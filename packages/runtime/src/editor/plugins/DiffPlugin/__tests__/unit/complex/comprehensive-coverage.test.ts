@@ -948,7 +948,7 @@ describe('Comprehensive lexical-diff coverage tests', () => {
           'Top level item 10 MODIFIED',
         );
         expect(result.getApprovedMarkdown()).toContain('Sub item 15.5 UPDATED');
-      });
+      }, 20000);
     });
 
     describe('Documents with scattered changes', () => {

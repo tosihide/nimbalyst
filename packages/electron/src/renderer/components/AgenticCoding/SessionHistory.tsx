@@ -497,7 +497,7 @@ const SessionHistoryComponent: React.FC<SessionHistoryProps> = ({
     if (!activeSessionId && sessions.length > 0 && onSessionSelect) {
       // Small delay to ensure AgentMode is fully mounted
       const timer = setTimeout(() => {
-        console.log('[SessionHistory] Auto-selecting first session:', sessions[0].id);
+        // console.log('[SessionHistory] Auto-selecting first session:', sessions[0].id);
         onSessionSelect(sessions[0].id);
       }, 100);
       return () => clearTimeout(timer);
@@ -534,7 +534,7 @@ const SessionHistoryComponent: React.FC<SessionHistoryProps> = ({
     try {
       const result = await window.electronAPI.ai.buildFtsIndex();
       if (result.success) {
-        console.log('[SessionHistory] FTS index built successfully');
+        // console.log('[SessionHistory] FTS index built successfully');
         // Run the pending search now that index is built
         if (pendingSearchQuery) {
           await executeSearch(pendingSearchQuery);

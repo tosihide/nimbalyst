@@ -209,7 +209,7 @@ export const WorkspaceManager: React.FC = () => {
   const loadWorkspaces = async () => {
     try {
       const recentWorkspaces = await window.electronAPI.workspaceManager.getRecentWorkspaces();
-      console.log('Loaded workspaces:', recentWorkspaces);
+      // console.log('Loaded workspaces:', recentWorkspaces);
       setWorkspaces(recentWorkspaces);
       // Don't auto-select first workspace - show welcome pane instead
     } catch (error) {

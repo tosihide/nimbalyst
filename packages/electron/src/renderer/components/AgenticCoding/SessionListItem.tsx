@@ -318,7 +318,7 @@ export const SessionListItem = memo<SessionListItemProps>(({
 
       // Validate not dropping on current parent (no-op)
       if (parentId === id) {
-        console.log('[SessionListItem] Session already belongs to this workstream');
+        // console.log('[SessionListItem] Session already belongs to this workstream');
         return;
       }
 
@@ -328,7 +328,7 @@ export const SessionListItem = memo<SessionListItemProps>(({
         // Drop target is a standalone session, not a workstream.
         // Convert it to a workstream first (without creating a sibling - the dragged session fills that role),
         // then reparent the dragged session into the new workstream parent.
-        console.log(`[SessionListItem] Converting session ${id} to workstream before reparenting`);
+        // console.log(`[SessionListItem] Converting session ${id} to workstream before reparenting`);
         const result = await convertToWorkstream({
           sessionId: id,
           workspacePath: projectPath,
@@ -345,7 +345,7 @@ export const SessionListItem = memo<SessionListItemProps>(({
       }
 
       // Execute reparent into the (possibly new) workstream parent
-      console.log(`[SessionListItem] Reparenting session ${sessionId} from ${parentId} to ${targetParentId}`);
+      // console.log(`[SessionListItem] Reparenting session ${sessionId} from ${parentId} to ${targetParentId}`);
       const success = await reparentSession({
         sessionId,
         oldParentId: parentId,

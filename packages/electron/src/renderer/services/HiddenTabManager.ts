@@ -61,7 +61,7 @@ class HiddenTabManager {
 
     document.body.appendChild(this.hiddenContainer);
 
-    console.log(`${LOG_PREFIX} Initialized`);
+    // console.log(`${LOG_PREFIX} Initialized`);
   }
 
   /**
@@ -80,13 +80,13 @@ class HiddenTabManager {
         clearTimeout(instance.ttlTimer);
         instance.ttlTimer = null;
       }
-      console.log(`${LOG_PREFIX} Reusing existing hidden editor for ${filePath} (refCount: ${instance.refCount})`);
+      // console.log(`${LOG_PREFIX} Reusing existing hidden editor for ${filePath} (refCount: ${instance.refCount})`);
       return;
     }
 
     // Check if a visible editor already has this file open
     if (this.isEditorAPIAvailable(filePath)) {
-      console.log(`${LOG_PREFIX} Visible editor already open for ${filePath}`);
+      // console.log(`${LOG_PREFIX} Visible editor already open for ${filePath}`);
       return;
     }
 
@@ -114,7 +114,7 @@ class HiddenTabManager {
       instance.ttlTimer = setTimeout(() => {
         this.unmountEditor(filePath);
       }, TTL_MS);
-      console.log(`${LOG_PREFIX} Released ${filePath}, cleanup in ${TTL_MS / 1000}s`);
+      // console.log(`${LOG_PREFIX} Released ${filePath}, cleanup in ${TTL_MS / 1000}s`);
     }
   }
 
@@ -155,7 +155,7 @@ class HiddenTabManager {
    * Mount a hidden editor for a file.
    */
   private async mountEditor(filePath: string, workspacePath: string): Promise<void> {
-    console.log(`${LOG_PREFIX} Mounting hidden editor for ${filePath}`);
+    // console.log(`${LOG_PREFIX} Mounting hidden editor for ${filePath}`);
 
     if (!this.hiddenContainer) {
       this.initialize();
@@ -217,7 +217,7 @@ class HiddenTabManager {
     // Wait for the editor API to register, then move offscreen
     try {
       await this.waitForEditorAPI(filePath);
-      console.log(`${LOG_PREFIX} Hidden editor ready for ${filePath}`);
+      // console.log(`${LOG_PREFIX} Hidden editor ready for ${filePath}`);
     } catch (error) {
       // Cleanup on failure
       this.unmountEditor(filePath);
@@ -237,7 +237,7 @@ class HiddenTabManager {
     const instance = this.editors.get(filePath);
     if (!instance) return;
 
-    console.log(`${LOG_PREFIX} Unmounting hidden editor for ${filePath}`);
+    // console.log(`${LOG_PREFIX} Unmounting hidden editor for ${filePath}`);
 
     // Clean up the central editor API registry
     unregisterEditorAPI(filePath);
@@ -267,7 +267,7 @@ class HiddenTabManager {
     // Find an editor with refCount 0 first
     for (const [filePath, instance] of this.editors) {
       if (instance.refCount === 0) {
-        console.log(`${LOG_PREFIX} Evicting idle hidden editor: ${filePath}`);
+        // console.log(`${LOG_PREFIX} Evicting idle hidden editor: ${filePath}`);
         this.unmountEditor(filePath);
         return;
       }
@@ -276,7 +276,7 @@ class HiddenTabManager {
     // All editors are in use -- evict the first one
     const firstKey = this.editors.keys().next().value;
     if (firstKey) {
-      console.log(`${LOG_PREFIX} Evicting oldest hidden editor: ${firstKey}`);
+      // console.log(`${LOG_PREFIX} Evicting oldest hidden editor: ${firstKey}`);
       this.unmountEditor(firstKey);
     }
   }

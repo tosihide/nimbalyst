@@ -315,7 +315,7 @@ export const EditorScreenshotWidget: React.FC<CustomToolWidgetProps> = ({
     const source = inlineImageData ? 'inline' : 'file-system';
     const sizeBytes = Math.floor((imageData.imageBase64.length * 3) / 4);
     const sizeMB = (sizeBytes / 1024 / 1024).toFixed(2);
-    console.log(`[EditorScreenshotWidget] Image loaded: ${sizeMB} MB, source: ${source}, mimeType: ${imageData.mimeType}`);
+    // console.log(`[EditorScreenshotWidget] Image loaded: ${sizeMB} MB, source: ${source}, mimeType: ${imageData.mimeType}`);
   }
 
   const hasError = isToolError(parsedResult, message);

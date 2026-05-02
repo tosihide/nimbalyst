@@ -64,7 +64,7 @@ export function useWindowLifecycle({
       }
 
       if (hasBlockingChanges) {
-        console.log('[WINDOW CLOSE] Has unsaved changes');
+        // console.log('[WINDOW CLOSE] Has unsaved changes');
         // This will show a dialog in Electron
         e.preventDefault();
         e.returnValue = 'You have unsaved changes. Are you sure you want to quit?';
@@ -77,7 +77,7 @@ export function useWindowLifecycle({
           // NOTE: lastSaveTime is tracked in EditorPool per-file now
           window.electronAPI.saveFile(content, currentFilePath).then(result => {
             if (result && result.success) {
-              console.log('[WINDOW CLOSE] Saved current file');
+              // console.log('[WINDOW CLOSE] Saved current file');
             }
           }).catch(error => {
             console.error('[WINDOW CLOSE] Failed to save:', error);

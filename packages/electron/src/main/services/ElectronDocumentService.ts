@@ -200,8 +200,8 @@ export class ElectronDocumentService implements DocumentService {
   constructor(workspacePath: string) {
     this.workspacePath = workspacePath;
 
-    console.log(`[DocumentService] Constructor called for workspace: ${workspacePath}`);
-    console.log(`[DocumentService] SKIPPING initial scan - scan will happen on-demand only`);
+    // console.log(`[DocumentService] Constructor called for workspace: ${workspacePath}`);
+    // console.log(`[DocumentService] SKIPPING initial scan - scan will happen on-demand only`);
 
     // DON'T scan on startup - it freezes the app for large projects.
     // Metadata initialization runs lazily when metadata APIs are first called.
@@ -582,10 +582,10 @@ export class ElectronDocumentService implements DocumentService {
           `Some files may not appear in @ mentions.`
         );
       } else if (scanState.trackerCount > 0) {
-        console.log(
-          `[DocumentService] Scan complete: ${scanState.count} files in ${elapsed}ms ` +
-          `(${scanState.trackerCount} tracker files found beyond ${ElectronDocumentService.MAX_FILES_TO_SCAN} file limit)`
-        );
+        // console.log(
+        //   `[DocumentService] Scan complete: ${scanState.count} files in ${elapsed}ms ` +
+        //   `(${scanState.trackerCount} tracker files found beyond ${ElectronDocumentService.MAX_FILES_TO_SCAN} file limit)`
+        // );
       }
 
       return docs;
@@ -827,7 +827,7 @@ export class ElectronDocumentService implements DocumentService {
 
           // Add to documents list so future lookups work
           this.documents.push(doc);
-          console.log(`[DocumentService] Added document entry for agent-edited file: ${relativePath}`);
+          // console.log(`[DocumentService] Added document entry for agent-edited file: ${relativePath}`);
         }
 
         const metadata: DocumentMetadataEntry = {
@@ -897,12 +897,12 @@ export class ElectronDocumentService implements DocumentService {
         assetPath = path.join(app.getAppPath(), virtualDoc.assetPath);
       }
 
-      console.log('[DocumentService] Loading virtual document:', {
-        virtualPath,
-        assetPath,
-        __dirname,
-        exists: await fs.access(assetPath).then(() => true).catch(() => false)
-      });
+      // console.log('[DocumentService] Loading virtual document:', {
+      //   virtualPath,
+      //   assetPath,
+      //   __dirname,
+      //   exists: await fs.access(assetPath).then(() => true).catch(() => false)
+      // });
 
       const content = await fs.readFile(assetPath, 'utf-8');
       return content;
@@ -1962,10 +1962,10 @@ export class ElectronDocumentService implements DocumentService {
     // Only write if file doesn't already exist (deduplication)
     try {
       await fs.access(assetPath);
-      console.log(`[DocumentService] Asset ${filename} already exists at ${assetsDir}, skipping write`);
+      // console.log(`[DocumentService] Asset ${filename} already exists at ${assetsDir}, skipping write`);
     } catch {
       await fs.writeFile(assetPath, buffer);
-      console.log(`[DocumentService] Stored asset ${filename} at ${assetsDir} (${buffer.length} bytes)`);
+      // console.log(`[DocumentService] Stored asset ${filename} at ${assetsDir} (${buffer.length} bytes)`);
     }
 
     return { hash, extension, relativePath };
@@ -2028,7 +2028,7 @@ export class ElectronDocumentService implements DocumentService {
       if (!referencedHashes.has(hash)) {
         const assetPath = path.join(assetsDir, file);
         await shell.trashItem(assetPath);
-        console.log(`[DocumentService] Deleted unreferenced asset: ${file}`);
+        // console.log(`[DocumentService] Deleted unreferenced asset: ${file}`);
         deletedCount++;
       }
     }
@@ -2347,23 +2347,23 @@ export function setupDocumentServiceHandlers(resolver: DocumentServiceResolver) 
   }) => {
     try {
       const syncPolicy = getEffectiveTrackerSyncPolicy(payload.workspace, payload.type, payload.syncMode);
-      console.log('[DocumentService] create-tracker-item called:', {
-        id: payload.id,
-        type: payload.type,
-        requestedSyncMode: payload.syncMode,
-        effectiveSyncPolicy: syncPolicy,
-        workspace: payload.workspace,
-      });
+      // console.log('[DocumentService] create-tracker-item called:', {
+      //   id: payload.id,
+      //   type: payload.type,
+      //   requestedSyncMode: payload.syncMode,
+      //   effectiveSyncPolicy: syncPolicy,
+      //   workspace: payload.workspace,
+      // });
       const item = await requireDocumentService(event).createTrackerItem(payload);
-      console.log('[DocumentService] create-tracker-item created locally:', item.id);
+      // console.log('[DocumentService] create-tracker-item created locally:', item.id);
 
       if (shouldSyncTrackerPolicy(syncPolicy)) {
         const active = isTrackerSyncActive(payload.workspace);
-        console.log('[DocumentService] create-tracker-item sync check:', { syncPolicy, active });
+        // console.log('[DocumentService] create-tracker-item sync check:', { syncPolicy, active });
         if (active) {
           try {
             await syncTrackerItem(item);
-            console.log('[DocumentService] create-tracker-item synced to TrackerRoom:', item.id);
+            // console.log('[DocumentService] create-tracker-item synced to TrackerRoom:', item.id);
           } catch (syncErr) {
             console.error('[DocumentService] create-tracker-item sync failed (item still created locally):', syncErr);
           }
@@ -2384,30 +2384,30 @@ export function setupDocumentServiceHandlers(resolver: DocumentServiceResolver) 
     syncMode?: string;
   }) => {
     try {
-      console.log('[DocumentService] update-tracker-item:', {
-        itemId: payload.itemId,
-        requestedSyncMode: payload.syncMode,
-        updateKeys: Object.keys(payload.updates),
-      });
+      // console.log('[DocumentService] update-tracker-item:', {
+      //   itemId: payload.itemId,
+      //   requestedSyncMode: payload.syncMode,
+      //   updateKeys: Object.keys(payload.updates),
+      // });
       const item = await requireDocumentService(event).updateTrackerItem(payload.itemId, payload.updates);
       const syncPolicy = getEffectiveTrackerSyncPolicy(item.workspace, item.type, payload.syncMode);
 
       if (shouldSyncTrackerPolicy(syncPolicy)) {
         const syncActive = isTrackerSyncActive(item.workspace);
-        console.log('[DocumentService] update-tracker-item sync gate:', { syncPolicy, workspace: item.workspace, syncActive });
+        // console.log('[DocumentService] update-tracker-item sync gate:', { syncPolicy, workspace: item.workspace, syncActive });
         try {
           if (syncActive) {
             await syncTrackerItem(item);
-            console.log('[DocumentService] update-tracker-item synced:', item.id);
+            // console.log('[DocumentService] update-tracker-item synced:', item.id);
           } else {
             await requireDocumentService(event).updateTrackerItemSyncStatus(item.id, 'pending');
-            console.log('[DocumentService] update-tracker-item skipped: sync not active for workspace');
+            // console.log('[DocumentService] update-tracker-item skipped: sync not active for workspace');
           }
         } catch (syncErr) {
           console.error('[DocumentService] update-tracker-item sync failed:', syncErr);
         }
       } else {
-        console.log('[DocumentService] update-tracker-item no sync: effective mode =', syncPolicy.mode);
+        // console.log('[DocumentService] update-tracker-item no sync: effective mode =', syncPolicy.mode);
       }
 
       return { success: true, item };

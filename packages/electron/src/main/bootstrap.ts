@@ -115,7 +115,7 @@ if (customUserDataDir) {
   app.setPath('userData', customUserDataDir);
   // Also set appData to parent directory for consistency
   app.setPath('appData', path.dirname(customUserDataDir));
-  console.log(`[Bootstrap] Using custom userData directory: ${customUserDataDir}`);
+  // console.log(`[Bootstrap] Using custom userData directory: ${customUserDataDir}`);
 }
 
 // Configure V8 heap memory limit from app settings
@@ -126,12 +126,12 @@ try {
   const maxHeapSizeMB = appSettings.get('maxHeapSizeMB', 4096);
   if (maxHeapSizeMB && maxHeapSizeMB > 0) {
     app.commandLine.appendSwitch('js-flags', `--max-old-space-size=${maxHeapSizeMB}`);
-    console.log(`[Bootstrap] V8 heap limit set to ${maxHeapSizeMB}MB`);
+    // console.log(`[Bootstrap] V8 heap limit set to ${maxHeapSizeMB}MB`);
   }
 } catch (error) {
   // If we can't read settings, use default
   app.commandLine.appendSwitch('js-flags', '--max-old-space-size=4096');
-  console.log('[Bootstrap] V8 heap limit set to 4096MB (default)');
+  // console.log('[Bootstrap] V8 heap limit set to 4096MB (default)');
 }
 
 // Enable CDP remote debugging in dev mode for Playwright extension testing.
@@ -140,7 +140,7 @@ try {
 if (process.env.NODE_ENV !== 'production') {
   const cdpPort = process.env.NIMBALYST_CDP_PORT || '9222';
   app.commandLine.appendSwitch('remote-debugging-port', cdpPort);
-  console.log(`[Bootstrap] CDP remote debugging enabled on port ${cdpPort}`);
+  // console.log(`[Bootstrap] CDP remote debugging enabled on port ${cdpPort}`);
 }
 
 // Static import - no chunk boundary, no module duplication issues.

@@ -162,7 +162,7 @@ ${exportNames.map((name) => `export const ${name} = __mod?.${name};`).join('\n')
     // Register the import map with es-module-shims
     importShim.addImportMap({ imports });
 
-    console.log('[ExtensionPlatformService] Import map initialized with', Object.keys(imports).length, 'entries');
+    // console.log('[ExtensionPlatformService] Import map initialized with', Object.keys(imports).length, 'entries');
     this.importMapInitialized = true;
   }
 
@@ -238,7 +238,7 @@ ${exportNames.map((name) => `export const ${name} = __mod?.${name};`).join('\n')
 
     const exists = await electronAPI.invoke('extensions:file-exists', filePath);
     if (!exists) {
-      console.warn(`[ExtensionPlatformService] File not found: ${filePath}`);
+      // console.warn(`[ExtensionPlatformService] File not found: ${filePath}`);
     }
     return exists;
   }
@@ -252,7 +252,7 @@ ${exportNames.map((name) => `export const ${name} = __mod?.${name};`).join('\n')
    */
   async loadModule(modulePath: string): Promise<ExtensionModule> {
     try {
-      console.log('[ExtensionPlatformService] Loading module:', modulePath);
+      // console.log('[ExtensionPlatformService] Loading module:', modulePath);
 
       // Initialize import map on first load
       this.initializeImportMap();
@@ -450,7 +450,7 @@ CHECK:
       },
     };
 
-    console.log('[ExtensionPlatformService] Host dependencies exposed');
+    // console.log('[ExtensionPlatformService] Host dependencies exposed');
   }
 
   /**

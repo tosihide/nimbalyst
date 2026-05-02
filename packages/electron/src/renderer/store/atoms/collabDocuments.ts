@@ -218,7 +218,7 @@ export async function initSharedDocuments(workspacePath: string, retryCount = 0)
 
   // Resolve config from main process
   if (!window.electronAPI?.documentSync?.resolveIndexConfig) {
-    console.log('[collabDocuments] No resolveIndexConfig API available');
+    // console.log('[collabDocuments] No resolveIndexConfig API available');
     return;
   }
 
@@ -229,7 +229,7 @@ export async function initSharedDocuments(workspacePath: string, retryCount = 0)
       const isNoTeam = result.error?.includes('No team found');
       const isTransient = result.error && !isNotAuthenticated && !isNoTeam;
       if (isTransient) {
-        console.log('[collabDocuments] Could not resolve index config:', result.error);
+        // console.log('[collabDocuments] Could not resolve index config:', result.error);
       }
       if (!isTransient) {
         store.set(workspaceHasTeamAtom, false);
@@ -237,7 +237,7 @@ export async function initSharedDocuments(workspacePath: string, retryCount = 0)
       const maxRetries = 5;
       if (isTransient && retryCount < maxRetries) {
         const delayMs = Math.min(3000 * Math.pow(2, retryCount), 30000);
-        console.log(`[collabDocuments] Will retry in ${delayMs}ms (attempt ${retryCount + 1}/${maxRetries})`);
+        // console.log(`[collabDocuments] Will retry in ${delayMs}ms (attempt ${retryCount + 1}/${maxRetries})`);
         pendingRetryTimer = setTimeout(() => {
           pendingRetryTimer = null;
           initSharedDocuments(workspacePath, retryCount + 1);
@@ -322,7 +322,7 @@ export async function initSharedDocuments(workspacePath: string, retryCount = 0)
 
       onMemberAdded: (_member) => {
         // A new member was added to the org -- try to wrap the org key for them
-        console.log('[collabDocuments] Member added, triggering auto-wrap for org:', orgId);
+        // console.log('[collabDocuments] Member added, triggering auto-wrap for org:', orgId);
         (window as any).electronAPI.team.autoWrapNewMembers(orgId).catch((err: unknown) => {
           console.error('[collabDocuments] auto-wrap after memberAdded failed:', err);
         });
@@ -330,7 +330,7 @@ export async function initSharedDocuments(workspacePath: string, retryCount = 0)
 
       onIdentityKeyUploaded: (_userId) => {
         // A member uploaded their identity key -- now we can wrap the org key for them
-        console.log('[collabDocuments] Identity key uploaded, triggering auto-wrap for org:', orgId);
+        // console.log('[collabDocuments] Identity key uploaded, triggering auto-wrap for org:', orgId);
         (window as any).electronAPI.team.autoWrapNewMembers(orgId).catch((err: unknown) => {
           console.error('[collabDocuments] auto-wrap after identityKeyUploaded failed:', err);
         });
@@ -343,7 +343,7 @@ export async function initSharedDocuments(workspacePath: string, retryCount = 0)
         // 2. Destroy this TeamSyncProvider (holds old encryptionKey)
         // 3. Reinitialize from scratch (will get new key from main process)
         // 4. Tracker sync must also be restarted (separate IPC)
-        console.log('[collabDocuments] Org key rotated, new fingerprint:', fingerprint, '-- tearing down all providers');
+        // console.log('[collabDocuments] Org key rotated, new fingerprint:', fingerprint, '-- tearing down all providers');
         errorNotificationService.showInfo(
           'Team encryption key updated',
           'Reconnecting with the new key...',
@@ -355,7 +355,7 @@ export async function initSharedDocuments(workspacePath: string, retryCount = 0)
             if (result?.success && result.keyRefreshed) {
               // Key is refreshed in main process. Now tear down and recreate
               // all providers so they use the new key.
-              console.log('[collabDocuments] Key refreshed, reinitializing all sync providers...');
+              // console.log('[collabDocuments] Key refreshed, reinitializing all sync providers...');
 
               // Destroy current TeamSyncProvider (holds old key)
               destroyTeamSync();
@@ -408,7 +408,7 @@ export async function initSharedDocuments(workspacePath: string, retryCount = 0)
     activeWorkspacePath = workspacePath;
 
     await provider.connect();
-    console.log('[collabDocuments] Connected to TeamRoom for org:', orgId);
+    // console.log('[collabDocuments] Connected to TeamRoom for org:', orgId);
   } catch (err) {
     console.error('[collabDocuments] Failed to initialize team sync:', err);
     store.set(teamSyncStatusAtom, 'error');

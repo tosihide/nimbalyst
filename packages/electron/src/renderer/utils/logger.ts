@@ -147,5 +147,5 @@ export const logger = {
 // Expose to window for debugging (like the old logger)
 if (typeof window !== 'undefined') {
   (window as any).logger = logger;
-  console.log('%c📊 Unified logger initialized. Use window.logger to log.', 'color: #00d2d3; font-weight: bold;');
+  // console.log('%c📊 Unified logger initialized. Use window.logger to log.', 'color: #00d2d3; font-weight: bold;');
 }

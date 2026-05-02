@@ -61,7 +61,7 @@ export class AIToolService {
         return await this.executeCreateDocument(args);
       };
 
-      console.log('[AIToolService] Registered createDocument on aiChatBridge');
+      // console.log('[AIToolService] Registered createDocument on aiChatBridge');
     }
   }
 
@@ -69,7 +69,7 @@ export class AIToolService {
    * Execute a tool by name with given arguments
    */
   async executeTool(toolName: string, args: any): Promise<any> {
-    console.log(`[AIToolService] Executing tool: ${toolName}`);
+    // console.log(`[AIToolService] Executing tool: ${toolName}`);
 
     switch (toolName) {
       // Document editing tools
@@ -93,7 +93,7 @@ export class AIToolService {
    * Apply diff replacements to the current document
    */
   private async executeApplyDiff(args: { replacements: Array<{ oldText: string; newText: string }>; targetFilePath?: string }): Promise<DiffResult> {
-    console.log('[AIToolService] applyDiff:', args.replacements?.length, 'replacements', 'targetFilePath:', args.targetFilePath);
+    // console.log('[AIToolService] applyDiff:', args.replacements?.length, 'replacements', 'targetFilePath:', args.targetFilePath);
 
     if (!args?.replacements || !Array.isArray(args.replacements)) {
       throw new Error('applyDiff requires replacements array');
@@ -119,7 +119,7 @@ export class AIToolService {
    * Get current document content
    */
   private async executeGetDocumentContent(args: any): Promise<{ content: string }> {
-    console.log('[AIToolService] getDocumentContent');
+    // console.log('[AIToolService] getDocumentContent');
 
     if (!this.getContentFn) {
       throw new Error('getContent function not set');
@@ -133,7 +133,7 @@ export class AIToolService {
    * Update frontmatter in the current document
    */
   private async executeUpdateFrontmatter(args: { updates: Record<string, any>; targetFilePath?: string }): Promise<DiffResult> {
-    console.log('[AIToolService] updateFrontmatter:', args.updates, 'targetFilePath:', args.targetFilePath);
+    // console.log('[AIToolService] updateFrontmatter:', args.updates, 'targetFilePath:', args.targetFilePath);
 
     if (!args?.updates) {
       throw new Error('updateFrontmatter requires updates object');
@@ -229,7 +229,7 @@ export class AIToolService {
     initialContent?: string;
     switchToFile?: boolean;
   }): Promise<{ success: boolean; filePath?: string; error?: string }> {
-    console.log('[AIToolService] createDocument:', args.filePath, 'switchToFile:', args.switchToFile);
+    // console.log('[AIToolService] createDocument:', args.filePath, 'switchToFile:', args.switchToFile);
 
     if (!args?.filePath) {
       throw new Error('createDocument requires filePath');
@@ -251,7 +251,7 @@ export class AIToolService {
       if (!this.handleWorkspaceFileSelectFn) {
         console.warn('[AIToolService] Cannot switch to file: handleWorkspaceFileSelect not set');
       } else {
-        console.log('[AIToolService] Switching to new file:', result.filePath);
+        // console.log('[AIToolService] Switching to new file:', result.filePath);
         await this.handleWorkspaceFileSelectFn(result.filePath);
       }
     }

@@ -287,7 +287,7 @@ export function useIPCHandlers(props: UseIPCHandlersProps) {
       try {
         const workspaceState = await window.electronAPI.invoke('workspace:get-state', data.workspacePath);
         const aiChatState = workspaceState?.aiPanel;
-        console.log('Restoring AI Chat state for workspace:', aiChatState);
+        // console.log('Restoring AI Chat state for workspace:', aiChatState);
         if (aiChatState) {
           handlersRef.current.setIsAIChatCollapsed(aiChatState.collapsed);
           handlersRef.current.setAIChatWidth(aiChatState.width);
@@ -306,7 +306,7 @@ export function useIPCHandlers(props: UseIPCHandlersProps) {
 
       // Open welcome tab if no tabs are open
       if (editorModeRef.current?.tabs && editorModeRef.current.tabs.tabs.length === 0) {
-        console.log('[WORKSPACE] No tabs open, opening welcome tab');
+        // console.log('[WORKSPACE] No tabs open, opening welcome tab');
         // Delay slightly to ensure workspace state is fully set
         setTimeout(() => handlersRef.current.openWelcomeTab(), 100);
       }
@@ -315,7 +315,7 @@ export function useIPCHandlers(props: UseIPCHandlersProps) {
     // Handle opening a specific file in a workspace (used when restoring workspace state)
     if (window.electronAPI.onOpenWorkspaceFile) {
       cleanupFns.push(window.electronAPI.onOpenWorkspaceFile(async (filePath) => {
-        console.log('Opening workspace file from saved state:', filePath);
+        // console.log('Opening workspace file from saved state:', filePath);
         // Use the existing file selection handler
         await handlersRef.current.handleWorkspaceFileSelect(filePath);
       }));
@@ -323,7 +323,7 @@ export function useIPCHandlers(props: UseIPCHandlersProps) {
 
     if (window.electronAPI.onOpenDocument) {
       cleanupFns.push(window.electronAPI.onOpenDocument(async ({ path }) => {
-        console.log('[DOCUMENT_LINK] Renderer received open-document for path:', path);
+        // console.log('[DOCUMENT_LINK] Renderer received open-document for path:', path);
         try {
           await handlersRef.current.handleWorkspaceFileSelect(path);
         } catch (error) {
@@ -335,7 +335,7 @@ export function useIPCHandlers(props: UseIPCHandlersProps) {
     // Handle workspace open from CLI
     if (window.electronAPI.onOpenWorkspaceFromCLI) {
       cleanupFns.push(window.electronAPI.onOpenWorkspaceFromCLI(async (workspacePath) => {
-        console.log('Opening workspace from CLI:', workspacePath);
+        // console.log('Opening workspace from CLI:', workspacePath);
         // Open the workspace using the existing openWorkspace API
         if (window.electronAPI.workspaceManager?.openWorkspace) {
           await window.electronAPI.workspaceManager.openWorkspace(workspacePath);
@@ -347,7 +347,7 @@ export function useIPCHandlers(props: UseIPCHandlersProps) {
     // which triggers handleWorkspaceFileSelect -> switchWorkspaceFile for content loading
 
     cleanupFns.push(window.electronAPI.onNewUntitledDocument((data) => {
-      console.log('Received new-untitled-document event:', data.untitledName);
+      // console.log('Received new-untitled-document event:', data.untitledName);
       currentFilePathRef.current = null;
       currentFileNameRef.current = data.untitledName;
       // setIsDirty(true); // New documents start as dirty
@@ -383,7 +383,7 @@ export function useIPCHandlers(props: UseIPCHandlersProps) {
     // NOTE: File watching is now handled by TabEditor component for each individual tab.
     // The legacy file change handler has been removed as it's no longer needed.
     cleanupFns.push(window.electronAPI.onFileMoved(async (data) => {
-      console.log('File moved:', data);
+      // console.log('File moved:', data);
 
       // Update the tab for this file
       if (editorModeRef.current?.tabs) {
@@ -417,7 +417,7 @@ export function useIPCHandlers(props: UseIPCHandlersProps) {
 
     // Listen for show preferences event
     cleanupFns.push(window.electronAPI.onFileRenamed((data) => {
-      console.log('File renamed:', data);
+      // console.log('File renamed:', data);
 
       // Update the tab for this file
       if (editorModeRef.current?.tabs) {
@@ -442,7 +442,7 @@ export function useIPCHandlers(props: UseIPCHandlersProps) {
     // Load session from Session Manager
     if (window.electronAPI.onLoadSessionFromManager) {
       cleanupFns.push(window.electronAPI.onLoadSessionFromManager(async (data: { sessionId: string; workspacePath?: string }) => {
-        console.log('Loading session from manager:', data);
+        // console.log('Loading session from manager:', data);
 
         // If there's a workspace path and we're not in workspace mode, open the workspace first
         if (data.workspacePath && !stateRef.current.workspaceMode) {
@@ -481,7 +481,7 @@ export function useIPCHandlers(props: UseIPCHandlersProps) {
     // Approve/Reject action handlers
     if (window.electronAPI.onApproveAction) {
       cleanupFns.push(window.electronAPI.onApproveAction(() => {
-        console.log('Approve action triggered');
+        // console.log('Approve action triggered');
         // Get the active editor from the registry
         const activeFilePath = editorRegistry.getActiveFilePath();
         if (activeFilePath) {
@@ -495,7 +495,7 @@ export function useIPCHandlers(props: UseIPCHandlersProps) {
 
     if (window.electronAPI.onRejectAction) {
       cleanupFns.push(window.electronAPI.onRejectAction(() => {
-        console.log('Reject action triggered');
+        // console.log('Reject action triggered');
         // Get the active editor from the registry
         const activeFilePath = editorRegistry.getActiveFilePath();
         if (activeFilePath) {
@@ -510,7 +510,7 @@ export function useIPCHandlers(props: UseIPCHandlersProps) {
     // Copy as Markdown handler
     if (window.electronAPI.onCopyAsMarkdown) {
       cleanupFns.push(window.electronAPI.onCopyAsMarkdown(() => {
-        console.log('Copy as Markdown triggered from menu');
+        // console.log('Copy as Markdown triggered from menu');
         // Get the active editor from the registry
         const activeFilePath = editorRegistry.getActiveFilePath();
         if (activeFilePath) {
@@ -738,7 +738,7 @@ export function useIPCHandlers(props: UseIPCHandlersProps) {
 
     if (window.electronAPI.onMcpNavigateTo) {
       cleanupFns.push(window.electronAPI.onMcpNavigateTo(({ line, column }) => {
-        console.log('MCP navigateTo request:', { line, column });
+        // console.log('MCP navigateTo request:', { line, column });
         // TODO: Implement navigation to specific line/column in editor
         // This would require adding a navigation command to the editor
       }));
@@ -753,7 +753,7 @@ export function useIPCHandlers(props: UseIPCHandlersProps) {
 
     if (window.electronAPI.onAIGetDocumentContent) {
       cleanupFns.push(window.electronAPI.onAIGetDocumentContent(async ({ filePath, resultChannel }) => {
-        console.log('AI getDocumentContent request for:', filePath);
+        // console.log('AI getDocumentContent request for:', filePath);
         try {
           // SAFETY: Require explicit filePath
           if (!filePath) {
@@ -782,7 +782,7 @@ export function useIPCHandlers(props: UseIPCHandlersProps) {
 
     if (window.electronAPI.onAIUpdateFrontmatter) {
       cleanupFns.push(window.electronAPI.onAIUpdateFrontmatter(async ({ filePath, updates, resultChannel }) => {
-        console.log('AI updateFrontmatter request for:', filePath, 'updates:', updates);
+        // console.log('AI updateFrontmatter request for:', filePath, 'updates:', updates);
         try {
           // SAFETY: Require explicit filePath
           if (!filePath) {
@@ -851,7 +851,7 @@ export function useIPCHandlers(props: UseIPCHandlersProps) {
     // Handle AI create document requests from main process
     if (window.electronAPI.onAICreateDocument) {
       cleanupFns.push(window.electronAPI.onAICreateDocument(async ({ filePath, initialContent, switchToFile, resultChannel }) => {
-        console.log('AI createDocument request from main:', { filePath, switchToFile });
+        // console.log('AI createDocument request from main:', { filePath, switchToFile });
         try {
           // Create the document via IPC
           const result = await window.electronAPI.invoke('create-document', filePath, initialContent);
@@ -859,7 +859,7 @@ export function useIPCHandlers(props: UseIPCHandlersProps) {
           if (result.success) {
             // Switch to the new file if requested
             if (switchToFile && result.filePath) {
-              console.log('Switching to new file:', result.filePath);
+              // console.log('Switching to new file:', result.filePath);
               await handlersRef.current.handleWorkspaceFileSelect(result.filePath);
             }
 
@@ -902,7 +902,7 @@ export function useIPCHandlers(props: UseIPCHandlersProps) {
     // Handle open welcome tab from menu
     if (window.electronAPI.onOpenWelcomeTab) {
       cleanupFns.push(window.electronAPI.onOpenWelcomeTab(() => {
-        console.log('Open welcome tab command received from menu');
+        // console.log('Open welcome tab command received from menu');
         handlersRef.current.openWelcomeTab();
       }));
     }
@@ -910,7 +910,7 @@ export function useIPCHandlers(props: UseIPCHandlersProps) {
     // Handle open keyboard shortcuts dialog from menu
     if ((window.electronAPI as any).onOpenKeyboardShortcuts) {
       cleanupFns.push((window.electronAPI as any).onOpenKeyboardShortcuts(() => {
-        console.log('Open keyboard shortcuts dialog command received from menu');
+        // console.log('Open keyboard shortcuts dialog command received from menu');
         if (dialogRef.current) {
           dialogRef.current.open(DIALOG_IDS.KEYBOARD_SHORTCUTS, {});
         }
@@ -920,7 +920,7 @@ export function useIPCHandlers(props: UseIPCHandlersProps) {
     // Handle open feedback dialog from menu
     if ((window.electronAPI as any).onOpenFeedback) {
       cleanupFns.push((window.electronAPI as any).onOpenFeedback(() => {
-        console.log('Open feedback dialog command received from menu');
+        // console.log('Open feedback dialog command received from menu');
         handlersRef.current.openFeedback();
       }));
     }
@@ -968,7 +968,7 @@ export function useIPCHandlers(props: UseIPCHandlersProps) {
     let currentStreamTargetFilePath: string | null = null;
 
     const handleStreamEditStart = (data: any) => {
-      console.log('[AI Streaming] Stream edit started:', { sessionId: data.sessionId, config: data });
+      // console.log('[AI Streaming] Stream edit started:', { sessionId: data.sessionId, config: data });
 
       // Use explicit targetFilePath from data - this was captured when the message was sent
       // and prevents race conditions if user switches tabs while waiting for AI
@@ -995,7 +995,7 @@ export function useIPCHandlers(props: UseIPCHandlersProps) {
       // Handle both old format (string) and new format ({ sessionId, content })
       const content = typeof data === 'string' ? data : data.content;
       const sessionId = typeof data === 'object' ? data.sessionId : undefined;
-      console.log('[AI Streaming] Stream edit content:', { sessionId, preview: content?.substring(0, 50) });
+      // console.log('[AI Streaming] Stream edit content:', { sessionId, preview: content?.substring(0, 50) });
 
       // Use the target file path captured at stream start
       const filePath = currentStreamTargetFilePath;
@@ -1008,7 +1008,7 @@ export function useIPCHandlers(props: UseIPCHandlersProps) {
     };
 
     const handleStreamEditEnd = (data: any) => {
-      console.log('[AI Streaming] Stream edit ended:', { sessionId: data?.sessionId, error: data?.error });
+      // console.log('[AI Streaming] Stream edit ended:', { sessionId: data?.sessionId, error: data?.error });
 
       // Use the target file path captured at stream start
       const filePath = currentStreamTargetFilePath;

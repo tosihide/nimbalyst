@@ -1015,7 +1015,7 @@ export const setAgentModeSettingsAtom = atom(
  */
 export async function initAgentModeSettings(): Promise<AgentModeSettings> {
   if (typeof window === 'undefined' || !window.electronAPI) {
-    console.log('[appSettings] initAgentModeSettings: No window/electronAPI, using defaults');
+    // console.log('[appSettings] initAgentModeSettings: No window/electronAPI, using defaults');
     return defaultAgentModeSettings;
   }
 
@@ -1031,7 +1031,7 @@ export async function initAgentModeSettings(): Promise<AgentModeSettings> {
     console.error('[appSettings] Failed to load agent mode settings:', error);
   }
 
-  console.log('[appSettings] initAgentModeSettings: Using defaults');
+  // console.log('[appSettings] initAgentModeSettings: Using defaults');
   return defaultAgentModeSettings;
 }
 

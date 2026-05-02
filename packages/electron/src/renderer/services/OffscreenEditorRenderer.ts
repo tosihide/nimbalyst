@@ -134,14 +134,14 @@ class OffscreenEditorRendererImpl {
 
     document.body.appendChild(this.hiddenContainer);
 
-    console.log('[OffscreenEditorRenderer] Initialized');
+    // console.log('[OffscreenEditorRenderer] Initialized');
   }
 
   /**
    * Mount an editor offscreen for a file.
    */
   public async mountEditor(filePath: string, workspacePath: string): Promise<void> {
-    console.log('[OffscreenEditorRenderer] Mounting editor for', filePath);
+    // console.log('[OffscreenEditorRenderer] Mounting editor for', filePath);
 
     if (!this.hiddenContainer) {
       this.initialize();
@@ -149,13 +149,13 @@ class OffscreenEditorRendererImpl {
 
     // Check if already mounted offscreen
     if (this.editors.has(filePath)) {
-      console.log('[OffscreenEditorRenderer] Already mounted offscreen');
+      // console.log('[OffscreenEditorRenderer] Already mounted offscreen');
       return;
     }
 
     // Check if an editor is already registered for this file (visible or hidden tab)
     if (hasExtensionEditorAPI(filePath)) {
-      console.log('[OffscreenEditorRenderer] Editor already registered, skipping offscreen mount');
+      // console.log('[OffscreenEditorRenderer] Editor already registered, skipping offscreen mount');
       return;
     }
 
@@ -203,18 +203,18 @@ class OffscreenEditorRendererImpl {
       host,
     });
 
-    console.log('[OffscreenEditorRenderer] Editor mounted for', filePath);
+    // console.log('[OffscreenEditorRenderer] Editor mounted for', filePath);
   }
 
   /**
    * Unmount an offscreen editor.
    */
   public unmountEditor(filePath: string): void {
-    console.log('[OffscreenEditorRenderer] Unmounting editor for', filePath);
+    // console.log('[OffscreenEditorRenderer] Unmounting editor for', filePath);
 
     const instance = this.editors.get(filePath);
     if (!instance) {
-      console.warn('[OffscreenEditorRenderer] No editor to unmount for', filePath);
+      // console.warn('[OffscreenEditorRenderer] No editor to unmount for', filePath);
       return;
     }
 
@@ -228,7 +228,7 @@ class OffscreenEditorRendererImpl {
 
     this.editors.delete(filePath);
 
-    console.log('[OffscreenEditorRenderer] Editor unmounted for', filePath);
+    // console.log('[OffscreenEditorRenderer] Editor unmounted for', filePath);
   }
 
   /**
@@ -303,7 +303,7 @@ class OffscreenEditorRendererImpl {
       },
 
       openHistory(): void {
-        console.log('[OffscreenEditorRenderer] openHistory not implemented for offscreen editors');
+        // console.log('[OffscreenEditorRenderer] openHistory not implemented for offscreen editors');
       },
 
       onThemeChanged(callback: (theme: string) => void): () => void {
@@ -403,7 +403,7 @@ class OffscreenEditorRendererImpl {
       (instance.host as any)._notifyThemeChanged?.(theme);
     }
 
-    console.log(`[OffscreenEditorRenderer] Applied ${theme} theme`);
+    // console.log(`[OffscreenEditorRenderer] Applied ${theme} theme`);
   }
 
   /**
@@ -437,7 +437,7 @@ class OffscreenEditorRendererImpl {
     // First, check if a visible editor has this file open
     const visibleRect = this.findVisibleEditorRect(filePath, selector);
     if (visibleRect) {
-      console.log('[OffscreenEditorRenderer] Capturing visible editor for', filePath);
+      // console.log('[OffscreenEditorRenderer] Capturing visible editor for', filePath);
       const result = await electronAPI.invoke('offscreen-editor:native-capture', { rect: visibleRect });
       if (!result.success) {
         throw new Error(result.error || 'Native capture failed');
@@ -509,7 +509,7 @@ class OffscreenEditorRendererImpl {
         height: Math.round(domRect.height),
       };
 
-      console.log('[OffscreenEditorRenderer] Capturing offscreen editor:', rect.width, 'x', rect.height);
+      // console.log('[OffscreenEditorRenderer] Capturing offscreen editor:', rect.width, 'x', rect.height);
 
       // Invoke native capture -- main process calls capturePage(rect)
       const result = await electronAPI.invoke('offscreen-editor:native-capture', { rect });
@@ -550,7 +550,7 @@ class OffscreenEditorRendererImpl {
         });
       }
 
-      console.log('[OffscreenEditorRenderer] Using editor API exportToPngBlob for', filePath);
+      // console.log('[OffscreenEditorRenderer] Using editor API exportToPngBlob for', filePath);
       const blob: Blob = await api.exportToPngBlob({ padding: 20, maxWidthOrHeight: 1920 });
 
       // Convert blob to base64
@@ -562,10 +562,10 @@ class OffscreenEditorRendererImpl {
       }
       const base64 = btoa(binary);
 
-      console.log(`[OffscreenEditorRenderer] Editor API export: ${base64.length} base64 chars`);
+      // console.log(`[OffscreenEditorRenderer] Editor API export: ${base64.length} base64 chars`);
       return base64;
     } catch (error) {
-      console.warn('[OffscreenEditorRenderer] Editor API export failed, falling back to DOM capture:', error);
+      // console.warn('[OffscreenEditorRenderer] Editor API export failed, falling back to DOM capture:', error);
       return null;
     }
   }
@@ -614,7 +614,7 @@ class OffscreenEditorRendererImpl {
    * Cleanup on shutdown.
    */
   public cleanup(): void {
-    console.log('[OffscreenEditorRenderer] Cleaning up');
+    // console.log('[OffscreenEditorRenderer] Cleaning up');
 
     // Unmount all editors
     for (const filePath of Array.from(this.editors.keys())) {

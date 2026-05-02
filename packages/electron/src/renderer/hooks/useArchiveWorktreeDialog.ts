@@ -44,7 +44,7 @@ export function useArchiveWorktreeDialog(): UseArchiveWorktreeDialogResult {
   }): Promise<boolean> => {
     const { worktreeId, worktreeName, worktreePath, workspacePath } = params;
 
-    console.log('[useArchiveWorktreeDialog] showDialog called', { worktreeId, worktreeName, worktreePath, workspacePath });
+    // console.log('[useArchiveWorktreeDialog] showDialog called', { worktreeId, worktreeName, worktreePath, workspacePath });
 
     // Fetch worktree status to check for uncommitted/unmerged changes
     let hasUncommittedChanges = false;
@@ -57,7 +57,7 @@ export function useArchiveWorktreeDialog(): UseArchiveWorktreeDialogResult {
       try {
         // Fetch base branch from origin first to ensure remote refs are up-to-date
         const result = await window.electronAPI.worktreeGetStatus(worktreePath, { fetchFirst: true });
-        console.log('[useArchiveWorktreeDialog] worktreeGetStatus result', result);
+        // console.log('[useArchiveWorktreeDialog] worktreeGetStatus result', result);
         if (result.success && result.status) {
           statusFetched = true;
           hasUncommittedChanges = result.status.hasUncommittedChanges;
@@ -79,21 +79,21 @@ export function useArchiveWorktreeDialog(): UseArchiveWorktreeDialogResult {
       console.warn('[useArchiveWorktreeDialog] No worktreePath provided, skipping status check');
     }
 
-    console.log('[useArchiveWorktreeDialog] Status check result', {
-      statusFetched,
-      hasUncommittedChanges,
-      uncommittedFileCount,
-      hasUnmergedChanges,
-      unmergedCommitCount,
-    });
+    // console.log('[useArchiveWorktreeDialog] Status check result', {
+    //   statusFetched,
+    //   hasUncommittedChanges,
+    //   uncommittedFileCount,
+    //   hasUnmergedChanges,
+    //   unmergedCommitCount,
+    // });
 
     // If status was fetched and everything is clean, auto-archive without dialog
     if (statusFetched && !hasUncommittedChanges && !hasUnmergedChanges) {
-      console.log('[useArchiveWorktreeDialog] Auto-archiving (clean + merged)');
+      // console.log('[useArchiveWorktreeDialog] Auto-archiving (clean + merged)');
       try {
         const result = await window.electronAPI.worktreeArchive(worktreeId, workspacePath);
         if (result.success) {
-          console.log('[useArchiveWorktreeDialog] Auto-archive succeeded');
+          // console.log('[useArchiveWorktreeDialog] Auto-archive succeeded');
           return true;
         }
         console.error('[useArchiveWorktreeDialog] Auto-archive failed:', result.error);
@@ -103,7 +103,7 @@ export function useArchiveWorktreeDialog(): UseArchiveWorktreeDialogResult {
       // Fall through to show dialog on archive error
     }
 
-    console.log('[useArchiveWorktreeDialog] Showing dialog');
+    // console.log('[useArchiveWorktreeDialog] Showing dialog');
     setDialogState({
       worktreeId,
       worktreeName,

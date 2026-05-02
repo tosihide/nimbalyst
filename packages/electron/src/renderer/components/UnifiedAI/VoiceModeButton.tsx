@@ -15,6 +15,7 @@ import { voiceModeEnabledAtom } from '../../store/atoms/appSettings';
 import { activeSessionIdAtom } from '../../store/atoms/sessions';
 import { voiceTokenUsageAtom, voiceListenStateAtom, voiceErrorAtom, registerVoiceAudioCallback, registerVoiceInterruptCallback, registerVoiceSubmitPromptCallback, registerVoiceAgentTaskCompleteCallback, registerVoiceStoppedCallback } from '../../store/atoms/voiceModeState';
 import { setVoiceActiveSession, clearVoiceActiveSession, persistAndClearVoiceSession, onLinkedSessionChanged, wakeVoiceListening } from '../../store/listeners/voiceModeListeners';
+import { openSettingsCommandAtom } from '../../store';
 import { HelpTooltip } from '../../help';
 import { store } from '@nimbalyst/runtime/store';
 
@@ -352,6 +353,15 @@ export function VoiceModeButton({ workspacePath }: VoiceModeButtonProps) {
     }
   };
 
+  const handleOpenVoiceModeSettings = () => {
+    store.set(openSettingsCommandAtom, {
+      category: 'voice-mode',
+      scope: 'user',
+      timestamp: Date.now(),
+    });
+    setError(null);
+  };
+
   // Context usage ring (wraps button when voice is active -- both listening and sleeping)
   const tokenUsage = useAtomValue(voiceTokenUsageAtom);
 
@@ -410,7 +420,7 @@ export function VoiceModeButton({ workspacePath }: VoiceModeButtonProps) {
 
   return (
     <HelpTooltip testId="voice-mode-toggle" placement="right" extraContent={contextExtraContent}>
-      <div className="relative">
+      <div className="voice-mode-button relative">
         <button
           onClick={handleToggleVoice}
           disabled={isDisabled}
@@ -470,15 +480,26 @@ export function VoiceModeButton({ workspacePath }: VoiceModeButtonProps) {
         </button>
         {error && (
           <div
-            className="absolute left-[calc(100%+8px)] top-1/2 -translate-y-1/2 bg-nim border border-nim-error rounded-lg p-3 min-w-[200px] max-w-[300px] shadow-[0_4px_12px_rgba(0,0,0,0.15)] z-[1000]"
+            className="voice-mode-error-popover absolute left-[calc(100%+8px)] top-1/2 -translate-y-1/2 bg-nim border border-nim-error rounded-lg p-3 min-w-[200px] max-w-[300px] shadow-[0_4px_12px_rgba(0,0,0,0.15)] z-[1000]"
           >
             <div className="flex items-start gap-2 text-nim">
               <MaterialSymbol icon="error" size={18} className="text-nim-error shrink-0" />
               <div className="text-[13px] leading-[1.4]">
                 <div className="font-semibold mb-1">Voice Mode Error</div>
                 <div className="text-nim-muted">{getErrorMessage(error)}</div>
+                {shouldShowVoiceModeSettingsLink(error) && (
+                  <button
+                    type="button"
+                    onClick={handleOpenVoiceModeSettings}
+                    data-testid="voice-mode-error-open-settings"
+                    className="voice-mode-error-settings-link mt-2 bg-transparent border-none cursor-pointer p-0 text-left text-[var(--nim-link)] hover:text-[var(--nim-link-hover)]"
+                  >
+                    Open Voice Mode Settings
+                  </button>
+                )}
               </div>
               <button
+                type="button"
                 onClick={(e) => { e.stopPropagation(); setError(null); }}
                 className="bg-transparent border-none cursor-pointer p-0 ml-auto text-nim-faint"
               >
@@ -508,4 +529,17 @@ function getErrorMessage(error: { type: string; message: string }): string {
     default:
       return error.message || 'An unexpected error occurred.';
   }
+}
+
+function shouldShowVoiceModeSettingsLink(error: { type: string; message: string }): boolean {
+  if (error.type === 'invalid_api_key') {
+    return true;
+  }
+
+  if (error.type !== 'connection_failed') {
+    return false;
+  }
+
+  const message = error.message.toLowerCase();
+  return message.includes('api key') || message.includes('settings');
 }

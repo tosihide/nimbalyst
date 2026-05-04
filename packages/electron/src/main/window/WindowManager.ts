@@ -19,6 +19,7 @@ import { AnalyticsService } from '../services/analytics/AnalyticsService';
 import { FeatureTrackingService } from '../services/analytics/FeatureTrackingService';
 import { ExtensionLogService } from '../services/ExtensionLogService';
 import { getMcpConfigService } from '../index';
+import { addNimAssetRoot } from '../protocols/nimAssetProtocol';
 import { windows, windowStates } from './windowState';
 
 // Window management
@@ -240,7 +241,14 @@ export function createWindow(
                 nodeIntegration: false,
                 contextIsolation: true,
                 preload: preloadPath,
-                webSecurity: false,
+                // Issue #146: webSecurity enforces same-origin policy. We
+                // previously disabled it so the renderer could load workspace
+                // images via `<img src="file://...">`. Those four call sites
+                // (ImageViewer, ImageDiffViewer, HistoryDialog,
+                // AttachmentPreview) now go through the registered
+                // `nim-asset://` scheme (see protocols/nimAssetProtocol.ts),
+                // which is treated as same-origin by the renderer. Leaving
+                // webSecurity at its default (true).
                 webviewTag: false
             },
             show: false,
@@ -265,6 +273,14 @@ export function createWindow(
             workspacePath: isWorkspaceMode ? workspacePath : null,
             documentEdited: false
         });
+
+        // Issue #146: register the workspace path with the nim-asset protocol
+        // so the renderer can render workspace images via `nim-asset://`. This
+        // happens before the renderer mounts, so the allowlist is ready when
+        // image components first render.
+        if (isWorkspaceMode && workspacePath) {
+            addNimAssetRoot(workspacePath);
+        }
         if (isWorkspaceMode && workspacePath) {
             if (!documentServices.has(workspacePath)) {
                 const docService = new ElectronDocumentService(workspacePath);

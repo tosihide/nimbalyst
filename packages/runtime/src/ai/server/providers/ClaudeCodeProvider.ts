@@ -266,6 +266,7 @@ export class ClaudeCodeProvider extends BaseAgentProvider {
       superLoopProgressServerPort: null, // Disabled - was leaking into non-super-loop sessions
       sessionContextServerPort: ClaudeCodeDeps.sessionContextServerPort,
       metaAgentServerPort: ClaudeCodeDeps.metaAgentServerPort,
+      mcpAuthToken: ClaudeCodeDeps.mcpAuthToken,
       mcpConfigLoader: ClaudeCodeDeps.mcpConfigLoader,
       extensionPluginsLoader: ClaudeCodeDeps.extensionPluginsLoader,
       claudeSettingsEnvLoader: ClaudeCodeDeps.claudeSettingsEnvLoader,
@@ -365,6 +366,7 @@ export class ClaudeCodeProvider extends BaseAgentProvider {
   public static setSuperLoopProgressServerPort(port: number | null): void { ClaudeCodeDeps.setSuperLoopProgressServerPort(port); }
   public static setSessionContextServerPort(port: number | null): void { ClaudeCodeDeps.setSessionContextServerPort(port); }
   public static setMetaAgentServerPort(port: number | null): void { ClaudeCodeDeps.setMetaAgentServerPort(port); }
+  public static setMcpAuthToken(token: string | null): void { ClaudeCodeDeps.setMcpAuthToken(token); }
   public static setMCPConfigLoader(loader: ((workspacePath?: string) => Promise<Record<string, any>>) | null): void { ClaudeCodeDeps.setMCPConfigLoader(loader); }
   public static setExtensionPluginsLoader(loader: ((workspacePath?: string) => Promise<Array<{ type: 'local'; path: string }>>) | null): void { ClaudeCodeDeps.setExtensionPluginsLoader(loader); }
   public static setClaudeCodeSettingsLoader(loader: (() => Promise<{ projectCommandsEnabled: boolean; userCommandsEnabled: boolean }>) | null): void { ClaudeCodeDeps.setClaudeCodeSettingsLoader(loader); }

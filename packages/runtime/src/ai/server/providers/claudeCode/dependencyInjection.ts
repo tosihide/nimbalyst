@@ -61,6 +61,12 @@ export const ClaudeCodeDeps = {
   // Meta-agent MCP server port
   metaAgentServerPort: null as number | null,
 
+  // Per-launch bearer token for the internal Nimbalyst MCP HTTP servers.
+  // Issue #146: required so a malicious page in the user's browser can't
+  // invoke MCP tools against the localhost ports. Plumbed to the SDK
+  // subprocesses through the `headers` field on each MCP server config.
+  mcpAuthToken: null as string | null,
+
   // ---- Loaders ----
 
   // Returns merged user + workspace MCP servers
@@ -147,6 +153,10 @@ export const ClaudeCodeDeps = {
 
   setMetaAgentServerPort(port: number | null): void {
     this.metaAgentServerPort = port;
+  },
+
+  setMcpAuthToken(token: string | null): void {
+    this.mcpAuthToken = token;
   },
 
   setMCPConfigLoader(loader: McpConfigLoader | null): void {

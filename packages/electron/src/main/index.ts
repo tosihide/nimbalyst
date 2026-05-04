@@ -80,6 +80,13 @@ import { detectFileWorkspace, suggestWorkspaceForFile, getAdditionalDirectoriesF
 import { cliManager, initEnhancedPath, getEnhancedPath, getShellEnvironment } from './services/CLIManager';
 import { registerWorkspaceWindow, registerExtensionTools, shutdownHttpServer, startMcpHttpServer, updateDocumentState } from './mcp/httpServer';
 import { startSessionContextServer, cleanupSessionContextServer, shutdownSessionContextServer } from './mcp/sessionContextServer';
+import { generateMcpAuthToken, getMcpAuthToken } from './mcp/mcpAuth';
+import {
+  registerNimAssetSchemeAsPrivileged,
+  registerNimAssetProtocolHandler,
+  addNimAssetRoot,
+  removeNimAssetRoot,
+} from './protocols/nimAssetProtocol';
 import { SessionNamingService } from './services/SessionNamingService';
 import { SessionWakeupScheduler } from './services/SessionWakeupScheduler';
 import { getSessionWakeupsStore } from './services/RepositoryManager';
@@ -145,6 +152,12 @@ if (process.env.ELECTRON_RUN_AS_NODE === '1' && process.platform === 'darwin') {
 if (process.platform === 'win32') {
   app.setAppUserModelId('com.nimbalyst.electron');
 }
+
+// Issue #146: register the `nim-asset://` scheme as standard/secure BEFORE
+// `app.whenReady` resolves. Per Electron docs, schemes must be marked as
+// privileged before the app is ready or the renderer treats them as opaque
+// origins. The actual request handler is wired up after whenReady.
+registerNimAssetSchemeAsPrivileged();
 
 // NOTE: User data directory configuration is handled in bootstrap.ts
 // which runs BEFORE this file is imported, ensuring electron-store
@@ -869,6 +882,10 @@ app.whenReady().then(async () => {
         session.defaultSession.setSpellCheckerEnabled(false);
     }
 
+    // Issue #146: wire up the `nim-asset://` request handler. Workspaces are
+    // added to its allowlist below, as windows register their workspace path.
+    registerNimAssetProtocolHandler();
+
     // Show splash screen immediately so the user sees something while we initialize
     // Skip splash in Playwright tests - the splash window would be returned by firstWindow()
     // instead of the actual workspace window, causing tests to fail
@@ -1517,6 +1534,29 @@ app.whenReady().then(async () => {
 
     // Start MCP SSE server
     markStart('mcp-servers');
+
+    // Generate the per-launch bearer token before any MCP server starts.
+    // The same token is shared across all five internal MCP servers (they all
+    // run in this process). It is held in memory only -- never persisted.
+    // Issue #146: required so a malicious page in the user's browser can't
+    // invoke MCP tools against the localhost ports.
+    const mcpAuthToken = generateMcpAuthToken();
+    ClaudeCodeProvider.setMcpAuthToken(mcpAuthToken);
+    OpenAICodexProvider.setMcpAuthToken(mcpAuthToken);
+    OpenAICodexACPProvider.setMcpAuthToken(mcpAuthToken);
+    OpenCodeProvider.setMcpAuthToken(mcpAuthToken);
+    CopilotCLIProvider.setMcpAuthToken(mcpAuthToken);
+
+    // Test-only IPC handler: lets E2E tests verify the bearer token is
+    // enforced by the MCP servers. Mirrors the pattern used for
+    // `meta-agent:get-server-port`.
+    if (process.env.PLAYWRIGHT === '1' || process.env.PLAYWRIGHT_TEST === 'true' || process.env.NODE_ENV === 'test') {
+        safeHandle('mcp:get-auth-token', async () => {
+            const token = getMcpAuthToken();
+            return { success: token !== null, token };
+        });
+    }
+
     try {
         const result = await startMcpHttpServer(3456);
         mcpHttpServer = result.httpServer;
@@ -1620,6 +1660,9 @@ app.whenReady().then(async () => {
         if (state?.workspacePath && windowId) {
             // logger.mcp.info(`Registering workspace ${state.workspacePath} -> window ${windowId}`);
             registerWorkspaceWindow(state.workspacePath, windowId);
+            // Issue #146: also allow `nim-asset://` to serve images from the
+            // workspace. addNimAssetRoot is idempotent.
+            addNimAssetRoot(state.workspacePath);
         } else {
             logger.mcp.warn(`Cannot register workspace: workspacePath=${state?.workspacePath}, windowId=${windowId}`);
         }

@@ -118,6 +118,11 @@ export class OpenAICodexProvider extends BaseAgentProvider {
   // Meta-agent MCP server port (injected from electron main process)
   private static metaAgentServerPort: number | null = null;
 
+  // Per-launch bearer token for the internal Nimbalyst MCP HTTP servers.
+  // Issue #146: required so a malicious page in the user's browser can't
+  // invoke MCP tools against the localhost ports.
+  private static mcpAuthToken: string | null = null;
+
   // MCP config loader (injected from electron main process)
   // Returns merged user + workspace MCP servers
   private static mcpConfigLoader: ((workspacePath?: string) => Promise<Record<string, MCPServerConfig>>) | null = null;
@@ -193,6 +198,7 @@ export class OpenAICodexProvider extends BaseAgentProvider {
       superLoopProgressServerPort: null, // Disabled - was leaking into non-super-loop sessions
       sessionContextServerPort: OpenAICodexProvider.sessionContextServerPort,
       metaAgentServerPort: OpenAICodexProvider.metaAgentServerPort,
+      mcpAuthToken: OpenAICodexProvider.mcpAuthToken,
       mcpConfigLoader: OpenAICodexProvider.mcpConfigLoader,
       extensionPluginsLoader: null,
       claudeSettingsEnvLoader: OpenAICodexProvider.claudeSettingsEnvLoader,
@@ -242,6 +248,10 @@ export class OpenAICodexProvider extends BaseAgentProvider {
 
   public static setMetaAgentServerPort(port: number | null): void {
     OpenAICodexProvider.metaAgentServerPort = port;
+  }
+
+  public static setMcpAuthToken(token: string | null): void {
+    OpenAICodexProvider.mcpAuthToken = token;
   }
 
   public static setMCPConfigLoader(loader: ((workspacePath?: string) => Promise<Record<string, MCPServerConfig>>) | null): void {

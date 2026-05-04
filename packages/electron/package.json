@@ -4,6 +4,7 @@
   "private": true,
   "license": "MIT",
   "description": "Electron app for Nimbalyst",
+  "homepage": "https://nimbalyst.com",
   "main": "out/main/index.js",
   "bin": {
     "nimbalyst": "./bin/nimbalyst"
@@ -36,6 +37,7 @@
     "build:win:arm64": "npm run build && npm run build:extensions && npm run validate:win-updater-config && npm run validate:extra-resources && electron-builder --win --arm64",
     "build:win:all": "npm run build && npm run build:extensions && npm run validate:win-updater-config && npm run validate:extra-resources && electron-builder --win --x64 --arm64",
     "build:linux": "npm run build && npm run build:extensions && npm run validate:extra-resources && electron-builder --linux",
+    "build:linux:docker": "./scripts/build-linux-deb.sh",
     "test": "vitest",
     "test:ui": "vitest --ui",
     "test:watch": "vitest watch",
@@ -413,8 +415,17 @@
       "runAfterFinish": true
     },
     "linux": {
-      "target": "AppImage",
-      "artifactName": "${productName}-Linux.${ext}"
+      "target": [
+        { "target": "deb", "arch": ["x64"] },
+        { "target": "AppImage", "arch": ["x64"] }
+      ],
+      "artifactName": "${productName}-Linux-${arch}.${ext}",
+      "icon": "icon.png",
+      "category": "Development",
+      "maintainer": "Nimbalyst Inc. <support@nimbalyst.com>",
+      "vendor": "Nimbalyst Inc.",
+      "synopsis": "AI-native visual workspace for Codex and Claude Code",
+      "description": "Nimbalyst is a visual editor and session manager for building with AI coding agents. Manage multiple sessions in parallel, approve changes in red/green WYSIWYG, and collaborate visually on markdown, mockups, diagrams, CSV, Excalidraw, data models, and code."
     },
     "buildVersion": "0.36.5"
   }

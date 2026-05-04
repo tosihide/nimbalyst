@@ -420,12 +420,22 @@
         { "target": "AppImage", "arch": ["x64"] }
       ],
       "artifactName": "${productName}-Linux-${arch}.${ext}",
-      "icon": "icon.png",
+      "executableName": "nimbalyst",
+      "icon": "build/icons",
       "category": "Development",
       "maintainer": "Nimbalyst Inc. <support@nimbalyst.com>",
       "vendor": "Nimbalyst Inc.",
       "synopsis": "AI-native visual workspace for Codex and Claude Code",
-      "description": "Nimbalyst is a visual editor and session manager for building with AI coding agents. Manage multiple sessions in parallel, approve changes in red/green WYSIWYG, and collaborate visually on markdown, mockups, diagrams, CSV, Excalidraw, data models, and code."
+      "description": "Nimbalyst is a visual editor and session manager for building with AI coding agents. Manage multiple sessions in parallel, approve changes in red/green WYSIWYG, and collaborate visually on markdown, mockups, diagrams, CSV, Excalidraw, data models, and code.",
+      "desktop": {
+        "entry": {
+          "Name": "Nimbalyst",
+          "GenericName": "AI Workspace",
+          "Comment": "AI-native visual workspace for Codex and Claude Code",
+          "StartupWMClass": "Nimbalyst",
+          "Keywords": "AI;Editor;Markdown;Claude;Codex;"
+        }
+      }
     },
     "buildVersion": "0.36.5"
   }

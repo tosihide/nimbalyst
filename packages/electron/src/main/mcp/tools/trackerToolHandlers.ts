@@ -37,6 +37,45 @@ async function resolveTrackerRowByReference(
   return result.rows[0] || null;
 }
 
+/**
+ * Determine whether a tracker item's body content lives in a Y.Doc rather than
+ * in the PGLite `content` column.
+ *
+ * Why this matters: for team-synced native tracker items, the renderer's
+ * TrackerItemDetail panel mounts a CollabLexicalProvider for
+ * `tracker-content/{itemId}`, and the live Y.Doc becomes the source of truth.
+ * The PGLite `content` column is only a snapshot rewritten on every save from
+ * the Y.Doc state. An MCP write straight into PGLite would be silently
+ * clobbered the next time anyone (or anything) saves the editor, because the
+ * renderer never sees the MCP edit -- it reads from Y.Doc. See NIM-436.
+ *
+ * Conditions for "body is collaborative":
+ *  1. Item is native (no document_path) -- only natives use Y.Doc bodies.
+ *     Inline / frontmatter / file-backed items keep their body in the
+ *     source file and never touch Y.Doc.
+ *  2. Tracker type's sync policy is shared / hybrid.
+ *  3. Tracker sync is active for the workspace -- proxy for "this user has
+ *     a team connected for this workspace". When sync is inactive there is
+ *     no team plumbing in this process and the renderer would also fall
+ *     back to the local-PGLite editor (see TrackerItemDetail.contentMode),
+ *     so direct PGLite writes are safe.
+ */
+function isTrackerItemBodyCollaborative(
+  workspacePath: string | undefined,
+  trackerType: string,
+  source: string | null,
+  documentPath: string | null,
+  modelSyncMode: string | undefined,
+): boolean {
+  if (!workspacePath) return false;
+  // Native = no source file. Inline/frontmatter/import/file items have no Y.Doc body.
+  const isNative = (source === 'native' || source == null) && !documentPath;
+  if (!isNative) return false;
+  const policy = getEffectiveTrackerSyncPolicy(workspacePath, trackerType, modelSyncMode);
+  if (!shouldSyncTrackerPolicy(policy)) return false;
+  return isTrackerSyncActive(workspacePath);
+}
+
 /** Append an activity entry to a tracker item's data.activity array */
 function appendActivity(
   data: Record<string, any>,
@@ -1199,6 +1238,38 @@ export async function handleTrackerUpdate(
     // getCurrentIdentity imported statically at top of file
     data.lastModifiedBy = getCurrentIdentity(workspacePath);
 
+    // For collaborative tracker items the rich body lives in a Yjs document
+    // (`tracker-content/{itemId}` collab room), not in PGLite. Writing the
+    // description straight into PGLite would silently lose the edit when the
+    // renderer's next debounced save serialises the unchanged Y.Doc back over
+    // it (NIM-436). Refuse the description write and surface a structured
+    // skip so the caller can decide what to do (e.g., post a comment, or ask
+    // the user to make the body edit interactively). All other field updates
+    // (status, priority, etc.) still flow through normally because they sync
+    // via the tracker JSONB / field-level LWW path, not Y.Doc.
+    const { globalRegistry: trackerRegistry } = await import(
+      "@nimbalyst/runtime/plugins/TrackerPlugin/models/TrackerDataModel"
+    );
+    const itemModel = trackerRegistry.get(row.type);
+    const bodyIsCollab = isTrackerItemBodyCollaborative(
+      workspacePath,
+      row.type,
+      row.source ?? null,
+      row.document_path ?? null,
+      itemModel?.sync?.mode,
+    );
+    let descriptionSkipped: { reason: string } | null = null;
+    if (bodyIsCollab && args.description !== undefined) {
+      descriptionSkipped = {
+        reason:
+          "This tracker item's body lives in a collaborative Y.Doc, not the local database. " +
+          "Writing the description through MCP would be silently overwritten by the next " +
+          "renderer save. Skip-applied; use tracker_add_comment, or have the user edit the " +
+          "body in the tracker detail panel instead.",
+      };
+      delete args.description;
+    }
+
     // Resolve role-based field names for the item's type
     const { getTrackerRoleField } = await import('../../services/TrackerSchemaService');
     const rf = (role: string, fallback: string) => getTrackerRoleField(row.type, role as any) ?? fallback;
@@ -1258,13 +1329,29 @@ export async function handleTrackerUpdate(
     // Merge generic fields bag (overrides role-resolved args above)
     if (args.fields && typeof args.fields === 'object') {
       for (const [key, value] of Object.entries(args.fields)) {
-        if (value !== undefined) {
-          const oldVal = data[key];
-          if (oldVal !== value) {
-            changes[key] = { from: oldVal, to: value };
+        if (value === undefined) continue;
+        // Same Y.Doc-vs-PGLite hazard as args.description above: a generic
+        // `fields.description` write on a collab item would create a divergent
+        // JSONB snapshot that the renderer never picks up. Skip it here so
+        // there is no path -- explicit arg or generic bag -- that bypasses
+        // the collab body authority.
+        if (bodyIsCollab && key === 'description') {
+          if (!descriptionSkipped) {
+            descriptionSkipped = {
+              reason:
+                "This tracker item's body lives in a collaborative Y.Doc, not the local database. " +
+                "Writing the description through MCP would be silently overwritten by the next " +
+                "renderer save. Skip-applied; use tracker_add_comment, or have the user edit the " +
+                "body in the tracker detail panel instead.",
+            };
           }
-          data[key] = value;
+          continue;
         }
+        const oldVal = data[key];
+        if (oldVal !== value) {
+          changes[key] = { from: oldVal, to: value };
+        }
+        data[key] = value;
       }
     }
 
@@ -1394,7 +1481,7 @@ export async function handleTrackerUpdate(
       ? updatedRow.rows[0].type_tags
       : [row.type];
 
-    const structured = {
+    const structured: Record<string, any> = {
       action: "updated" as const,
       id: row.id,
       issueNumber: postSyncRow?.issue_number ?? refreshedRow?.issue_number ?? row.issue_number ?? undefined,
@@ -1404,6 +1491,17 @@ export async function handleTrackerUpdate(
       title: data.title,
       changes,
     };
+    if (descriptionSkipped) {
+      structured.skippedFields = { description: descriptionSkipped.reason };
+    }
+
+    const summaryLines = [
+      `Updated tracker item ${getTrackerDisplayRef({ id: row.id, issueKey: postSyncRow?.issue_key ?? refreshedRow?.issue_key ?? row.issue_key ?? undefined })}:`,
+      ...updateSummaryParts,
+    ];
+    if (descriptionSkipped) {
+      summaryLines.push(`- **Description**: NOT applied -- ${descriptionSkipped.reason}`);
+    }
 
     return {
       content: [
@@ -1411,7 +1509,7 @@ export async function handleTrackerUpdate(
           type: "text",
           text: JSON.stringify({
             structured,
-            summary: `Updated tracker item ${getTrackerDisplayRef({ id: row.id, issueKey: postSyncRow?.issue_key ?? refreshedRow?.issue_key ?? row.issue_key ?? undefined })}:\n${updateSummaryParts.join("\n")}`,
+            summary: summaryLines.join("\n"),
           }),
         },
       ],

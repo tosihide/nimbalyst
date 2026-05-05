@@ -51,7 +51,10 @@ import {
   handleTrackerGet,
   handleTrackerLinkSession,
   handleTrackerUnlinkSession,
+  handleTrackerUpdate,
 } from '../trackerToolHandlers';
+import { isTrackerSyncActive } from '../../../services/TrackerSyncManager';
+import { getEffectiveTrackerSyncPolicy, shouldSyncTrackerPolicy } from '../../../services/TrackerPolicyService';
 
 function makeRow(overrides: Record<string, unknown> = {}) {
   return {
@@ -366,5 +369,166 @@ describe('handleTrackerUnlinkSession', () => {
     expect(payload.structured.sessionId).toBe('session_missing');
     expect(payload.structured.linkedCount).toBe(0);
     expect(payload.structured.removed).toBe(true);
+  });
+});
+
+describe('handleTrackerUpdate description / collab body', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    // Default: non-collab (local) workspace -- description writes proceed.
+    vi.mocked(getEffectiveTrackerSyncPolicy).mockReturnValue({ mode: 'local', scope: 'project' });
+    vi.mocked(shouldSyncTrackerPolicy).mockReturnValue(false);
+    vi.mocked(isTrackerSyncActive).mockReturnValue(false);
+  });
+
+  function setupUpdateQueueWithDescription(extraRowFields: Record<string, unknown> = {}) {
+    const trackerRow = makeRow({
+      id: 'bug_target',
+      workspace: '/tmp/ws',
+      source: 'native',
+      document_path: '',
+      ...extraRowFields,
+    });
+    mockQuery
+      .mockResolvedValueOnce({ rows: [trackerRow] })                          // resolveTrackerRowByReference (initial)
+      .mockResolvedValueOnce({ rows: [] })                                    // UPDATE tracker_items SET data
+      .mockResolvedValueOnce({ rows: [] })                                    // UPDATE tracker_items SET content
+      .mockResolvedValueOnce({ rows: [trackerRow] })                          // notifyTrackerItemUpdated read
+      .mockResolvedValueOnce({ rows: [trackerRow] })                          // refreshedRow read for sync block
+      .mockResolvedValueOnce({ rows: [trackerRow] })                          // postSyncRow read
+      .mockResolvedValueOnce({ rows: [{ type_tags: ['bug'] }] });             // re-read type_tags
+    return trackerRow;
+  }
+
+  function setupUpdateQueueNoContentWrite() {
+    // Same as above but no SET content step (collab path skips it)
+    const trackerRow = makeRow({
+      id: 'bug_target',
+      workspace: '/tmp/ws',
+      source: 'native',
+      document_path: '',
+    });
+    mockQuery
+      .mockResolvedValueOnce({ rows: [trackerRow] })                          // resolveTrackerRowByReference (initial)
+      .mockResolvedValueOnce({ rows: [] })                                    // UPDATE tracker_items SET data
+      .mockResolvedValueOnce({ rows: [trackerRow] })                          // notifyTrackerItemUpdated read
+      .mockResolvedValueOnce({ rows: [trackerRow] })                          // refreshedRow read for sync block
+      .mockResolvedValueOnce({ rows: [trackerRow] })                          // postSyncRow read
+      .mockResolvedValueOnce({ rows: [{ type_tags: ['bug'] }] });             // re-read type_tags
+    return trackerRow;
+  }
+
+  it('writes description to PGLite for local-only items', async () => {
+    setupUpdateQueueWithDescription();
+
+    const result = await handleTrackerUpdate(
+      { id: 'NIM-1', description: 'New body text' },
+      '/tmp/ws',
+    );
+
+    expect(result.isError).toBe(false);
+    const updateContentCalls = mockQuery.mock.calls.filter(
+      (c) => /UPDATE tracker_items SET content/.test(String(c[0])),
+    );
+    expect(updateContentCalls).toHaveLength(1);
+
+    const payload = JSON.parse(result.content[0].text!);
+    expect(payload.structured.skippedFields).toBeUndefined();
+    expect(payload.structured.changes.description).toEqual({ from: undefined, to: 'New body text' });
+  });
+
+  it('refuses description writes for collab native items and skips the content column update', async () => {
+    vi.mocked(getEffectiveTrackerSyncPolicy).mockReturnValue({ mode: 'shared', scope: 'project' });
+    vi.mocked(shouldSyncTrackerPolicy).mockReturnValue(true);
+    vi.mocked(isTrackerSyncActive).mockReturnValue(true);
+    setupUpdateQueueNoContentWrite();
+
+    const result = await handleTrackerUpdate(
+      { id: 'NIM-1', description: 'AI-authored body' },
+      '/tmp/ws',
+    );
+
+    expect(result.isError).toBe(false);
+    const updateContentCalls = mockQuery.mock.calls.filter(
+      (c) => /UPDATE tracker_items SET content/.test(String(c[0])),
+    );
+    expect(updateContentCalls).toHaveLength(0);
+
+    const payload = JSON.parse(result.content[0].text!);
+    expect(payload.structured.skippedFields?.description).toMatch(/collaborative Y\.Doc/);
+    expect(payload.structured.changes.description).toBeUndefined();
+    expect(payload.summary).toMatch(/Description.*NOT applied/);
+  });
+
+  it('still applies non-body field updates when description is refused for a collab item', async () => {
+    vi.mocked(getEffectiveTrackerSyncPolicy).mockReturnValue({ mode: 'shared', scope: 'project' });
+    vi.mocked(shouldSyncTrackerPolicy).mockReturnValue(true);
+    vi.mocked(isTrackerSyncActive).mockReturnValue(true);
+    setupUpdateQueueNoContentWrite();
+
+    const result = await handleTrackerUpdate(
+      { id: 'NIM-1', description: 'AI body', status: 'in-progress', priority: 'high' },
+      '/tmp/ws',
+    );
+
+    expect(result.isError).toBe(false);
+    const payload = JSON.parse(result.content[0].text!);
+    expect(payload.structured.changes.status).toEqual({ from: 'to-do', to: 'in-progress' });
+    expect(payload.structured.changes.priority).toEqual({ from: 'high', to: 'high' });
+    expect(payload.structured.changes.description).toBeUndefined();
+    expect(payload.structured.skippedFields?.description).toBeDefined();
+  });
+
+  it('also blocks description set via the generic fields bag for collab items', async () => {
+    vi.mocked(getEffectiveTrackerSyncPolicy).mockReturnValue({ mode: 'shared', scope: 'project' });
+    vi.mocked(shouldSyncTrackerPolicy).mockReturnValue(true);
+    vi.mocked(isTrackerSyncActive).mockReturnValue(true);
+    setupUpdateQueueNoContentWrite();
+
+    const result = await handleTrackerUpdate(
+      { id: 'NIM-1', fields: { description: 'sneaky body via fields' } },
+      '/tmp/ws',
+    );
+
+    expect(result.isError).toBe(false);
+    const payload = JSON.parse(result.content[0].text!);
+    expect(payload.structured.changes.description).toBeUndefined();
+    expect(payload.structured.skippedFields?.description).toBeDefined();
+  });
+
+  it('does NOT refuse description for inline / file-backed items even when sync is active', async () => {
+    // Inline tracker item (frontmatter or marker) keeps its body in the
+    // source file, not Y.Doc. The collab body bug doesn't apply.
+    vi.mocked(getEffectiveTrackerSyncPolicy).mockReturnValue({ mode: 'shared', scope: 'project' });
+    vi.mocked(shouldSyncTrackerPolicy).mockReturnValue(true);
+    vi.mocked(isTrackerSyncActive).mockReturnValue(true);
+    setupUpdateQueueWithDescription({ source: 'frontmatter', document_path: 'design/foo.md' });
+
+    const result = await handleTrackerUpdate(
+      { id: 'NIM-1', description: 'updated body' },
+      '/tmp/ws',
+    );
+
+    expect(result.isError).toBe(false);
+    const payload = JSON.parse(result.content[0].text!);
+    expect(payload.structured.skippedFields).toBeUndefined();
+    expect(payload.structured.changes.description).toEqual({ from: undefined, to: 'updated body' });
+  });
+
+  it('does NOT refuse description when tracker sync is inactive (no team plumbing in this process)', async () => {
+    vi.mocked(getEffectiveTrackerSyncPolicy).mockReturnValue({ mode: 'shared', scope: 'project' });
+    vi.mocked(shouldSyncTrackerPolicy).mockReturnValue(true);
+    vi.mocked(isTrackerSyncActive).mockReturnValue(false);
+    setupUpdateQueueWithDescription();
+
+    const result = await handleTrackerUpdate(
+      { id: 'NIM-1', description: 'body while sync is offline' },
+      '/tmp/ws',
+    );
+
+    expect(result.isError).toBe(false);
+    const payload = JSON.parse(result.content[0].text!);
+    expect(payload.structured.skippedFields).toBeUndefined();
+    expect(payload.structured.changes.description).toEqual({ from: undefined, to: 'body while sync is offline' });
   });
 });

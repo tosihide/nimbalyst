@@ -6,7 +6,7 @@ import { MessageSegment } from './MessageSegment';
 import { MarkdownRenderer } from './MarkdownRenderer';
 import { ProviderIcon } from '../../icons/ProviderIcons';
 import { MaterialSymbol } from '../../icons/MaterialSymbol';
-import { formatMessageTime, formatDuration } from '../../../utils/dateUtils';
+import { formatMessageTime, formatDuration, formatTurnFinishedAt } from '../../../utils/dateUtils';
 import { copyToClipboard } from '../../../utils/clipboard';
 import { JSONViewer } from './JSONViewer';
 import { formatToolArguments, extractFilePathFromArgs } from '../utils/pathResolver';
@@ -2083,10 +2083,12 @@ export const RichTranscriptView = React.forwardRef<
                           const endTimestamp = message.createdAt?.getTime() ?? 0;
                           const duration = formatDuration(startTimestamp, endTimestamp);
                           if (!duration || duration === '0ms') return null;
+                          const finishedAt = formatTurnFinishedAt(endTimestamp);
                           const fileStats = computeTurnFileStats(messages, startIdx, index);
                           return (
                             <div className="rich-transcript-turn-elapsed text-xs text-[var(--nim-text-faint)] mt-2 ml-6">
                               Finished in {duration}
+                              {finishedAt && <span> {finishedAt}</span>}
                               {fileStats && (
                                 <span>
                                   {' · '}{fileStats.filesModified} file{fileStats.filesModified !== 1 ? 's' : ''}

@@ -107,6 +107,14 @@ export class OpenAICodexProvider extends BaseAgentProvider {
   private readonly codexEditGroupIdsBySession = new Map<string, Map<string, string>>();
   private codexEditGroupCounter = 0;
 
+  /**
+   * Tracks which Codex `file_change` raw item IDs we've already taken a
+   * pre-edit snapshot for, per session. The SDK emits `item.started` for
+   * `file_change` twice (second observation has post-edit content), so we
+   * dedupe and snapshot only on the first observation.
+   */
+  private readonly fileChangePreEditSnapshottedIds = new Map<string, Set<string>>();
+
   // Analytics initialization data, captured during first sendMessage call
   private _initData: {
     model: string;
@@ -910,6 +918,47 @@ export class OpenAICodexProvider extends BaseAgentProvider {
       })) {
         if (abortController.signal.aborted) {
           throw new Error('Operation cancelled');
+        }
+
+        // The codex-sdk numbers items per-turn (`item_0`, `item_1`, ...
+        // restarting each turn). `codexEditGroupIdsBySession` /
+        // `fileChangePreEditSnapshottedIds` are keyed on `(sessionId,
+        // rawItemId)` and are normally cleared on the terminal tool_call
+        // by `case 'tool_call'` below. Side paths that bypass the main
+        // loop -- notably `sendSessionNamingReminder`, which runs its own
+        // `for await` over `protocol.sendMessage` and never reaches case
+        // 'tool_call' -- can leave stale entries from earlier turns.
+        // Drop any prior-turn entry on `item.started` BEFORE the per-event
+        // handlers below run; otherwise the next turn's `item.started`
+        // would reuse the stale `editGroupId`, causing two tool calls in
+        // different turns to share a `providerToolCallId` (the transcript
+        // renderer dedupes them, hiding the later one) and the
+        // `fileChangePreEditSnapshottedIds` dedup would falsely skip the
+        // pre-edit snapshot for the new turn's file_change.
+        if (sessionId && event.type === 'raw_event' && event.metadata?.rawEvent) {
+          const startedItemId = this.extractCodexRawItemId(event.metadata.rawEvent);
+          if (startedItemId && this.getRawEventType(event.metadata.rawEvent) === 'item.started') {
+            this.clearCodexEditGroupForItem(sessionId, startedItemId);
+          }
+        }
+
+        // Pre-edit snapshot for `file_change`. The codex-sdk emits
+        // `item.started` BEFORE applying the patch on disk, which gives us
+        // the only deterministic moment to capture the real pre-edit
+        // baseline -- no watcher, no FileSnapshotCache, no
+        // recoverBaselineFromHistory fallback (those all break for
+        // gitignored or post-boot-created files). Dedup by itemId per
+        // session protects against the SDK ever emitting item.started
+        // twice; combined with the cross-turn clear above, this also
+        // ensures distinct turns reusing the same raw item id each get
+        // their own snapshot.
+        try {
+          const preEditChunk = await this.maybeBuildFileChangePreEditSnapshot(event, sessionId);
+          if (preEditChunk) {
+            yield preEditChunk;
+          }
+        } catch {
+          // never let snapshot work break the stream
         }
 
         // Store EACH raw event immediately as a separate database row
@@ -1823,11 +1872,95 @@ export class OpenAICodexProvider extends BaseAgentProvider {
    */
   private clearCodexEditGroupForItem(sessionId: string, rawItemId: string): void {
     const sessionMap = this.codexEditGroupIdsBySession.get(sessionId);
-    if (!sessionMap) return;
-    sessionMap.delete(rawItemId);
-    if (sessionMap.size === 0) {
-      this.codexEditGroupIdsBySession.delete(sessionId);
+    if (sessionMap) {
+      sessionMap.delete(rawItemId);
+      if (sessionMap.size === 0) {
+        this.codexEditGroupIdsBySession.delete(sessionId);
+      }
     }
+    const seen = this.fileChangePreEditSnapshottedIds.get(sessionId);
+    if (seen) {
+      seen.delete(rawItemId);
+      if (seen.size === 0) {
+        this.fileChangePreEditSnapshottedIds.delete(sessionId);
+      }
+    }
+  }
+
+  /**
+   * Build a `pre_edit_snapshot` StreamChunk from a Codex SDK event when it
+   * is the FIRST `item.started` observation of a `file_change` for this
+   * session. Reads each affected path from disk RIGHT NOW so the host can
+   * write a local-history pre-edit tag with the real baseline -- before
+   * Codex applies the patch.
+   *
+   * Returns null when the event is not a first-observation file_change
+   * item.started (every other event type, every other tool, and every
+   * subsequent observation of the same itemId within this turn).
+   *
+   * The dedup is defensive against the SDK ever emitting item.started
+   * twice; the per-(sessionId, rawItemId) entry is cleared at the top of
+   * the main `for await` loop on every `item.started`, so distinct turns
+   * that reuse the same raw item id each get their own snapshot.
+   */
+  private async maybeBuildFileChangePreEditSnapshot(
+    event: ProtocolEvent,
+    sessionId: string | undefined,
+  ): Promise<StreamChunk | null> {
+    if (!sessionId) return null;
+    const rawAny = (event as { metadata?: { rawEvent?: unknown } })?.metadata?.rawEvent as
+      | { type?: string; item?: { type?: string; id?: string; status?: string; changes?: Array<{ path?: string; kind?: string }> } }
+      | undefined;
+    if (rawAny?.type !== 'item.started') return null;
+    const rawItem = rawAny.item;
+    if (rawItem?.type !== 'file_change') return null;
+    if (!Array.isArray(rawItem.changes) || rawItem.changes.length === 0) return null;
+    const itemId = rawItem.id;
+    if (typeof itemId !== 'string' || !itemId) return null;
+
+    let seen = this.fileChangePreEditSnapshottedIds.get(sessionId);
+    if (!seen) {
+      seen = new Set<string>();
+      this.fileChangePreEditSnapshottedIds.set(sessionId, seen);
+    }
+    if (seen.has(itemId)) return null;
+    seen.add(itemId);
+
+    const fs = await import('fs');
+    const editGroupId = this.getOrMintCodexEditGroupId(sessionId, itemId);
+    const entries: Array<{ path: string; content: string | null; kind?: string }> = [];
+    for (const change of rawItem.changes) {
+      const filePath = change?.path;
+      if (typeof filePath !== 'string' || !filePath) continue;
+      const kind = change?.kind;
+      let content: string | null = null;
+      // For new-file creation (kind='add'), Codex writes the file BEFORE
+      // emitting item.started -- the opposite of kind='update'. Reading
+      // disk now would capture the post-edit body and the diff would come
+      // back empty. Force empty baseline for adds; for updates, read the
+      // real pre-edit content from disk.
+      if (kind === 'add' || kind === 'create' || kind === 'new') {
+        content = '';
+      } else {
+        try {
+          content = fs.readFileSync(filePath, 'utf8');
+        } catch {
+          // ENOENT for an update means the path was relocated or never
+          // existed; fall back to empty baseline so the diff still renders.
+          content = '';
+        }
+      }
+      entries.push({ path: filePath, content, kind });
+    }
+    if (entries.length === 0) return null;
+
+    return {
+      type: 'pre_edit_snapshot',
+      preEditSnapshot: {
+        toolUseId: editGroupId,
+        entries,
+      },
+    };
   }
 
   /**

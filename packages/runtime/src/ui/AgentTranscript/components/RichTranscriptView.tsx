@@ -709,11 +709,25 @@ export const toolCallDiffsToEdits = (diffs: any[]): any[] => {
     const operation = typeof diff.operation === 'string' ? diff.operation : 'edit';
 
     if (operation === 'create') {
+      // Prefer the explicit `content` field when the matcher provided it
+      // (Write/Edit tools include the file body directly). For Codex
+      // `file_change` with kind='add', the matcher returns
+      // `diffs: [{ oldString: '', newString: <full body> }]` from its
+      // history-snapshot fallback because the SDK's FileChangeItem.changes
+      // doesn't carry content -- pull the body off newString in that case
+      // so NewFilePreview renders with the actual file contents instead
+      // of an empty preview.
+      let content = typeof diff.content === 'string' ? diff.content : '';
+      if (!content && Array.isArray(diff.diffs) && diff.diffs.length > 0) {
+        content = diff.diffs
+          .map((d: any) => (typeof d?.newString === 'string' ? d.newString : ''))
+          .join('');
+      }
       out.push({
         filePath,
         type: 'add',
         operation: 'create',
-        content: typeof diff.content === 'string' ? diff.content : '',
+        content,
       });
       continue;
     }

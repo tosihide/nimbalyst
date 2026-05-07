@@ -1967,10 +1967,24 @@ class ToolCallMatcherImpl {
         logger.main.warn('[ToolCallMatcher] Failed to load canonical event for getDiffsFromToolCallContent:', canonicalError);
       }
 
+      // Build a lookup of session_files metadata.operation by file path so
+      // the create/delete kind set by SessionFileTracker is preserved here.
+      // Hardcoding 'edit' would mask new-file creation (NewFilePreview) and
+      // route everything to DiffViewer.
+      const opByFilePath = new Map<string, string>();
+      for (const row of linkResult.rows) {
+        const op = (row.metadata as Record<string, unknown> | undefined)?.operation;
+        if (typeof op === 'string' && !opByFilePath.has(row.file_path)) {
+          opByFilePath.set(row.file_path, op);
+        }
+      }
+
       const results: ToolCallDiffResult[] = [];
       for (const filePath of filePaths) {
-        const operation = toolName === 'Bash' ? 'bash' : 'edit';
-        const debug: string[] = [`match: toolUseId in session_files`, `tool: ${toolName}`];
+        const operation =
+          opByFilePath.get(filePath) ??
+          (toolName === 'Bash' ? 'bash' : 'edit');
+        const debug: string[] = [`match: toolUseId in session_files`, `tool: ${toolName}`, `op: ${operation}`];
         const diffResult: ToolCallDiffResult = {
           filePath,
           operation,

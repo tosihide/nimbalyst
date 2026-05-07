@@ -385,7 +385,7 @@ export interface ProviderSettings {
 }
 
 export interface StreamChunk {
-  type: 'text' | 'tool_call' | 'tool_error' | 'error' | 'complete' | 'stream_edit_start' | 'stream_edit_content' | 'stream_edit_end';
+  type: 'text' | 'tool_call' | 'tool_error' | 'error' | 'complete' | 'stream_edit_start' | 'stream_edit_content' | 'stream_edit_end' | 'pre_edit_snapshot';
   content?: string;
   isSystem?: boolean; // For system messages like slash command output
   toolCall?: {
@@ -438,6 +438,25 @@ export interface StreamChunk {
   contextWindow?: number;
   // Set to true when context was compacted this turn. Signals AIService to clear stale currentContext.
   contextCompacted?: boolean;
+  /**
+   * Pre-edit snapshot delivered by providers that have a clean
+   * tool-lifecycle signal (currently OpenAICodex `file_change` via
+   * `item.started`). Carries the on-disk content of each affected path,
+   * read BEFORE the agent applies its patch. The host writes a
+   * local-history pre-edit tag with that exact content so the diff
+   * renderer always has a real baseline -- gitignored files,
+   * never-snapshotted files, and post-boot-created files all work.
+   * Replaces the watcher/cache/recoverBaseline fallback chain for
+   * this provider.
+   */
+  preEditSnapshot?: {
+    toolUseId: string;
+    entries: Array<{
+      path: string;
+      content: string | null;
+      kind?: string;
+    }>;
+  };
 }
 
 export interface DiffArgs {

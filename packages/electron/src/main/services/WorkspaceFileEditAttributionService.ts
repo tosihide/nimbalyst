@@ -286,25 +286,39 @@ class WorkspaceFileEditAttributionServiceImpl {
         codexEditWindowRegistry.recordObservation(codexWindowMatch.editGroupId, event.filePath);
       }
 
-      await SessionFilesRepository.addFileLink({
-        sessionId: winner.sessionId,
-        workspaceId: event.workspacePath,
-        filePath: event.filePath,
-        linkType: 'edited',
-        timestamp: event.timestamp,
-        metadata: {
-          toolName: winner.toolName,
-          operation: winner.toolName === 'Bash' ? 'bash' : 'edit',
-          toolUseId,
-          watcherAttribution: {
-            score: winner.score,
-            reasons: winner.reasons,
-            messageId: winner.messageId,
-            toolCallItemId: winner.toolCallItemId,
-            fileTimestamp: event.timestamp,
+      // Skip the watcher-attribution session_files insert when the matched
+      // tool already has its own pre-edit hook that writes a session_files
+      // row with the correct operation (`create` / `edit` / `delete`).
+      // OpenAICodexProvider emits a `pre_edit_snapshot` chunk on
+      // item.started for `file_change`, which routes through
+      // sessionFileTracker.trackToolExecution -- BEFORE the file is written
+      // and well before chokidar fires. A redundant watcher-attribution row
+      // here would clobber the create/delete kind with a hardcoded
+      // `operation: 'edit'` (different signature -> new row), and the
+      // ai_tool_call_file_edits matcher would then link against the wrong
+      // row in the renderer.
+      const skipWatcherAttribution = winner.toolName === 'file_change';
+      if (!skipWatcherAttribution) {
+        await SessionFilesRepository.addFileLink({
+          sessionId: winner.sessionId,
+          workspaceId: event.workspacePath,
+          filePath: event.filePath,
+          linkType: 'edited',
+          timestamp: event.timestamp,
+          metadata: {
+            toolName: winner.toolName,
+            operation: winner.toolName === 'Bash' ? 'bash' : 'edit',
+            toolUseId,
+            watcherAttribution: {
+              score: winner.score,
+              reasons: winner.reasons,
+              messageId: winner.messageId,
+              toolCallItemId: winner.toolCallItemId,
+              fileTimestamp: event.timestamp,
+            },
           },
-        },
-      });
+        });
+      }
 
       counters.attributedEdits++;
 

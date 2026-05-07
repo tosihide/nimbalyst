@@ -11,8 +11,12 @@ describe('CodexEditWindowRegistry', () => {
   });
 
   describe('shouldOpenCodexEditWindow', () => {
-    it('opens windows for file_change', () => {
-      expect(shouldOpenCodexEditWindow('file_change')).toBe(true);
+    it('does not auto-open windows for file_change (handled via pre_edit_snapshot)', () => {
+      // file_change attribution moved to the OpenAICodexProvider
+      // pre_edit_snapshot chunk path, which captures the real pre-edit
+      // baseline directly from disk on item.started -- so the registry
+      // no longer needs to auto-open a window for it.
+      expect(shouldOpenCodexEditWindow('file_change')).toBe(false);
     });
 
     it('does not open windows for command_execution (per Phase 2 scope)', () => {

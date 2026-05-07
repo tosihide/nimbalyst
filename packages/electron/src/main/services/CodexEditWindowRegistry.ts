@@ -48,13 +48,16 @@ export interface CodexEditWindow {
 }
 
 /**
- * Codex tool names that always open an edit attribution window. `file_change`
- * is the only Codex-native write event in v1; MCP tools opt in via
- * `isWriteCapableMcpTool` below.
+ * Codex tool names that always open an edit attribution window.
+ *
+ * `file_change` USED to be the lone entry here, but its edits are now
+ * attributed via the `pre_edit_snapshot` chunk path -- the codex-sdk emits
+ * `item.started` for `file_change` BEFORE applying the patch, which lets
+ * us read the real pre-edit baseline straight from disk and bypass the
+ * watcher entirely. The registry now only serves write-capable MCP tools
+ * (see `isWriteCapableMcpTool`) which have no equivalent lifecycle hook.
  */
-const ALWAYS_OPEN_TOOL_NAMES = new Set<string>([
-  'file_change',
-]);
+const ALWAYS_OPEN_TOOL_NAMES = new Set<string>([]);
 
 /**
  * Identify MCP tools that are known to write files in the workspace, so we

@@ -13,7 +13,6 @@
  */
 
 import { BrowserWindow } from 'electron';
-import * as fs from 'fs';
 import * as path from 'path';
 import {
   ProviderFactory,
@@ -70,10 +69,7 @@ import {
   tagFileBeforeEdit,
   detectConfiguredAIProvider,
   detectNimbalystSlashCommand,
-  recoverBaselineFromHistory,
   readFileContentOrNull,
-  isCreateLikeChangeKind,
-  isBinaryFile,
   getFileExtensionForAnalytics,
 } from './aiServiceUtils';
 import { disableParentNotificationsAfterDirectTakeover } from './childSessionTakeover';
@@ -1162,6 +1158,115 @@ export class MessageStreamingHandler {
             });
             break;
 
+          case 'pre_edit_snapshot':
+            // OpenAICodexProvider yields this on the first `item.started`
+            // observation of a `file_change` -- BEFORE Codex applies the
+            // patch on disk. The chunk carries each affected path's true
+            // pre-edit content, read from disk at the right moment. We
+            // write it as a local-history pre-edit tag so the diff
+            // renderer always has a real baseline (gitignored files,
+            // never-cached files, post-boot-created files all included).
+            // This replaces the watcher/cache/recoverBaseline fallback
+            // that previously ran at item.completed and produced
+            // empty-baseline diffs for any path the cache hadn't seen.
+            if (chunk.preEditSnapshot) {
+              const { toolUseId, entries } = chunk.preEditSnapshot;
+
+              // Worktree adoption: any change path may live under a
+              // worktree the session hasn't adopted yet. Adopt before
+              // writing tags so they land in the correct workspace
+              // history.
+              for (const entry of entries) {
+                if (!entry?.path) continue;
+                const absPath = path.isAbsolute(entry.path)
+                  ? path.normalize(entry.path)
+                  : path.resolve(effectiveWorkspacePath, entry.path);
+                const inferredWorktreePath = this.svc.inferWorktreePathFromFilePath(workspacePath, absPath);
+                if (inferredWorktreePath) {
+                  await this.svc.adoptWorktreeForSession(session, inferredWorktreePath, event);
+                  effectiveWorkspacePath = session.worktreePath || effectiveWorkspacePath;
+                  permissionsPath = session.worktreeProjectPath || permissionsPath;
+                  break;
+                }
+              }
+
+              // For 'update' kind entries, prefer the FileSnapshotCache as
+              // the baseline source: it holds the file content captured at
+              // session-start (or earliest observation of the file), which
+              // is guaranteed pre-edit. Disk-read at item.started can race
+              // with Codex applying its patch synchronously -- when that
+              // race lands, `entry.content` IS the post-edit body, the tag
+              // baseline equals the new content, and DocumentModel's
+              // empty-diff guard skips creating a DiffSession (the editor
+              // never enters diff mode). For 'add' kind, the provider
+              // already forces empty content; pass it through unchanged.
+              const watcherEntryForBaseline = this.svc.hooklessWatcher.getEntry(session.id);
+              for (const entry of entries) {
+                if (!entry?.path) continue;
+                const absPath = path.isAbsolute(entry.path)
+                  ? path.normalize(entry.path)
+                  : path.resolve(effectiveWorkspacePath, entry.path);
+                addGitignoreBypass(effectiveWorkspacePath, absPath);
+                const tagId = `ai-edit-pending-${session.id}-${toolUseId}`;
+
+                let baselineContent: string = entry.content ?? '';
+                const isAddKind = entry.kind === 'add' || entry.kind === 'create' || entry.kind === 'new';
+                if (!isAddKind && watcherEntryForBaseline) {
+                  try {
+                    const cached = await watcherEntryForBaseline.cache.getBeforeState(absPath);
+                    if (typeof cached === 'string') {
+                      baselineContent = cached;
+                    }
+                  } catch {
+                    // Cache miss / cache error -- fall through to disk-read content.
+                  }
+                }
+
+                try {
+                  // replaceSpeculative: this is the authoritative
+                  // pre-edit baseline source for Codex `file_change` --
+                  // FileSnapshotCache is the primary source (captured at
+                  // session start, guaranteed pre-edit) with disk read as
+                  // fallback. Override any tag the bash-watcher /
+                  // workspace-watcher paths may have written speculatively
+                  // earlier this turn (their attribution can mis-score a
+                  // recent `sed` command higher than the still-being-stored
+                  // file_change in the same chokidar tick).
+                  await historyManager.createTag(
+                    effectiveWorkspacePath,
+                    absPath,
+                    tagId,
+                    baselineContent,
+                    session.id,
+                    toolUseId,
+                    { replaceSpeculative: true },
+                  );
+                  await sessionFileTracker.trackToolExecution(
+                    session.id,
+                    effectiveWorkspacePath,
+                    'file_change',
+                    { changes: [{ path: absPath, kind: entry.kind ?? 'update' }] },
+                    undefined,
+                    toolUseId,
+                    null,
+                  );
+                } catch (preEditError) {
+                  const errorStr = String(preEditError);
+                  if (
+                    !errorStr.includes('unique') &&
+                    !errorStr.includes('UNIQUE') &&
+                    !errorStr.includes('duplicate')
+                  ) {
+                    logger.ai.error(
+                      '[AIService] pre_edit_snapshot tag write failed',
+                      preEditError,
+                    );
+                  }
+                }
+              }
+            }
+            break;
+
           case 'tool_call':
             if (chunk.toolCall) {
               toolCallCount++;
@@ -1312,13 +1417,19 @@ export class MessageStreamingHandler {
                         }
                         const editToolUseId = toolUseId || `${session.provider}-edit-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
                         const tagId = `ai-edit-pending-${session.id}-${editToolUseId}`;
+                        // OpenCode / Codex-ACP edit tools fire on the
+                        // `running` status of the actual write tool, so
+                        // this is the authoritative pre-edit moment for
+                        // their attribution -- override any speculative
+                        // bash-watcher tag written earlier this turn.
                         await historyManager.createTag(
                           effectiveWorkspacePath,
                           editFilePath,
                           tagId,
                           beforeContent,
                           session.id,
-                          editToolUseId
+                          editToolUseId,
+                          { replaceSpeculative: true },
                         );
                       } catch (preEditError) {
                         const errorStr = String(preEditError);
@@ -1392,167 +1503,14 @@ export class MessageStreamingHandler {
                 logger.ai.warn('[AIService] applyDiff payload missing replacements', previewForLog(rawArgs));
               }
 
-              // Snapshot file contents for file_change events before saving
-              if (toolName === 'file_change' && toolArgs?.changes) {
-                const rawChanges = toolArgs.changes as Array<{ path: string; kind?: string }>;
-
-                for (const change of rawChanges) {
-                  if (!change?.path) continue;
-                  const candidatePath = path.isAbsolute(change.path)
-                    ? path.normalize(change.path)
-                    : path.resolve(effectiveWorkspacePath, change.path);
-                  const inferredWorktreePath = this.svc.inferWorktreePathFromFilePath(workspacePath, candidatePath);
-                  if (inferredWorktreePath) {
-                    await this.svc.adoptWorktreeForSession(session, inferredWorktreePath, event);
-                    effectiveWorkspacePath = session.worktreePath || effectiveWorkspacePath;
-                    permissionsPath = session.worktreeProjectPath || permissionsPath;
-                    break;
-                  }
-                }
-
-                const changes = rawChanges
-                  .filter((change): change is { path: string; kind?: string } => !!change?.path)
-                  .map((change) => ({
-                    ...change,
-                    path: path.isAbsolute(change.path)
-                      ? path.normalize(change.path)
-                      : path.resolve(effectiveWorkspacePath, change.path),
-                  }));
-
-                // Register gitignore bypass for all changed files immediately.
-                // Codex writes files before emitting file_change events, so the
-                // fs.watch event may have already fired and been buffered. The bypass
-                // triggers replay of any buffered events.
-                for (const change of changes) {
-                  if (change?.path && effectiveWorkspacePath) {
-                    addGitignoreBypass(effectiveWorkspacePath, change.path);
-                  }
-                }
-
-                const fileSnapshots: Record<string, { content: string | null; error?: string; isBinary?: boolean; truncated?: boolean }> = {};
-                const MAX_SNAPSHOT_SIZE = 100_000; // 100KB per file
-
-                // Proactive pre-edit snapshot: capture the before-state from the
-                // FileSnapshotCache BEFORE reading current (post-edit) content.
-                // The file has already been modified by Codex, so disk reads give
-                // after-state. The cache holds the content as of session start.
-                const watcherEntry = this.svc.hooklessWatcher.getEntry(session.id);
-                if (watcherEntry) {
-                  for (const change of changes) {
-                    if (!change?.path || change.kind === 'delete') continue;
-                    try {
-                      const currentContentForCheck = await readFileContentOrNull(change.path);
-                      let beforeContent = await watcherEntry.cache.getBeforeState(change.path);
-                      if (beforeContent === null) {
-                        // Ensure apply_patch edits still create pending-review tags when
-                        // the snapshot cache has no baseline (new/ignored files).
-                        // Skip binary files to avoid invalid diff baselines.
-                        if (isBinaryFile(change.path)) {
-                          continue;
-                        }
-                        if (!isCreateLikeChangeKind(change.kind)) {
-                          const recoveredBaseline = await recoverBaselineFromHistory(change.path, currentContentForCheck);
-                          if (recoveredBaseline !== null) {
-                            beforeContent = recoveredBaseline;
-                          } else {
-                            // Last-resort fallback: keep diff mode functional even when we
-                            // cannot reconstruct precise pre-edit content (e.g. ignored files
-                            // with no prior snapshots).
-                            logger.ai.warn('[AIService] Missing baseline for non-create change; using empty fallback baseline', {
-                              filePath: change.path,
-                              kind: change.kind,
-                              sessionId: session.id,
-                            });
-                            beforeContent = '';
-                          }
-                        } else {
-                          beforeContent = '';
-                        }
-                      }
-
-                      // Guard against stale cache baselines that already match post-edit
-                      // disk content. In that case, watcher attribution will provide a
-                      // better before-state; creating a tag here would produce no visible diff.
-                      if (currentContentForCheck !== null && beforeContent === currentContentForCheck) {
-                        continue;
-                      }
-
-                      // Prefer the synthetic edit-group ID stamped by the
-                      // OpenAICodexProvider so the pre-edit history tag,
-                      // SessionFileTracker dedupe key, and CodexRawParser-minted
-                      // canonical providerToolCallId all reference the same
-                      // group. Fall back to chunk.toolCall.id only for older
-                      // streaming code paths that don't yet stamp toolUseId.
-                      const codexSyntheticToolUseId =
-                        typeof (chunk.toolCall as any)?.toolUseId === 'string'
-                          ? ((chunk.toolCall as any).toolUseId as string)
-                          : undefined;
-                      const toolUseId =
-                        codexSyntheticToolUseId
-                        ?? (typeof chunk.toolCall.id === 'string'
-                          ? chunk.toolCall.id
-                          : `codex-file-change-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`);
-                      const tagId = `ai-edit-pending-${session.id}-${toolUseId}`;
-                      await historyManager.createTag(
-                        effectiveWorkspacePath,
-                        change.path,
-                        tagId,
-                        beforeContent,
-                        session.id,
-                        toolUseId
-                      );
-                      // Track the file edit so getDiffsFromToolCallContent can find it
-                      await sessionFileTracker.trackToolExecution(
-                        session.id,
-                        effectiveWorkspacePath,
-                        'file_change',
-                        { changes: [change] },
-                        undefined,
-                        toolUseId,
-                        null  // Watcher already running for this session
-                      );
-                    } catch (preEditError) {
-                      const errorStr = String(preEditError);
-                      if (!errorStr.includes('unique') && !errorStr.includes('UNIQUE') && !errorStr.includes('duplicate')) {
-                        logger.ai.error('[AIService] Failed to create pre-edit snapshot for file_change:', preEditError);
-                      }
-                    }
-                  }
-                }
-
-                for (const change of changes) {
-                  if (!change?.path) continue;
-                  if (change.kind === 'delete') {
-                    fileSnapshots[change.path] = { content: null };
-                    continue;
-                  }
-                  try {
-                    const buffer = fs.readFileSync(change.path);
-                    // Binary detection: check for null bytes in first 8KB
-                    const sampleSize = Math.min(buffer.length, 8192);
-                    let isBinary = false;
-                    for (let i = 0; i < sampleSize; i++) {
-                      if (buffer[i] === 0) { isBinary = true; break; }
-                    }
-                    if (isBinary) {
-                      fileSnapshots[change.path] = { content: null, isBinary: true };
-                    } else if (buffer.length > MAX_SNAPSHOT_SIZE) {
-                      fileSnapshots[change.path] = { content: buffer.toString('utf-8', 0, MAX_SNAPSHOT_SIZE), truncated: true };
-                    } else {
-                      fileSnapshots[change.path] = { content: buffer.toString('utf-8') };
-                    }
-                  } catch (err) {
-                    fileSnapshots[change.path] = { content: null, error: err instanceof Error ? err.message : String(err) };
-                  }
-                }
-
-                // Attach snapshots to the tool call result
-                if (typeof chunk.toolCall.result === 'object' && chunk.toolCall.result !== null) {
-                  (chunk.toolCall.result as any).fileSnapshots = fileSnapshots;
-                } else {
-                  chunk.toolCall.result = { success: true, fileSnapshots };
-                }
-              }
+              // file_change handling moved to the `pre_edit_snapshot` chunk
+              // (yielded by OpenAICodexProvider on item.started, before Codex
+              // applies the patch). That handler does worktree adoption,
+              // gitignore bypass, history-tag creation, and session_files
+              // tracking with the real pre-edit baseline -- no watcher,
+              // no cache, no recoverBaseline fallback. By the time this
+              // tool_call arrives at item.completed, the diff record is
+              // already correctly populated.
 
               // Agent providers (claude-code, codex, opencode) render tool calls
               // through the canonical transcript pipeline. The legacy addMessage +

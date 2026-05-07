@@ -86,6 +86,14 @@ export class OpenAICodexProvider extends BaseAgentProvider {
   private static readonly MODEL_ID_CACHE_DURATION_MS = 5 * 60 * 1000;
   private static readonly MODEL_ID_CACHE_MAX_SIZE = 100;
   private static readonly MODEL_ID_CACHE = new Map<string, { fetchedAt: number; ids: Set<string> }>();
+  private static readonly KNOWN_SLASH_COMMANDS: ReadonlyArray<string> = [
+    'compact',
+    'diff',
+    'init',
+    'mcp',
+    'review',
+    'status',
+  ];
 
   private readonly protocol: CodexSDKProtocol;
   private readonly permissionService: ToolPermissionService;
@@ -685,6 +693,10 @@ export class OpenAICodexProvider extends BaseAgentProvider {
     return this.DEFAULT_MODEL;
   }
 
+  static getKnownSlashCommands(): string[] {
+    return [...OpenAICodexProvider.KNOWN_SLASH_COMMANDS];
+  }
+
   getName(): string {
     return 'openai-codex';
   }
@@ -695,6 +707,10 @@ export class OpenAICodexProvider extends BaseAgentProvider {
 
   getDescription(): string {
     return 'OpenAI Codex SDK agent provider with tool and streaming support';
+  }
+
+  getSlashCommands(): string[] {
+    return OpenAICodexProvider.getKnownSlashCommands();
   }
 
   getProviderSessionData(sessionId: string): any {

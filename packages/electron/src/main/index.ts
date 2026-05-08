@@ -108,6 +108,7 @@ import { claudeUsageService } from './services/ClaudeUsageService';
 import { registerCodexUsageHandlers } from './ipc/CodexUsageHandlers';
 import { codexUsageService } from './services/CodexUsageService';
 import { registerExtensionHandlers, getClaudePluginPaths, initializeExtensionFileTypes } from './ipc/ExtensionHandlers';
+import { getAgentWorkflowService } from './services/AgentWorkflowService';
 import { queueMarketplaceInstallRequest, registerExtensionMarketplaceHandlers, runExtensionAutoUpdate } from './ipc/ExtensionMarketplaceHandlers';
 import { getRegisteredExtensions } from './extensions/RegisteredFileTypes';
 import { ClaudeCodeProvider, OpenAICodexProvider, OpenAICodexACPProvider, OpenCodeProvider, CopilotCLIProvider } from '@nimbalyst/runtime/ai/server';
@@ -1259,7 +1260,12 @@ app.whenReady().then(async () => {
     // Inject extension plugins loader into ClaudeCodeProvider
     // This allows extensions to provide Claude SDK plugins with custom commands/agents
     // Uses main-process-native implementation that reads extension manifests directly
-    ClaudeCodeProvider.setExtensionPluginsLoader(getClaudePluginPaths);
+    ClaudeCodeProvider.setExtensionPluginsLoader(async (workspacePath?: string) => {
+        if (!workspacePath) {
+            return getClaudePluginPaths(workspacePath);
+        }
+        return getAgentWorkflowService(workspacePath).getClaudeProviderPluginPaths();
+    });
 
     // ScheduleWakeup handler: the CLI emits ScheduleWakeup tool calls but its tool_result is
     // informational only. Re-queue the prompt at fire time via SessionWakeupScheduler.

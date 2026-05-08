@@ -99,6 +99,7 @@ import {
 } from './aiServiceUtils';
 import { MessageStreamingHandler } from './MessageStreamingHandler';
 import { HooklessAgentFileWatcher } from './HooklessAgentFileWatcher';
+import { getAgentWorkflowService } from '../AgentWorkflowService';
 
 const execFileAsync = promisify(execFile);
 
@@ -1233,6 +1234,56 @@ export class AIService {
     // NOTE: Message sync is handled automatically by SyncedAgentMessagesStore
 
     return provider;
+  }
+
+  private getProviderWorkflowCatalog(request: {
+    sessionId?: string;
+    provider?: string | null;
+  }): { commands: string[]; skills: string[] } {
+    const providerCandidates = request.provider
+      ? [request.provider]
+      : ['claude-code', 'openai-codex'];
+
+    let provider: AIProvider | undefined;
+    for (const providerType of providerCandidates) {
+      if (!request.sessionId) {
+        break;
+      }
+
+      provider = ProviderFactory.getProvider(providerType as AIProviderType, request.sessionId) ?? undefined;
+      if (provider) {
+        break;
+      }
+    }
+
+    if (isSlashCommandCatalogProvider(provider)) {
+      const commands = typeof provider.getSlashCommands === 'function'
+        ? provider.getSlashCommands()
+        : [];
+      const skills = typeof provider.getSkills === 'function'
+        ? provider.getSkills()
+        : [];
+
+      if (commands.length > 0 || skills.length > 0) {
+        return { commands, skills };
+      }
+    }
+
+    if (request.provider === 'claude-code' || !request.provider) {
+      return {
+        commands: ClaudeCodeProvider.getCachedSdkSlashCommands(),
+        skills: ClaudeCodeProvider.getCachedSdkSkills(),
+      };
+    }
+
+    if (request.provider === 'openai-codex') {
+      return {
+        commands: OpenAICodexProvider.getKnownSlashCommands(),
+        skills: [],
+      };
+    }
+
+    return { commands: [], skills: [] };
   }
 
   /**
@@ -2915,6 +2966,43 @@ export class AIService {
       return { success: true };
     });
 
+    safeHandle('ai:getAgentWorkflows', async (
+      _event,
+      payload?: {
+        workspacePath?: string;
+        sessionId?: string;
+        provider?: string | null;
+      }
+    ) => {
+      try {
+        const request = payload ?? {};
+        if (!request.workspacePath) {
+          throw new Error('ai:getAgentWorkflows requires workspacePath');
+        }
+
+        const resolvedProvider = request.provider ?? 'claude-code';
+        const nativeCatalog = this.getProviderWorkflowCatalog({
+          sessionId: request.sessionId,
+          provider: resolvedProvider,
+        });
+
+        const workflows = await getAgentWorkflowService(request.workspacePath).listEntries({
+          provider: resolvedProvider,
+          nativeCommands: nativeCatalog.commands,
+          nativeSkills: nativeCatalog.skills,
+        });
+
+        return { success: true, workflows };
+      } catch (error) {
+        console.error('[AIService] Error getting agent workflows:', error);
+        return {
+          success: false,
+          workflows: [],
+          error: error instanceof Error ? error.message : 'Unknown error',
+        };
+      }
+    });
+
     safeHandle('ai:getSlashCommands', async (
       _event,
       payload?: string | { sessionId?: string; provider?: string | null }
@@ -2923,46 +3011,8 @@ export class AIService {
         const request = typeof payload === 'string'
           ? { sessionId: payload, provider: undefined }
           : payload ?? {};
-        const providerCandidates = request.provider
-          ? [request.provider]
-          : ['claude-code', 'openai-codex'];
-
-        let provider: AIProvider | undefined;
-        for (const providerType of providerCandidates) {
-          if (!request.sessionId) {
-            break;
-          }
-
-          provider = ProviderFactory.getProvider(providerType as AIProviderType, request.sessionId) ?? undefined;
-          if (provider) {
-            break;
-          }
-        }
-
-        if (isSlashCommandCatalogProvider(provider)) {
-          const commands = typeof provider.getSlashCommands === 'function'
-            ? provider.getSlashCommands()
-            : [];
-          const skills = typeof provider.getSkills === 'function'
-            ? provider.getSkills()
-            : [];
-
-          if (commands.length > 0 || skills.length > 0) {
-            return { success: true, commands, skills };
-          }
-        }
-
-        if (request.provider === 'claude-code' || !request.provider) {
-          const cachedCommands = ClaudeCodeProvider.getCachedSdkSlashCommands();
-          const cachedSkills = ClaudeCodeProvider.getCachedSdkSkills();
-          return { success: true, commands: cachedCommands, skills: cachedSkills };
-        }
-
-        if (request.provider === 'openai-codex') {
-          return { success: true, commands: OpenAICodexProvider.getKnownSlashCommands(), skills: [] };
-        }
-
-        return { success: true, commands: [], skills: [] };
+        const { commands, skills } = this.getProviderWorkflowCatalog(request);
+        return { success: true, commands, skills };
       } catch (error) {
         console.error('[AIService] Error getting slash commands:', error);
         return { success: false, commands: [], skills: [], error: error instanceof Error ? error.message : 'Unknown error' };

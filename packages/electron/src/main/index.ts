@@ -1634,18 +1634,25 @@ app.whenReady().then(async () => {
     markEnd('ai-service-init');
 
     // Recovery sweep: any queued_prompts row that was 'executing' when the
-    // app shut down is now invisible to listPending and effectively stuck.
-    // Reset all such rows back to 'pending' so the queue auto-trigger /
-    // explicit triggerQueueProcessing can pick them up. Single broad sweep
-    // is simpler than per-session bookkeeping and is idempotent.
+    // app shut down is now invisible to listPending. sweepExecutingOnBoot
+    // distinguishes "delivered, but the agent was paused on a user prompt
+    // (AskUserQuestion / ExitPlanMode / permission request) at quit" from
+    // "crashed before the user message was ever sent" by checking whether
+    // an ai_agent_messages input row exists for the session at or after
+    // claimed_at. Delivered rows are marked completed; undelivered rows
+    // are rolled back to pending for retry. Without this split, a session
+    // paused on AskUserQuestion at quit gets its original user prompt
+    // re-sent on next launch (NIM-615).
     try {
       const { getQueuedPromptsStore } = await import('./services/RepositoryManager');
-      const rolledBack = await getQueuedPromptsStore().rollbackAllExecuting();
-      if (rolledBack > 0) {
-        logger.main.info(`[Main] Boot sweep: rolled back ${rolledBack} stuck queued prompt(s) from previous run`);
+      const { completed, rolledBack } = await getQueuedPromptsStore().sweepExecutingOnBoot();
+      if (completed > 0 || rolledBack > 0) {
+        logger.main.info(
+          `[Main] Boot sweep: ${completed} delivered prompt(s) marked completed, ${rolledBack} undelivered prompt(s) rolled back to pending`
+        );
       }
-    } catch (rollbackErr) {
-      logger.main.error('[Main] Boot sweep rollbackAllExecuting failed:', rollbackErr);
+    } catch (sweepErr) {
+      logger.main.error('[Main] Boot sweep failed:', sweepErr);
     }
 
     // Check for pending restart continuations and queue continuation prompts
@@ -1780,7 +1787,7 @@ app.whenReady().then(async () => {
                 if (!aiSvcRef) {
                     return { triggered: false };
                 }
-                await aiSvcRef.queuePromptForSession(sessionId, prompt);
+                await aiSvcRef.queuePromptForSession(sessionId, prompt, undefined, { promptOrigin: 'wakeup_resume' });
                 const triggered = await aiSvcRef.triggerQueuedPromptProcessingForSession(
                     sessionId,
                     workspacePath,

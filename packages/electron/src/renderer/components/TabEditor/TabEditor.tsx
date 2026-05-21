@@ -2062,9 +2062,16 @@ export const TabEditor: React.FC<TabEditorProps> = ({
         // Also register with DocumentModel handle for coordinated notifications
         if (documentModelHandleRef.current) {
           return documentModelHandleRef.current.onFileChanged((content) => {
-            if (typeof content === 'string') {
-              callback(content);
-            }
+            if (typeof content !== 'string') return;
+            // Mirror the built-in editor guard (the `onFileChanged` handler above
+            // skips when isApplyingDiffRef/pendingAIEditTagRef is set): while an
+            // AI-edit diff is in flight, don't deliver the raw file change to a
+            // custom editor. Its external-change handler would discard the
+            // pending-review diff before it can render (#328). The modified
+            // content already reaches the editor through the diff request path,
+            // and the final content arrives via diff resolution.
+            if (isApplyingDiffRef.current || pendingAIEditTagRef.current) return;
+            callback(content);
           });
         }
         return () => {

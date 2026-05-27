@@ -27,6 +27,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Tracker table view now gives the Type column enough width to show its header and icon instead of collapsing to a clipped sliver.
 - Smart commit in worktree sessions now resolves session-edited files against the worktree path, so the cross-reference with git status correctly matches.
 - Blitz no longer silently dismisses the dialog when run against a workspace whose git repo has no commits. (#455)
+- Re-uploading a shared MockupLM document now resolves the correct collab content adapter for `.mockup.html` and `.mockupproject` files.
 
 ### Removed
 <!-- Removed features go here -->

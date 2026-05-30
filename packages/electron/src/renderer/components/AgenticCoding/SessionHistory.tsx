@@ -2853,6 +2853,7 @@ const SessionHistoryComponent: React.FC = () => {
 
   // Check if we have an active search query
   const hasSearchQuery = searchQuery.trim().length > 0;
+  const hasTagFilter = tagFilter.tags.length > 0;
 
   // Pre-render the "new session / worktree / terminal / blitz" dropdown so that
   // both the empty-state early-return AND the main return can mount it. Before
@@ -2976,8 +2977,12 @@ const SessionHistoryComponent: React.FC = () => {
     />
   );
 
-  if (sessions.length === 0 && !hasSearchQuery) {
-    // No sessions at all - show simple empty state without search
+  if (sessions.length === 0 && !hasSearchQuery && !hasTagFilter) {
+    // No sessions at all - show simple empty state without search.
+    // When a search or tag filter is active we fall through to the main render so
+    // the search input and tag chips stay mounted -- otherwise the user can't
+    // clear a filter that hides every session (e.g. after archiving the last
+    // session with the filtered tag). See GitHub #470 / NIM-675.
     return (
       <div className="session-history flex flex-col h-full bg-[var(--nim-bg)] overflow-hidden">
         <div className="workspace-color-accent h-[3px] w-full opacity-90 shrink-0" style={{ backgroundColor: workspaceColor }} />
@@ -3458,18 +3463,21 @@ const SessionHistoryComponent: React.FC = () => {
         </div>
       )}
       <div className="session-history-list nim-scrollbar flex-1 overflow-y-auto overflow-x-hidden py-2 scroll-smooth" ref={scrollContainerCallbackRef}>
-        {groupKeys.length === 0 && hasSearchQuery ? (
-          // No search results - show message with option to clear
+        {groupKeys.length === 0 && (hasSearchQuery || hasTagFilter) ? (
+          // No results for the active search/tag filter - offer a clear affordance
           <div className="session-history-empty flex flex-col items-center justify-center px-4 py-8 text-center text-[var(--nim-text-faint)] text-[13px]">
             <p className="my-1">No matching sessions found</p>
             <p className="session-history-empty-hint my-1 text-xs text-[var(--nim-text-faint)]">
-              Try a different search term or{' '}
+              {hasSearchQuery && hasTagFilter ? 'Adjust your search or ' : hasSearchQuery ? 'Try a different search term or ' : 'Remove the active tag filter or '}
               <button
                 className="session-history-clear-search-link bg-transparent border-none text-[var(--nim-primary)] cursor-pointer underline p-0 text-inherit font-inherit hover:opacity-80"
-                onClick={() => setSearchQuery('')}
+                onClick={() => {
+                  setSearchQuery('');
+                  if (hasTagFilter) setTagFilter({ tags: [] });
+                }}
                 type="button"
               >
-                clear search
+                {hasSearchQuery && hasTagFilter ? 'clear search and tags' : hasSearchQuery ? 'clear search' : 'clear tag filter'}
               </button>
             </p>
           </div>

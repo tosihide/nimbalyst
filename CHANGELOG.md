@@ -15,9 +15,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 <!-- Changes to existing functionality go here -->
 
 ### Fixed
-<!-- Bug fixes go here -->
 - Import Claude Agent Sessions dialog no longer re-opens on every workspace switch after first use. (#480)
-
+- Session list tag filter is no longer stranded after archiving the last matching session -- the search input and tag chips now stay mounted whenever a filter is active, with a "clear tag filter" affordance in the empty state. (#470)
 
 ### Removed
 <!-- Removed features go here -->

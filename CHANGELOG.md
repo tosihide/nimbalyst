@@ -9,22 +9,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
-<!-- New features go here -->
-
-### Changed
-<!-- Changes to existing functionality go here -->
-
-### Fixed
-- Import Claude Agent Sessions dialog no longer re-opens on every workspace switch after first use. (#480)
-- Session list tag filter is no longer stranded after archiving the last matching session -- the search input and tag chips now stay mounted whenever a filter is active, with a "clear tag filter" affordance in the empty state. (#470)
-
-### Removed
-<!-- Removed features go here -->
-
-## [0.63.0] - 2026-05-30
-
-
-### Added
 - Claude Opus 4.8 is now selectable in the Claude provider (1M context, dateless ID `claude-opus-4-8`) and is the default Claude model for new installs. (#473)
 - Claude Code variants `opus-4-7` and `opus-4-7-1m` pinned to Opus 4.7 so it stays selectable after the canonical `opus` alias was bumped to 4.8. (#473)
 <!-- New features go here -->
@@ -39,6 +23,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 <!-- Changes to existing functionality go here -->
+- Main-process startup now logs event-loop lag, per-batch progress in `ProjectFileSyncService.buildManifest`/`handleSyncResponse`, per-phase timing in `document-sync:open`, and per-request elapsed time in `TeamService.fetchTeamApi` to diagnose multi-minute startup freezes.
 - Default Claude model bumped from `claude-opus-4-7` to `claude-opus-4-8`. Existing sessions keep their configured model; only new sessions and "reset to default" pick up 4.8. (#473)
 - Monaco editor host wrappers now support custom load/save content transforms so extensions can present normalized editor views while preserving richer on-disk source formats.
 - Bumping a tip or walkthrough version now re-shows it even if the prior version was completed or dismissed.

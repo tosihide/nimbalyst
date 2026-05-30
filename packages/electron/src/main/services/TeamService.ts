@@ -285,17 +285,29 @@ async function fetchTeamApi(path: string, method: string, body?: unknown, orgId?
     }
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), TEAM_API_TIMEOUT_MS);
+    const reqStart = Date.now();
     try {
-      return await net.fetch(`${httpUrl}${path}`, {
+      const resp = await net.fetch(`${httpUrl}${path}`, {
         method,
         headers,
         body: body !== undefined ? JSON.stringify(body) : undefined,
         signal: controller.signal,
       });
+      const reqMs = Date.now() - reqStart;
+      // Log slow (and any non-2xx) responses so a degraded team API surfaces
+      // before it hits the 15s timeout. The happy-path 200s under 500ms stay
+      // silent.
+      if (reqMs >= 500 || !resp.ok) {
+        logger.main.info(`[TeamService] ${method} ${path} -> ${resp.status} in ${reqMs}ms (jwt: ${jwtSource})`);
+      }
+      return resp;
     } catch (err) {
+      const reqMs = Date.now() - reqStart;
       if ((err as { name?: string })?.name === 'AbortError') {
+        logger.main.warn(`[TeamService] ${method} ${path} timed out after ${reqMs}ms (jwt: ${jwtSource})`);
         throw new Error(`Team API timeout after ${TEAM_API_TIMEOUT_MS}ms: ${method} ${path}`);
       }
+      logger.main.warn(`[TeamService] ${method} ${path} threw after ${reqMs}ms (jwt: ${jwtSource}):`, err);
       throw err;
     } finally {
       clearTimeout(timer);

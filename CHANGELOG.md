@@ -16,6 +16,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 - ScheduleWakeup no longer logs a spurious "unrecognized tool" warning each time the agent schedules a wake-up
+- Commit proposal widget reliably flips from "Pending" to "Changes Committed" after a successful commit (canonical transcript is now updated synchronously when the response is persisted)
+- "Waiting for your response" sidebar indicator no longer gets stuck on after the prompt is answered; the bit is now persisted in `ai_sessions.metadata` on every prompt open/resolve and rehydrated on session list refresh so it survives renderer reloads and stays in sync between desktop and mobile
 
 ### Removed
 <!-- Removed features go here -->

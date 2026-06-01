@@ -694,14 +694,18 @@ export function createPGLiteSessionStore(db: PGliteLike, ensureDbReady?: EnsureR
           branchPointMessageId: row.branch_point_message_id ? parseInt(row.branch_point_message_id) : undefined,
           branchedAt,
           hasUnread: metadata.metadata?.hasUnread ?? metadata.hasUnread ?? false,
-          // Check if session has a pending AskUserQuestion (for sidebar indicator persistence)
-          hasPendingQuestion: !!(metadata.pendingAskUserQuestion),
+          // Authoritative pending-interactive-prompt bit. Written by
+          // setSessionPendingPrompt() on every prompt open/resolve so the
+          // sidebar indicator survives renderer reloads and reaches mobile.
+          // Replaces the legacy `metadata.pendingAskUserQuestion` flag,
+          // which nothing was writing.
+          hasPendingInteractivePrompt: !!metadata.hasPendingPrompt,
           // Kanban board phase and tags from metadata JSONB
           phase: metadata.phase ?? undefined,
           tags: Array.isArray(metadata.tags) ? metadata.tags : undefined,
           // Linked tracker item IDs from metadata JSONB
           linkedTrackerItemIds: Array.isArray(metadata.linkedTrackerItemIds) ? metadata.linkedTrackerItemIds : undefined,
-        } satisfies SessionMeta & { hasPendingQuestion?: boolean; phase?: string; tags?: string[]; linkedTrackerItemIds?: string[] };
+        } satisfies SessionMeta & { hasPendingInteractivePrompt?: boolean; phase?: string; tags?: string[]; linkedTrackerItemIds?: string[] };
       });
     },
 

@@ -7,6 +7,7 @@ import { getSessionStateManager } from "@nimbalyst/runtime/ai/server/SessionStat
 import { notificationService } from "../../services/NotificationService";
 import { TrayManager } from "../../tray/TrayManager";
 import { findWindowIdForWorkspacePath } from "../mcpWorkspaceResolver";
+import { setSessionPendingPrompt } from "../../services/ai/pendingPromptPersistence";
 import {
   resolveRequestUserInputPromptTargets,
   resolveToolUseIdFromMcpRequest,
@@ -562,6 +563,8 @@ export async function handleGitCommitProposal(
 
     // Notify tray of pending prompt
     TrayManager.getInstance().onPromptCreated(targetSessionId);
+    // Persist pending-prompt bit + push to mobile
+    void setSessionPendingPrompt(targetSessionId, true);
   } catch (error) {
     console.error("[MCP Server] Failed to persist git commit proposal:", error);
     // Continue anyway - worst case is no durability
@@ -660,6 +663,8 @@ export async function handleGitCommitProposal(
         reasoning: proposalArgs.reasoning,
       });
     }
+    // Persist resolved state + push to mobile
+    void setSessionPendingPrompt(targetSessionId, false);
 
     console.log(
       `[MCP Server] Auto-commit completed: ${commitResult.commitHash || "no changes"}`
@@ -1159,6 +1164,9 @@ export async function handleRequestUserInput(
     }).catch((err) => {
       console.error("[MCP Server] Failed to update session status:", err);
     });
+    // Persist pending-prompt bit + push to mobile so the sidebar indicator
+    // survives renderer reloads and reaches other devices.
+    void setSessionPendingPrompt(sessionId, true);
   }
 
   // Notify renderer so the widget can pick up the prompt data immediately
@@ -1221,6 +1229,8 @@ export async function handleRequestUserInput(
           isStreaming: true,
         }).catch(() => {});
         TrayManager.getInstance().onPromptResolved(sessionId);
+        // Persist resolved state + push to mobile.
+        void setSessionPendingPrompt(sessionId, false);
         // Notify renderer to clear the pending indicator and remove from atom.
         try {
           BrowserWindow.getAllWindows().forEach((w) => {

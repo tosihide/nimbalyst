@@ -24,6 +24,7 @@ import {
     resolveGitCommitProposalPromptId,
 } from '../services/ai/gitCommitProposalPromptUtils';
 import { enrichTranscriptMessagesWithToolCallDiffs } from '../services/TranscriptToolCallEnricher';
+import { setSessionPendingPrompt } from '../services/ai/pendingPromptPersistence';
 
 // Initialize session manager
 const sessionManager = new SessionManager();
@@ -569,8 +570,7 @@ export async function registerSessionHandlers() {
                     childCount: entry.childCount || 0,  // Number of child sessions
                     uncommittedCount,  // Number of uncommitted files
                     hasUnread: entry.hasUnread || false,  // Unread state from metadata
-                    hasPendingQuestion: (entry as any).hasPendingQuestion || false,  // Pending AskUserQuestion state from metadata
-                    hasPendingInteractivePrompt: (entry as any).hasPendingQuestion || false,
+                    hasPendingInteractivePrompt: (entry as any).hasPendingInteractivePrompt || false,
                     // Branch tracking - SEPARATE from hierarchical parentSessionId
                     branchedFromSessionId: entry.branchedFromSessionId,
                     branchPointMessageId: entry.branchPointMessageId,
@@ -1296,6 +1296,28 @@ export async function registerSessionHandlers() {
                 ]
             );
 
+            // Drive the canonical transformer forward immediately so the
+            // associated tool_call event (e.g. developer_git_commit_proposal)
+            // flips from running -> completed before the renderer next reads
+            // the transcript. Without this we depend on the next SDK chunk's
+            // scheduleTranscriptProcessing to pick up the row, which has
+            // race-with-write-coalescing failure modes that leave the widget
+            // stuck on "pending" after a successful commit (session
+            // cb82f2eb-941c-4fb5-b552-adbae567df61 / 68a60f57). Best-effort:
+            // if the service isn't ready, the next chunk catches up.
+            if (TranscriptMigrationRepository.hasService()) {
+                try {
+                    const session = await AISessionsRepository.get(sessionId);
+                    const provider = session?.provider ?? 'claude-code';
+                    await TranscriptMigrationRepository.getService().processNewMessages(
+                        sessionId,
+                        provider,
+                    );
+                } catch (err) {
+                    console.warn('[SessionHandlers] processNewMessages after prompt response failed:', err);
+                }
+            }
+
             // Codex currently may not emit a follow-up item.completed event for
             // long-blocking MCP tools after interactive approval. Persist a
             // synthetic completion event so transcript replay shows committed state.
@@ -1438,6 +1460,14 @@ export async function registerSessionHandlers() {
                 event.sender.send('ai:gitCommitProposalResolved', { sessionId, proposalId: canonicalPromptId });
                 TrayManager.getInstance().onPromptResolved(sessionId);
             }
+
+            // Authoritative clear for the persisted "pending prompt" bit.
+            // Covers all prompt types resolved via this handler so the next
+            // session-list refresh on this or any other device sees the
+            // session as idle. The runtime atom clear paths in
+            // sessionStateListeners are still in place; this is the durable
+            // backstop that survives renderer reloads and reaches mobile.
+            void setSessionPendingPrompt(sessionId, false);
 
             return { success: true, responseContent };
         } catch (error) {

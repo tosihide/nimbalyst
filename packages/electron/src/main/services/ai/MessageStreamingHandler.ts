@@ -50,6 +50,7 @@ import { FeatureUsageService, FEATURES } from '../FeatureUsageService.ts';
 import { historyManager } from '../../HistoryManager';
 import { addGitignoreBypass } from '../../file/WorkspaceEventBus';
 import { getSyncProvider, isDesktopTrulyAway } from '../SyncManager';
+import { setSessionPendingPrompt } from './pendingPromptPersistence';
 import { getAgentWorkflowService } from '../AgentWorkflowService';
 import {
   shouldShowCommunityPopup,
@@ -687,15 +688,13 @@ export class MessageStreamingHandler {
     };
     this.installListener(provider, 'session:metadata-updated', onSessionMetadataUpdated);
 
-    // Helper to sync pending prompt state to mobile
+    // Helper to persist pending-prompt state to ai_sessions.metadata AND
+    // push the change to mobile in one call. See pendingPromptPersistence.ts
+    // for why we persist locally: the in-memory atom can desync from reality
+    // if a resolve event is missed (renderer reload, HMR, late delivery),
+    // and the only recovery is rehydrating from the DB on next list refresh.
     const syncPendingPrompt = (sessionId: string, hasPendingPrompt: boolean) => {
-      const sp = getSyncProvider();
-      if (sp) {
-        sp.pushChange(sessionId, {
-          type: 'metadata_updated',
-          metadata: { hasPendingPrompt, updatedAt: Date.now() },
-        });
-      }
+      void setSessionPendingPrompt(sessionId, hasPendingPrompt);
     };
 
     // Listen for ExitPlanMode confirmation requests and forward to renderer

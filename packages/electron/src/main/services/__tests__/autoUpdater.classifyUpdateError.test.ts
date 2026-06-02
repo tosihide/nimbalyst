@@ -5,7 +5,7 @@ import { describe, it, expect } from 'vitest';
 // Electron app global. CI caught this on the first push - prior to the
 // extraction, this test file was the only failed file across 229 passing
 // tests. See #245.
-import { classifyUpdateError } from '../autoUpdaterUtils';
+import { classifyUpdateError, isLinuxAutoUpdateUnsupported } from '../autoUpdaterUtils';
 
 // Regression coverage for nimbalyst#245. adambhenry reported the auto-update
 // flow failing on macOS arm64 with "The command is disabled and cannot be
@@ -108,5 +108,29 @@ describe('classifyUpdateError (issue #245)', () => {
     // reorder does not silently change behaviour.
     const err = new Error('Network timeout - command is disabled');
     expect(classifyUpdateError(err)).toBe('network');
+  });
+});
+
+// Regression coverage for the Linux .deb auto-update crash. A .deb install
+// makes electron-builder pick `DebUpdater`, which (unlike AppImageUpdater) has
+// no APPIMAGE-env guard and runs the hourly check. The published GitHub Linux
+// feed only ships an AppImage, so DebUpdater's `findFile(..., "deb", ...)`
+// returns undefined and `executeDownload` crashes reading `fileInfo.info.sha2`
+// -> the user sees "Cannot read properties of undefined (reading 'info')".
+// We gate the check on the `APPIMAGE` env var: only the running AppImage both
+// sets it and has a matching asset in the feed.
+describe('isLinuxAutoUpdateUnsupported', () => {
+  it('treats a Linux package install (no APPIMAGE env) as unsupported', () => {
+    // Mirrors electron-updater's own `process.env.APPIMAGE == null` check.
+    expect(isLinuxAutoUpdateUnsupported('linux', undefined)).toBe(true);
+  });
+
+  it('treats a running AppImage (APPIMAGE env set) as supported', () => {
+    expect(isLinuxAutoUpdateUnsupported('linux', '/home/u/Nimbalyst.AppImage')).toBe(false);
+  });
+
+  it('never disables auto-update on macOS or Windows', () => {
+    expect(isLinuxAutoUpdateUnsupported('darwin', undefined)).toBe(false);
+    expect(isLinuxAutoUpdateUnsupported('win32', undefined)).toBe(false);
   });
 });

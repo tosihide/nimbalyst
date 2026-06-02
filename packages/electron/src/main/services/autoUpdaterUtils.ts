@@ -68,6 +68,31 @@ export function classifyUpdateError(error: Error): string {
 }
 
 /**
+ * electron-updater can only deliver a Linux update for AppImage installs.
+ *
+ * The published GitHub Linux feed (`latest-linux.yml` / `alpha-linux.yml`)
+ * lists only a `Nimbalyst-Linux.AppImage` asset -- there is no `.deb` (or
+ * `.rpm`/`.pacman`) in it. A package install (.deb) makes electron-builder write
+ * a `package-type` file so electron-updater picks `DebUpdater`, whose
+ * `isUpdaterActive()` has no `APPIMAGE`-env guard, so the hourly check runs.
+ * It finds a newer version, auto-downloads, calls
+ * `findFile(resolveFiles(info), "deb", [...])`, gets `undefined` (no `.deb` in
+ * the feed), and crashes in `executeDownload` reading `fileInfo.info.sha2` ->
+ * "Cannot read properties of undefined (reading 'info')".
+ *
+ * The running AppImage is the only Linux install that (a) sets the `APPIMAGE`
+ * env var and (b) has a matching asset in the feed. So gate on that env var:
+ * absent on Linux means a package/snap/tar install where auto-update cannot
+ * work, and we should skip the check entirely instead of surfacing the crash.
+ */
+export function isLinuxAutoUpdateUnsupported(
+  platform: NodeJS.Platform,
+  appImageEnv: string | undefined,
+): boolean {
+  return platform === 'linux' && appImageEnv == null;
+}
+
+/**
  * Antivirus on Windows often holds a transient handle on the freshly-downloaded
  * installer, causing electron-updater's temp -> final rename to fail with EPERM
  * (occasionally EBUSY). Detect those errors so the caller can retry once.

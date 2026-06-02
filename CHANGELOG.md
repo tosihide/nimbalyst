@@ -16,6 +16,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 <!-- Bug fixes go here -->
+- Linux `.deb` installs no longer show a spurious "Update Error: Cannot read properties of undefined (reading 'info')" toast. The published GitHub Linux feed only ships an AppImage, so electron-updater's `DebUpdater` found no matching asset and crashed in the auto-download step; auto-update is now skipped on Linux package installs (AppImage updates are unaffected).
 - Agent transcript no longer collapses `$7M ... $40M`-style currency text into LaTeX. (#462)
 - Blitz no longer silently dismisses the dialog when run against a workspace whose git repo has no commits. (#455)
 

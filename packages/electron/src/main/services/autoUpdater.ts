@@ -12,6 +12,7 @@ import { getDatabase } from '../database/initialize';
 import {
   categorizeDownloadDuration,
   classifyUpdateError,
+  isLinuxAutoUpdateUnsupported,
   isWindowsRenameLockError,
 } from './autoUpdaterUtils';
 import { installAtomFeedFilter } from './electronUpdaterPatch';
@@ -52,6 +53,15 @@ export class AutoUpdaterService {
   // endpoint, which buries any real signal. Only emit when the
   // (stage, error_type) tuple changes within a process lifetime.
   private lastUpdateErrorKey: string | null = null;
+  // True on a Linux package install (.deb/.rpm/.pacman/snap/tar) where the
+  // published GitHub Linux feed only ships an AppImage. electron-updater's
+  // DebUpdater would find no matching asset and crash with
+  // "Cannot read properties of undefined (reading 'info')", so we skip the
+  // check entirely on these installs. See isLinuxAutoUpdateUnsupported.
+  private readonly autoUpdateUnsupported = isLinuxAutoUpdateUnsupported(
+    process.platform,
+    process.env.APPIMAGE,
+  );
 
   constructor() {
     // Configure electron-updater logger
@@ -61,8 +71,16 @@ export class AutoUpdaterService {
     // Configure auto-updater. autoDownload=true: both background polls and the
     // manual "Check for Updates" trigger download immediately, then surface a
     // single "Ready to install" toast. Per maintainer direction on #327.
-    autoUpdater.autoDownload = true;
+    // Force it off on Linux package installs so a stray check can never reach
+    // the crashing download path (defense in depth alongside the skips below).
+    autoUpdater.autoDownload = !this.autoUpdateUnsupported;
     autoUpdater.autoInstallOnAppQuit = true;
+
+    if (this.autoUpdateUnsupported) {
+      log.info(
+        'Auto-update disabled: Linux package install (no APPIMAGE env); the GitHub Linux feed only ships an AppImage.',
+      );
+    }
 
     // Configure feed URL based on release channel
     this.configureFeedURL();
@@ -399,6 +417,9 @@ export class AutoUpdaterService {
 
   private setupIpcHandlers() {
     safeHandle('check-for-updates', async () => {
+      if (this.autoUpdateUnsupported) {
+        return { updateSupported: false };
+      }
       if (this.isCheckingForUpdate) {
         return { checking: true };
       }
@@ -555,6 +576,10 @@ export class AutoUpdaterService {
   }
 
   public startAutoUpdateCheck(intervalMinutes = 60) {
+    if (this.autoUpdateUnsupported) {
+      log.info('Skipping scheduled auto-update check on this Linux package install');
+      return;
+    }
     // Initial check after 30 seconds
     setTimeout(() => {
       this.checkForUpdates();
@@ -578,6 +603,9 @@ export class AutoUpdaterService {
   }
 
   public async checkForUpdates() {
+    if (this.autoUpdateUnsupported) {
+      return;
+    }
     if (this.isCheckingForUpdate) {
       log.info('Already checking for updates, skipping...');
       return;
@@ -594,6 +622,21 @@ export class AutoUpdaterService {
   public async checkForUpdatesWithUI() {
     if (this.isCheckingForUpdate) {
       // Already checking, don't show anything - the checking toast is already visible
+      return;
+    }
+
+    // Linux package install (.deb/.rpm/etc.): the GitHub Linux feed only ships
+    // an AppImage, so electron-updater cannot deliver an in-place update here.
+    // Give the user the manual-download path instead of attempting a check that
+    // would crash in the auto-download step.
+    if (this.autoUpdateUnsupported) {
+      log.info('Manual update check requested on an unsupported Linux package install');
+      this.sendToFrontmostWindow('update-toast:checking');
+      setTimeout(() => {
+        this.sendToFrontmostWindow('update-toast:error', {
+          message: 'Automatic updates are not available for this Linux package. Please download the latest version manually.'
+        });
+      }, 500);
       return;
     }
 

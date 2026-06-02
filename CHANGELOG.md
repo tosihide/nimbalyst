@@ -19,6 +19,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 <!-- Changes to existing functionality go here -->
 
 ### Fixed
+- Linux `.deb` installs no longer show a spurious "Update Error" toast from the auto-updater.
 - Marketplace extension installs no longer hang mid-extraction and fail with "reply was never sent".
 - Settings navigation: the Marketplace item now works in project scope, and the Privileged Capabilities item now works in all scopes.
 - Mockup share links now render full-size in the browser instead of a tiny square.

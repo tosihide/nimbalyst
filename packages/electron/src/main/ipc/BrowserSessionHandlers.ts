@@ -24,7 +24,8 @@
  */
 
 import { BrowserWindow } from 'electron';
-import { relative, isAbsolute, resolve, sep } from 'path';
+import { relative, isAbsolute, resolve, sep, join } from 'path';
+import { mkdir, writeFile } from 'fs/promises';
 import {
   BrowserSessionService,
   type BrowserSessionBounds,
@@ -37,10 +38,14 @@ import {
 import { logger } from '../utils/logger';
 import { safeHandle } from '../utils/ipcRegistry';
 
+export const BROWSER_TRANSCRIPT_IMAGE_DIRNAME = 'transcript-images';
+
 interface CreatePayload {
   sessionId: string;
   url: string;
   partition?: string;
+  headless?: boolean;
+  viewport?: { width: number; height: number };
 }
 
 interface BoundsPayload {
@@ -55,6 +60,10 @@ interface SessionIdPayload {
 interface NavigatePayload {
   sessionId: string;
   url: string;
+}
+
+export function getBrowserTranscriptImageDir(workspacePath: string): string {
+  return join(resolve(workspacePath), '.nimbalyst', BROWSER_TRANSCRIPT_IMAGE_DIRNAME);
 }
 
 function broadcastState(state: BrowserNavigationState): void {
@@ -93,6 +102,8 @@ export function registerBrowserSessionHandlers(): void {
         sessionId: payload.sessionId,
         url: payload.url,
         partition: payload.partition,
+        headless: payload.headless,
+        viewport: payload.viewport,
       });
       return { success: true, state };
     } catch (err) {
@@ -255,6 +266,123 @@ export function registerBrowserSessionHandlers(): void {
     }
     return { success: true, state: service.getState(payload.sessionId) };
   });
+
+  safeHandle('browser-session:list-sessions', async () => {
+    return { success: true, sessionIds: service.listSessions() };
+  });
+
+  // Capture a screenshot and write it to a PNG file under the workspace,
+  // returning the absolute path. Used by the agent screenshot tool so large
+  // base64 blobs never travel through the renderer or the tool result.
+  safeHandle(
+    'browser-session:screenshot-to-file',
+    async (_event, payload: { sessionId: string; workspacePath: string; label?: string }) => {
+      if (!payload?.sessionId || !payload?.workspacePath) {
+        return { success: false, error: 'sessionId and workspacePath are required' };
+      }
+      if (!isAbsolute(payload.workspacePath)) {
+        return { success: false, error: 'workspacePath must be absolute' };
+      }
+      try {
+        const buffer = await service.captureScreenshot(payload.sessionId);
+        // Persist transcript-linked screenshots in a durable .nimbalyst
+        // subdirectory instead of the transient browser-shots path.
+        const dir = getBrowserTranscriptImageDir(payload.workspacePath);
+        await mkdir(dir, { recursive: true });
+        const safeLabel = (payload.label || payload.sessionId)
+          .replace(/[^a-zA-Z0-9_-]+/g, '-')
+          .slice(0, 60);
+        const filePath = join(dir, `${safeLabel}-${Date.now()}.png`);
+        await writeFile(filePath, buffer);
+        return { success: true, path: filePath };
+      } catch (err) {
+        return { success: false, error: err instanceof Error ? err.message : String(err) };
+      }
+    },
+  );
+
+  // ---- Interaction (agentic control) ----
+
+  safeHandle(
+    'browser-session:evaluate',
+    async (_event, payload: { sessionId: string; script: string }) => {
+      if (!payload?.sessionId || typeof payload?.script !== 'string') {
+        return { success: false, error: 'sessionId and script are required' };
+      }
+      try {
+        const result = await service.evaluate(payload.sessionId, payload.script);
+        return { success: true, result };
+      } catch (err) {
+        return { success: false, error: err instanceof Error ? err.message : String(err) };
+      }
+    },
+  );
+
+  safeHandle('browser-session:get-page-info', async (_event, payload: SessionIdPayload) => {
+    if (!payload?.sessionId) {
+      return { success: false, error: 'sessionId is required' };
+    }
+    try {
+      const info = await service.getPageInfo(payload.sessionId);
+      return { success: true, info };
+    } catch (err) {
+      return { success: false, error: err instanceof Error ? err.message : String(err) };
+    }
+  });
+
+  safeHandle(
+    'browser-session:click',
+    async (
+      _event,
+      payload: { sessionId: string; selector?: string; index?: number; x?: number; y?: number },
+    ) => {
+      if (!payload?.sessionId) {
+        return { success: false, error: 'sessionId is required' };
+      }
+      try {
+        await service.click(payload.sessionId, payload);
+        return { success: true };
+      } catch (err) {
+        return { success: false, error: err instanceof Error ? err.message : String(err) };
+      }
+    },
+  );
+
+  safeHandle(
+    'browser-session:type',
+    async (
+      _event,
+      payload: { sessionId: string; selector?: string; index?: number; text: string; clear?: boolean },
+    ) => {
+      if (!payload?.sessionId || typeof payload?.text !== 'string') {
+        return { success: false, error: 'sessionId and text are required' };
+      }
+      try {
+        await service.type(payload.sessionId, payload);
+        return { success: true };
+      } catch (err) {
+        return { success: false, error: err instanceof Error ? err.message : String(err) };
+      }
+    },
+  );
+
+  safeHandle(
+    'browser-session:scroll',
+    async (
+      _event,
+      payload: { sessionId: string; selector?: string; index?: number; dx?: number; dy?: number },
+    ) => {
+      if (!payload?.sessionId) {
+        return { success: false, error: 'sessionId is required' };
+      }
+      try {
+        await service.scroll(payload.sessionId, payload);
+        return { success: true };
+      } catch (err) {
+        return { success: false, error: err instanceof Error ? err.message : String(err) };
+      }
+    },
+  );
 
   logger.main.info('[BrowserSessionHandlers] handlers registered');
 }

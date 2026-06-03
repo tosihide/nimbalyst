@@ -273,7 +273,7 @@ const readFile = async (filePath: string): Promise<{ success: boolean; content?:
   try {
     const result = await window.electronAPI.readFileContent(filePath);
     if (!result) {
-      return { success: false, error: 'No response from file reader' };
+      return { success: false, error: `File not found: ${filePath}` };
     }
     if (!result.success) {
       return { success: false, error: result.error || 'Failed to read file' };

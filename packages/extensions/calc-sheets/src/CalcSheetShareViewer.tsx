@@ -1,10 +1,12 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import type { IDisposable } from 'monaco-editor';
 import type { EditorHostProps } from '@nimbalyst/extension-sdk';
+import { MonacoCodeEditor } from '@nimbalyst/runtime';
+import { applyCalcSheetMonaco } from './calcSheetMonaco';
 import { evaluateCalcSheet } from './evaluator';
 import { parseCalcSheetDocument } from './parser';
 
 const EDITOR_LINE_HEIGHT = 30;
-const EDITOR_VERTICAL_PADDING = 8;
 
 function lineTitle(
   line: ReturnType<typeof parseCalcSheetDocument>['lines'][number],
@@ -45,11 +47,19 @@ function lineTitle(
 }
 
 export function CalcSheetShareViewer({ host }: EditorHostProps) {
-  const [bodyContent, setBodyContent] = useState<string>('');
-  const [initialBodyContent, setInitialBodyContent] = useState<string>('');
+  const [bodyContent, setBodyContent] = useState<string | null>(null);
+  const [initialBodyContent, setInitialBodyContent] = useState<string | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
-  const [scrollTop, setScrollTop] = useState(0);
+  const [theme, setTheme] = useState(host.theme);
+  const [lineTops, setLineTops] = useState<number[]>([]);
+  const [contentHeight, setContentHeight] = useState(0);
   const frontmatterBlockRef = useRef('');
+  const gutterRef = useRef<HTMLDivElement | null>(null);
+  const editorRef = useRef<any>(null);
+  const contentListenerRef = useRef<IDisposable | null>(null);
+  const scrollListenerRef = useRef<IDisposable | null>(null);
+  const contentSizeListenerRef = useRef<IDisposable | null>(null);
+  const layoutListenerRef = useRef<IDisposable | null>(null);
 
   useEffect(() => {
     let mounted = true;
@@ -72,18 +82,92 @@ export function CalcSheetShareViewer({ host }: EditorHostProps) {
     };
   }, [host]);
 
-  const documentContent = `${frontmatterBlockRef.current}${bodyContent}`;
+  useEffect(() => {
+    setTheme(host.theme);
+    return host.onThemeChanged((nextTheme) => {
+      setTheme(nextTheme);
+    });
+  }, [host]);
+
+  useEffect(() => {
+    return () => {
+      contentListenerRef.current?.dispose();
+      scrollListenerRef.current?.dispose();
+      contentSizeListenerRef.current?.dispose();
+      layoutListenerRef.current?.dispose();
+    };
+  }, []);
+
+  const documentContent = `${frontmatterBlockRef.current}${bodyContent ?? ''}`;
   const parsed = useMemo(() => parseCalcSheetDocument(documentContent), [documentContent]);
   const evaluation = useMemo(
     () => evaluateCalcSheet(parsed.lines, parsed.frontmatter, parsed.lines.length),
     [parsed],
   );
 
-  const lineCount = Math.max(1, bodyContent.split(/\r?\n/).length);
-  const lineNumbers = Array.from({ length: lineCount }, (_, index) => index + 1);
   const title = parsed.frontmatter.title || host.fileName;
   const baseCurrency = parsed.frontmatter.baseCurrency || 'USD';
-  const hasLocalChanges = bodyContent !== initialBodyContent;
+  const hasLocalChanges = bodyContent !== null && bodyContent !== initialBodyContent;
+
+  const refreshLayout = useCallback((editor: any) => {
+    const model = editor?.getModel?.();
+    if (!model) {
+      setLineTops([]);
+      setContentHeight(0);
+      return;
+    }
+
+    const nextLineTops: number[] = [];
+    const lineCount = model.getLineCount();
+    for (let lineNumber = 1; lineNumber <= lineCount; lineNumber++) {
+      nextLineTops.push(editor.getTopForLineNumber(lineNumber));
+    }
+
+    setLineTops(nextLineTops);
+    setContentHeight(editor.getContentHeight());
+  }, []);
+
+  const attachEditor = useCallback((wrapper: any) => {
+    editorRef.current = wrapper;
+    const editor = wrapper?.editor;
+    const monaco = wrapper?.monaco;
+    if (!editor || !monaco) return;
+
+    contentListenerRef.current?.dispose();
+    scrollListenerRef.current?.dispose();
+    contentSizeListenerRef.current?.dispose();
+    layoutListenerRef.current?.dispose();
+
+    applyCalcSheetMonaco(editor, monaco, theme);
+    refreshLayout(editor);
+    if (gutterRef.current) {
+      gutterRef.current.scrollTop = editor.getScrollTop();
+    }
+
+    contentListenerRef.current = editor.onDidChangeModelContent(() => {
+      setBodyContent(editor.getValue());
+      refreshLayout(editor);
+    });
+
+    scrollListenerRef.current = editor.onDidScrollChange(() => {
+      if (!gutterRef.current) return;
+      gutterRef.current.scrollTop = editor.getScrollTop();
+    });
+
+    contentSizeListenerRef.current = editor.onDidContentSizeChange(() => {
+      refreshLayout(editor);
+    });
+
+    layoutListenerRef.current = editor.onDidLayoutChange(() => {
+      refreshLayout(editor);
+    });
+  }, [refreshLayout, theme]);
+
+  useEffect(() => {
+    if (editorRef.current?.editor && editorRef.current?.monaco) {
+      applyCalcSheetMonaco(editorRef.current.editor, editorRef.current.monaco, theme);
+    }
+  }, [theme, parsed]);
 
   if (loadError) {
     return (
@@ -91,6 +175,10 @@ export function CalcSheetShareViewer({ host }: EditorHostProps) {
         Failed to load calc sheet: {loadError}
       </div>
     );
+  }
+
+  if (bodyContent === null || initialBodyContent === null) {
+    return <div className="calc-sheets calc-sheets--loading">Loading calc sheet...</div>;
   }
 
   return (
@@ -112,7 +200,12 @@ export function CalcSheetShareViewer({ host }: EditorHostProps) {
             disabled={!hasLocalChanges}
             onClick={() => {
               setBodyContent(initialBodyContent);
-              setScrollTop(0);
+              editorRef.current?.setContent?.(initialBodyContent);
+              editorRef.current?.editor?.setScrollTop?.(0);
+              if (gutterRef.current) {
+                gutterRef.current.scrollTop = 0;
+              }
+              refreshLayout(editorRef.current?.editor);
             }}
           >
             Reset
@@ -126,53 +219,58 @@ export function CalcSheetShareViewer({ host }: EditorHostProps) {
         </div>
       ) : null}
 
-      <div className="calc-sheets__viewer-surface">
-        <div className="calc-sheets__line-numbers" aria-hidden="true">
-          <div
-            className="calc-sheets__line-number-list"
-            style={{ transform: `translateY(${-scrollTop}px)` }}
-          >
-            {lineNumbers.map((lineNumber) => (
-              <div
-                key={lineNumber}
-                className="calc-sheets__line-number"
-                style={{
-                  top: EDITOR_VERTICAL_PADDING + ((lineNumber - 1) * EDITOR_LINE_HEIGHT),
-                  height: EDITOR_LINE_HEIGHT,
-                }}
-              >
-                {lineNumber}
-              </div>
-            ))}
-          </div>
-        </div>
-
-        <div className="calc-sheets__share-editor">
-          <textarea
-            className="calc-sheets__share-textarea"
-            spellCheck={false}
-            wrap="off"
-            value={bodyContent}
-            onChange={(event) => setBodyContent(event.target.value)}
-            onScroll={(event) => setScrollTop(event.currentTarget.scrollTop)}
+      <div className="calc-sheets__surface">
+        <div className="calc-sheets__editor">
+          <MonacoCodeEditor
+            filePath={host.filePath}
+            fileName={host.fileName}
+            initialContent={bodyContent}
+            theme={theme as any}
+            onEditorReady={attachEditor}
+            editorOptions={{
+              readOnly: false,
+              fontSize: 15,
+              lineHeight: EDITOR_LINE_HEIGHT,
+              fontFamily: "'SF Mono', 'Monaco', 'Menlo', 'Consolas', monospace",
+              lineNumbers: 'on',
+              lineNumbersMinChars: 3,
+              minimap: { enabled: false },
+              glyphMargin: false,
+              folding: false,
+              lineDecorationsWidth: 18,
+              renderLineHighlight: 'none',
+              renderWhitespace: 'none',
+              scrollBeyondLastLine: false,
+              overviewRulerBorder: false,
+              hideCursorInOverviewRuler: true,
+              wordWrap: 'off',
+              tabSize: 2,
+              guides: {
+                indentation: false,
+                highlightActiveIndentation: false,
+              },
+              padding: { top: 8, bottom: 8 },
+            }}
           />
         </div>
 
-        <div className="calc-sheets__gutter" aria-hidden="true">
+        <div className="calc-sheets__gutter" ref={gutterRef} aria-hidden="true">
           <div
             className="calc-sheets__results"
-            style={{ height: EDITOR_VERTICAL_PADDING * 2 + (lineCount * EDITOR_LINE_HEIGHT) }}
+            style={{ height: Math.max(contentHeight, lineTops.length * EDITOR_LINE_HEIGHT) }}
           >
-            {parsed.lines.map((line, index) => {
-              const output = evaluation.lineOutputs[index] ?? '';
+            {parsed.lines.map((line) => {
+              const output = evaluation.lineOutputs[line.index] ?? '';
               const classes = ['calc-sheets__result-line', `calc-sheets__result-line--${line.kind}`];
-              if (line.parseError) classes.push('calc-sheets__result-line--error');
+              if (line.parseError || output.includes('ERR') || output.includes('FAIL')) {
+                classes.push('calc-sheets__result-line--error');
+              }
               return (
                 <div
-                  key={`${index}-${line.raw}`}
+                  key={`${line.index}-${line.raw}`}
                   className={classes.join(' ')}
                   style={{
-                    top: EDITOR_VERTICAL_PADDING + (index * EDITOR_LINE_HEIGHT) - scrollTop,
+                    top: lineTops[line.index] ?? (line.index * EDITOR_LINE_HEIGHT),
                     height: EDITOR_LINE_HEIGHT,
                   }}
                   title={lineTitle(line, evaluation)}

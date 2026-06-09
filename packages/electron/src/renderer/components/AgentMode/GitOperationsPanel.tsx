@@ -43,6 +43,7 @@ import { isPathInWorkspace } from '../../../shared/pathUtils';
 import { SuperFilesPanel } from './SuperFilesPanel';
 import { defaultAgentModelAtom } from '../../store/atoms/appSettings';
 import { type AgentModelOption } from './AgentModelPicker';
+import { isClaudeCliTerminalSession } from '../UnifiedAI/claudeCliInputRouting';
 
 // Types for worktree mode (copied from DiffModeView)
 interface WorktreeChangedFile {
@@ -463,7 +464,27 @@ export const GitOperationsPanel: React.FC<GitOperationsPanelProps> = React.memo(
           mode: 'agent',
           inputType: 'user' as const,
         };
-        await window.electronAPI.invoke('ai:sendMessage', message, docContext, sessionId, workspacePath);
+
+        // claude-code-cli (subscription, NIM-806): the genuine `claude` CLI is
+        // driven by its PTY, not the Agent SDK loop. ai:sendMessage has no
+        // in-process provider for it and throws ("Unknown provider"). Route the
+        // smart-commit prompt through the Nimbalyst queue instead; the
+        // main-process PID-idle flusher drains it to the terminal once the CLI is
+        // idle, whether or not a turn is currently in flight.
+        let provider: string | null = null;
+        try {
+          const sessionResult = await window.electronAPI.invoke('sessions:get', sessionId) as
+            { session?: { provider?: string } } | null;
+          provider = sessionResult?.session?.provider ?? null;
+        } catch {
+          /* fall through to the SDK send path */
+        }
+
+        if (isClaudeCliTerminalSession(provider)) {
+          await window.electronAPI.invoke('ai:createQueuedPrompt', sessionId, message, [], docContext);
+        } else {
+          await window.electronAPI.invoke('ai:sendMessage', message, docContext, sessionId, workspacePath);
+        }
       } catch (error) {
         console.error('[GitOperationsPanel] Failed to send smart commit message:', error);
       }

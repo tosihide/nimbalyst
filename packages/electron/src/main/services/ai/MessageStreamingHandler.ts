@@ -440,6 +440,10 @@ export class MessageStreamingHandler {
           // Claude Code: API key is optional and uses OAuth login when not configured.
           requiresApiKey = false;
           break;
+        case 'claude-code-cli':
+          // Genuine `claude` CLI: uses its own login/subscription, no API key.
+          requiresApiKey = false;
+          break;
         case 'openai':
           errorMessage = 'OpenAI API key not configured';
           break;

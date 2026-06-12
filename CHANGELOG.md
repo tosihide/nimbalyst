@@ -16,6 +16,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 <!-- Bug fixes go here -->
+
+### Removed
+<!-- Removed features go here -->
+
+## [0.65.2] - 2026-06-12
+
+
+### Added
+<!-- New features go here -->
+
+### Changed
+<!-- Changes to existing functionality go here -->
+
+### Fixed
+<!-- Bug fixes go here -->
 - Claude Code CLI sessions can now spawn sessions via the meta-agent tools, and prompts sent to them while closed (spawned sessions, restart continuations, scheduled wakeups) launch the CLI and deliver instead of failing.
 - Smart Commit and other queued prompts on Claude Code CLI sessions no longer linger in the queued list after they run.
 - The CLI terminal drawer no longer steals keyboard focus from the chat input when ordinary terminal output looks like a picker.

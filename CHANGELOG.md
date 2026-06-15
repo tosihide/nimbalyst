@@ -15,6 +15,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 <!-- Changes to existing functionality go here -->
 
 ### Fixed
+- Claude Agent sessions no longer hit a "Usage credits required for 1M context" error after a session's model is lost: the silent fallback now uses a standard 200k model, so 1M context is only ever sent when you explicitly pick a 1M model. (#631)
 - "Allow All" permission mode again auto-approves every operation without prompts; the Claude Code safety classifier is now an opt-in toggle per project instead of being forced on.
 - Auto-commit now retries with backoff when another git process briefly holds .git/index.lock, so concurrent sessions commit on the first try instead of failing and being misreported as "no changes".
 - Fixed an Electron crash when a worktree produced a filesystem-event storm; the workspace watcher now shuts down safely instead of aborting the app.

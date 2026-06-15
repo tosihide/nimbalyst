@@ -42,6 +42,7 @@ import {
   CLAUDE_CODE_VARIANT_VERSIONS,
   CLAUDE_CODE_MODEL_LABELS,
   CLAUDE_CODE_VARIANTS_WITH_1M,
+  CLAUDE_CODE_SAFE_FALLBACK_MODEL,
 } from '../../modelConstants';
 import { isBedrockToolSearchError } from '../utils/errorDetection';
 import { AgentMessagesRepository } from '../../../storage/repositories/AgentMessagesRepository';
@@ -450,7 +451,10 @@ export class ClaudeCodeProvider extends BaseAgentProvider {
   }
 
   private resolveModelVariant(): string {
-    return resolveClaudeCodeModelVariant(this.config.model, ClaudeCodeProvider.DEFAULT_MODEL);
+    // Billing safety (#631 / NIM-848): when no explicit model is set, fall back
+    // to a STANDARD 200k model, never the 1M user-facing default. The `[1m]`
+    // beta must only ever be emitted for an explicitly-selected `-1m` model.
+    return resolveClaudeCodeModelVariant(this.config.model, CLAUDE_CODE_SAFE_FALLBACK_MODEL);
   }
 
 

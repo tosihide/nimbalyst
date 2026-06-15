@@ -18,6 +18,7 @@ import {
   ClaudeCodeProvider,
   OpenAICodexProvider,
 } from '@nimbalyst/runtime/ai/server';
+import { CLAUDE_CODE_SAFE_FALLBACK_MODEL } from '@nimbalyst/runtime/ai/modelConstants';
 import { getSessionStateManager } from '@nimbalyst/runtime/ai/server/SessionStateManager';
 import { parseContextUsageMessage } from '@nimbalyst/runtime/ai/server/utils/contextUsage';
 import { isBedrockToolSearchError } from '@nimbalyst/runtime/ai/server/utils/errorDetection';
@@ -542,10 +543,11 @@ export class AIService {
     if (fullModel) {
       config.model = fullModel;
     } else {
-      const defaultModel = await ModelRegistry.getDefaultModel('claude-code');
-      if (defaultModel) {
-        config.model = defaultModel;
-      }
+      // Billing safety (#631 / NIM-848): a session with no resolved model must
+      // fall back to a STANDARD 200k model, never the 1M user-facing default
+      // (ModelRegistry.getDefaultModel('claude-code') is `opus-1m`). Sending the
+      // paid 1M beta for an empty/lost model silently bills the user.
+      config.model = CLAUDE_CODE_SAFE_FALLBACK_MODEL;
     }
 
     return config;

@@ -24,6 +24,8 @@ import { getEnhancedPath, getShellEnvironment } from '../CLIManager';
 import { ClaudeCliSessionLauncher } from './ClaudeCliSessionLauncher';
 import { HooklessAgentFileWatcher } from './HooklessAgentFileWatcher';
 import { resolveClaudeExecutablePath } from './claudeExecutableResolver';
+import { resolveClaudeCliSupportsPluginDir } from './claudeCliPluginSupport';
+import { getClaudePluginPaths } from '../../ipc/ExtensionHandlers';
 import { workspacePathToDir } from '../AttachmentService';
 import { resolveClaudePermissionHookScriptPath } from './claudeCliPermissionHookPath';
 import { getPermissionService } from '../PermissionService';
@@ -94,6 +96,17 @@ function resolveClaudeExecutable(): string {
  * Returns `undefined` on any failure so a directory-prep error never blocks the
  * CLI launch.
  */
+/**
+ * Whether a `claude-code-cli` session launched right now would be able to load
+ * extension Claude-plugins — i.e. the resolved `claude` accepts `--plugin-dir`
+ * (≥ 2.1.142). The slash-command picker uses this to hide namespaced plugin
+ * commands when the CLI can't run them (NIM-845). Resolves the same executable
+ * the launcher would spawn, so the picker matches actual launch behavior.
+ */
+export function claudeCliSessionSupportsPlugins(): boolean {
+  return resolveClaudeCliSupportsPluginDir(resolveClaudeExecutable());
+}
+
 function prepareAttachmentsAllowDir(workspacePath: string): string[] | undefined {
   try {
     const attachmentsRoot = join(
@@ -124,7 +137,6 @@ function buildMcpConfigService(): McpConfigService {
     settingsAgentToolsDisabledLoader: config.settingsAgentToolsDisabledLoader,
     mcpAuthToken: config.mcpAuthToken,
     mcpConfigLoader: config.mcpConfigLoader,
-    extensionPluginsLoader: null,
     claudeSettingsEnvLoader: null,
     shellEnvironmentLoader: () => getShellEnvironment(),
   });
@@ -150,6 +162,14 @@ function buildLauncher(): ClaudeCliSessionLauncher {
     // project so trust is shared.
     getPermissionMode: (workspacePath: string) =>
       getPermissionService().getPermissionMode(workspacePath),
+    // NIM-845: load extension Claude-plugins so namespaced slash commands
+    // (`/feedback:bug-report`, …) resolve in CLI sessions. `getClaudePluginPaths`
+    // is the same single source of truth the SDK path uses; we map to the bare
+    // directory paths the CLI's `--plugin-dir` expects. Gated by the `--version`
+    // probe below so old CLIs (< 2.1.142, which reject the flag) silently skip it.
+    loadPluginDirs: async (workspacePath: string) =>
+      (await getClaudePluginPaths(workspacePath)).map((plugin) => plugin.path),
+    cliSupportsPluginDir: (executable: string) => resolveClaudeCliSupportsPluginDir(executable),
   });
 }
 

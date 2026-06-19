@@ -1,18 +1,8 @@
 import { describe, it, expect, vi } from 'vitest';
 import { ClaudeCliSessionLauncher, type ClaudeCliSessionLauncherDeps } from '../ClaudeCliSessionLauncher';
-import type { ClaudeCliSpawnConfig } from '../claudeCliSpawnConfig';
 
-type CreateClaudeCliTerminalArgs = [
-  terminalId: string,
-  opts: {
-    cwd: string;
-    spawnConfig: ClaudeCliSpawnConfig;
-    workspacePath?: string;
-    cols?: number;
-    rows?: number;
-    onExit?: (exitCode: number) => void;
-  },
-];
+type CreateClaudeCliTerminal = ClaudeCliSessionLauncherDeps['terminalManager']['createClaudeCliTerminal'];
+type CreateClaudeCliTerminalArgs = Parameters<CreateClaudeCliTerminal>;
 
 /**
  * Launcher orchestration for the genuine `claude` CLI session (NIM-806, Phase 1).
@@ -22,14 +12,14 @@ type CreateClaudeCliTerminalArgs = [
 describe('ClaudeCliSessionLauncher', () => {
   function makeHarness(opts: {
     startObservation?: ClaudeCliSessionLauncherDeps['startObservation'];
-    createClaudeCliTerminal?: ReturnType<typeof vi.fn>;
+    createClaudeCliTerminal?: ReturnType<typeof vi.fn<CreateClaudeCliTerminal>>;
     pathExists?: (p: string) => boolean;
     homedir?: () => string;
   } = {}) {
     const writes: Array<{ file: string; data: string }> = [];
     const createClaudeCliTerminal =
       opts.createClaudeCliTerminal ??
-      vi.fn(async (..._args: CreateClaudeCliTerminalArgs): Promise<void> => {});
+      vi.fn<CreateClaudeCliTerminal>(async (..._args: CreateClaudeCliTerminalArgs): Promise<void> => {});
     const getMcpServersConfig = vi.fn(async (_opts: { sessionId: string; workspacePath: string }) => ({
       'nimbalyst-mcp': {
         type: 'sse',

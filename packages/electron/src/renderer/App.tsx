@@ -1988,7 +1988,7 @@ export default function App() {
             const escapedId =
               typeof CSS !== 'undefined' && typeof CSS.escape === 'function'
                 ? CSS.escape(targetId)
-                : targetId.replace(/(["\\\]\[\(\)\.:;'#])/g, '\\$1');
+                : targetId.replace(/([\]"\\().:;'#[])/g, '\\$1');
             const targetElement = scope.querySelector(`#${escapedId}`);
             if (targetElement) {
               event.preventDefault();

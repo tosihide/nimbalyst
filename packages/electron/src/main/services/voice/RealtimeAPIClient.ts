@@ -8,12 +8,77 @@
 import WebSocket from 'ws';
 import { ipcMain } from 'electron';
 import { AnalyticsService } from '../analytics/AnalyticsService';
+import type { RealtimeFunctionTool } from './voiceToolBridge';
 
 interface RealtimeEvent {
   type: string;
   event_id?: string;
   [key: string]: unknown;
 }
+
+/**
+ * Names of the built-in voice tools handled by the fixed switch in
+ * handleFunctionCall(). Extension-contributed voice tools whose sanitized name
+ * collides with one of these are skipped so a built-in is never shadowed.
+ */
+export const BUILTIN_VOICE_TOOL_NAMES: ReadonlySet<string> = new Set([
+  'submit_agent_prompt',
+  'stop_voice_session',
+  'get_session_summary',
+  'ask_coding_agent',
+  'pause_listening',
+  'respond_to_interactive_prompt',
+  'list_sessions',
+  'navigate_to_session',
+  'create_session',
+  'propose_commit',
+]);
+
+/**
+ * Result shape returned by the generic extension-voice-tool dispatch callback.
+ */
+export interface ExtensionVoiceToolResult {
+  success: boolean;
+  message?: string;
+  data?: unknown;
+  error?: string;
+}
+
+/**
+ * A function/tool call the voice agent made. Emitted so the renderer can write
+ * it to the voice session transcript (otherwise tool calls are invisible).
+ * Sent twice per call: once when started, once when the result is returned.
+ */
+export type VoiceToolCallEvent =
+  | {
+      phase: 'started';
+      callId: string;
+      name: string;
+      displayName: string;
+      args: Record<string, unknown>;
+    }
+  | {
+      phase: 'completed';
+      callId: string;
+      name: string;
+      displayName: string;
+      success: boolean;
+      summary?: string;
+    };
+
+/** Human-friendly labels for the built-in voice tools (for transcript display). */
+const BUILTIN_VOICE_TOOL_DISPLAY_NAMES: Record<string, string> = {
+  submit_agent_prompt: 'Send task to coding agent',
+  ask_coding_agent: 'Ask coding agent',
+  get_session_summary: 'Get session summary',
+  list_sessions: 'List sessions',
+  navigate_to_session: 'Switch session',
+  create_session: 'Create session',
+  propose_commit: 'Propose commit',
+  respond_to_interactive_prompt: 'Answer prompt',
+  pause_listening: 'Pause listening',
+  stop_voice_session: 'Stop voice session',
+};
 
 /** GA Realtime API audio format object (replaces the beta flat "pcm16" string). */
 interface AudioFormat {
@@ -116,6 +181,22 @@ export class RealtimeAPIClient {
 
   // When true, the inactivity monitor is suspended (e.g. voice is sleeping)
   private listeningPaused: boolean = false;
+
+  // Extension-contributed voice tools (Core hook 1). Schemas are appended to the
+  // session tool list; nameMap maps the realtime-safe name back to the original
+  // namespaced (dotted) name for dispatch through the extension execution path.
+  private extensionVoiceTools: RealtimeFunctionTool[] = [];
+  private extensionVoiceToolNameMap: Map<string, string> = new Map();
+  private onExtensionVoiceToolCallback:
+    | ((namespacedName: string, args: Record<string, unknown>) => Promise<ExtensionVoiceToolResult>)
+    | null = null;
+
+  // Tool-call transcript visibility (Issue: voice tool calls were invisible).
+  // Fired on call start and completion; the renderer persists each to the voice
+  // session transcript. callId -> display label, so the completed event can be
+  // labeled without re-deriving it.
+  private onToolCallCallback: ((event: VoiceToolCallEvent) => void) | null = null;
+  private pendingToolCalls: Map<string, { name: string; displayName: string }> = new Map();
 
   constructor(
     apiKey: string,
@@ -277,6 +358,55 @@ export class RealtimeAPIClient {
    */
   setOnProposeCommit(callback: () => Promise<{ success: boolean; error?: string }>): void {
     this.onProposeCommitCallback = callback;
+  }
+
+  /**
+   * Provide extension-contributed voice tools (Core hook 1). Must be called
+   * before connect() so the tool list is in place when the session is configured.
+   * @param schemas Realtime function-tool schemas to append to the session.
+   * @param nameMap Realtime-safe name -> namespaced (dotted) name for dispatch.
+   */
+  setExtensionVoiceTools(schemas: RealtimeFunctionTool[], nameMap: Map<string, string>): void {
+    this.extensionVoiceTools = schemas;
+    this.extensionVoiceToolNameMap = nameMap;
+  }
+
+  /**
+   * Set the generic dispatch callback invoked when the voice agent calls an
+   * extension-contributed tool (any tool name not handled by the built-in
+   * switch in handleFunctionCall()).
+   */
+  setOnExtensionVoiceTool(
+    callback: (namespacedName: string, args: Record<string, unknown>) => Promise<ExtensionVoiceToolResult>
+  ): void {
+    this.onExtensionVoiceToolCallback = callback;
+  }
+
+  /**
+   * Set callback fired when the voice agent calls a tool (started + completed),
+   * so the renderer can record it in the voice session transcript.
+   */
+  setOnToolCall(callback: (event: VoiceToolCallEvent) => void): void {
+    this.onToolCallCallback = callback;
+  }
+
+  /** Resolve a display label for a tool call (built-in label or namespaced name). */
+  private toolDisplayName(name: string): string {
+    if (BUILTIN_VOICE_TOOL_DISPLAY_NAMES[name]) {
+      return BUILTIN_VOICE_TOOL_DISPLAY_NAMES[name];
+    }
+    // Extension tool: prefer the original namespaced (dotted) name if known.
+    return this.extensionVoiceToolNameMap.get(name) ?? name;
+  }
+
+  /**
+   * Build the full list of function tools advertised in the Realtime session
+   * config: the built-in tools followed by any extension-contributed voice
+   * tools. Exposed (not private) so the tool list can be asserted in tests
+   * without opening a WebSocket.
+   */
+  buildSessionTools(): NonNullable<SessionConfig['tools']> {
+    return [...this.buildBuiltinTools(), ...this.extensionVoiceTools];
   }
 
   /**
@@ -447,11 +577,20 @@ export class RealtimeAPIClient {
         }
         break;
 
-      case 'error':
+      case 'error': {
         const errorEvent = event as any;
+        // `response_cancel_not_active` is an expected VAD race: we send
+        // response.cancel on speech-start, but the server already finished
+        // that response, so it rejects the stray cancel. Harmless -- log at
+        // debug so it doesn't masquerade as a real failure in the console.
+        if (errorEvent.error?.code === 'response_cancel_not_active') {
+          console.debug('[RealtimeAPIClient] Ignoring stale response.cancel (no active response)');
+          break;
+        }
         console.error('[RealtimeAPIClient] Server error:', JSON.stringify(errorEvent.error, null, 2));
         console.error('[RealtimeAPIClient] Full error event:', JSON.stringify(errorEvent, null, 2));
         break;
+      }
 
       default:
         break;
@@ -477,7 +616,7 @@ Architecture:
 
 Session: ${this.sessionContext}
 
-IMPORTANT: Your knowledge of this codebase is limited to the session context above. You do NOT have current knowledge of this project's code, files, implementation details, or recent changes. Do not assume you know how features work. When in doubt, ask the coding agent.
+IMPORTANT: Your knowledge of this codebase is limited to the session context above. You do NOT have current knowledge of this project's code, files, implementation details, or recent changes. Do not assume you know how features work -- look it up. If project-knowledge or memory tools are listed below, prefer them for that lookup; otherwise ask the coding agent.
 
 Tools:
 - submit_agent_prompt: Send a coding task to the coding agent.
@@ -495,8 +634,9 @@ Guidelines:
 - Be terse. One short sentence per response. No filler phrases.
 - When the user says "shut up", "stop talking", "be quiet", "stop listening", "shh", or anything similar: IMMEDIATELY call pause_listening. Say ABSOLUTELY NOTHING before or after calling the tool -- not "ok", not "pausing", not any acknowledgment at all. Do not describe what will happen with the mic. Just call the tool silently.
 - For coding tasks: use submit_agent_prompt, say what you did in ~5 words (e.g. "Submitted."), then STOP. Do NOT say anything about waiting, timing out, or checking back. The microphone will go dormant automatically. You will be woken up with an "[INTERNAL: Task complete...]" message when the coding agent finishes. There is NO timeout -- tasks can take minutes. You do NOT need to monitor, wait, or follow up.
-- For questions about this project: use ask_coding_agent. The answer will come back as the tool result. Summarize it conversationally for the user.
+- For questions about this project (how it works, what was decided, what is in flight): if project-knowledge or memory tools (e.g. search_project_knowledge, recall) are listed in your tools, call them FIRST -- they answer in under a second. Only fall back to ask_coding_agent when memory returns nothing or the question needs live code inspection (reading current files, running something). When you do use ask_coding_agent, summarize the result conversationally for the user.
 - Only answer directly for truly general knowledge questions unrelated to this project.
+- Brainstorming and planning: you can be a design partner, not just a relay. Talk an idea through, push back, and when it is fleshed out kick off a written plan with submit_agent_prompt phrased as "/design <the idea>". To start implementation against an approved plan, use submit_agent_prompt phrased as "/implement <plan>". If extra grounding or plan-reading tools are listed in your context above, prefer them for pulling design docs and reading plans back; otherwise fall back to ask_coding_agent.
 - For "[INTERNAL: Task complete. Result: ...]" messages: briefly relay the result to the user. Do NOT say "I finished that task" -- just state the result.
 - For "[INTERNAL: User is now viewing ...]" messages: do NOT announce this. Silently note it for context.
 - For "[INTERACTIVE PROMPT: ...]" messages: the coding agent needs user input. Read the question and option labels aloud BRIEFLY -- just the question and option labels, not descriptions. Then WAIT for the user to clearly state their choice. Do NOT call respond_to_interactive_prompt until you hear a clear, deliberate answer from the user. If you hear garbled audio, silence, or unclear speech, ask "Which option?" -- do NOT guess or pick the first option. The user's microphone may pick up echo from your own speech -- ignore any "response" that arrives while you are still speaking or immediately after.
@@ -548,7 +688,24 @@ Your job is to be a voice relay, not to interpret or improve the user's requests
           format: { type: 'audio/pcm', rate: 24000 },
         },
       },
-      tools: [
+      tools: this.buildSessionTools(),
+    };
+
+    const event = {
+      type: 'session.update',
+      session: config,
+    };
+
+    console.log(`[RealtimeAPIClient] session.update: voice=${config.audio.output.voice}`);
+    this.ws.send(JSON.stringify(event));
+  }
+
+  /**
+   * Built-in voice tool schemas advertised on every session. Extension-
+   * contributed voice tools are appended in buildSessionTools().
+   */
+  private buildBuiltinTools(): NonNullable<SessionConfig['tools']> {
+    return [
         {
           type: 'function',
           name: 'submit_agent_prompt',
@@ -687,16 +844,7 @@ Your job is to be a voice relay, not to interpret or improve the user's requests
             required: [],
           },
         },
-      ],
-    };
-
-    const event = {
-      type: 'session.update',
-      session: config,
-    };
-
-    console.log(`[RealtimeAPIClient] session.update: voice=${config.audio.output.voice}`);
-    this.ws.send(JSON.stringify(event));
+    ];
   }
 
   /**
@@ -825,6 +973,20 @@ Your job is to be a voice relay, not to interpret or improve the user's requests
    * Handle function call from OpenAI
    */
   private async handleFunctionCall(callId: string, name: string, argsJson: string): Promise<void> {
+    // Record the call so it shows up in the voice session transcript. The
+    // matching 'completed' event is emitted from sendFunctionCallResult().
+    const displayName = this.toolDisplayName(name);
+    this.pendingToolCalls.set(callId, { name, displayName });
+    if (this.onToolCallCallback) {
+      let parsedArgs: Record<string, unknown> = {};
+      try {
+        parsedArgs = argsJson ? JSON.parse(argsJson) : {};
+      } catch {
+        parsedArgs = {};
+      }
+      this.onToolCallCallback({ phase: 'started', callId, name, displayName, args: parsedArgs });
+    }
+
     switch (name) {
       case 'submit_agent_prompt': {
         try {
@@ -1096,6 +1258,24 @@ Your job is to be a voice relay, not to interpret or improve the user's requests
       }
 
       default: {
+        // Not a built-in tool -- route to an extension-contributed voice tool
+        // (Core hook 1) if one is registered under this realtime-safe name.
+        const namespacedName = this.extensionVoiceToolNameMap.get(name);
+        if (namespacedName && this.onExtensionVoiceToolCallback) {
+          try {
+            const args = argsJson ? JSON.parse(argsJson) : {};
+            const result = await this.onExtensionVoiceToolCallback(namespacedName, args);
+            this.sendFunctionCallResult(callId, result);
+          } catch (error) {
+            console.error('[RealtimeAPIClient] Extension voice tool failed:', name, error);
+            this.sendFunctionCallResult(callId, {
+              success: false,
+              error: error instanceof Error ? error.message : String(error),
+            });
+          }
+          break;
+        }
+
         console.error('[RealtimeAPIClient] Unknown function call:', name);
         this.sendFunctionCallResult(callId, { error: 'Unknown function' });
       }
@@ -1121,6 +1301,30 @@ Your job is to be a voice relay, not to interpret or improve the user's requests
     };
 
     this.ws.send(JSON.stringify(event));
+
+    // Emit the matching 'completed' tool-call event for transcript visibility.
+    const pending = this.pendingToolCalls.get(callId);
+    if (pending) {
+      this.pendingToolCalls.delete(callId);
+      if (this.onToolCallCallback) {
+        const r = (result ?? {}) as Record<string, unknown>;
+        const success = typeof r.success === 'boolean' ? r.success : !r.error;
+        const summary =
+          (typeof r.summary === 'string' && r.summary) ||
+          (typeof r.answer === 'string' && r.answer) ||
+          (typeof r.message === 'string' && r.message) ||
+          (typeof r.error === 'string' && r.error) ||
+          undefined;
+        this.onToolCallCallback({
+          phase: 'completed',
+          callId,
+          name: pending.name,
+          displayName: pending.displayName,
+          success,
+          summary: summary || undefined,
+        });
+      }
+    }
 
     // Trigger assistant response
     this.createResponse();

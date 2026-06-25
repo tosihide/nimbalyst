@@ -50,6 +50,9 @@ Voice mode does **not** replace the coding session. It augments it. The voice ag
 | `packages/electron/src/renderer/utils/audioPlayback.ts` | Renderer | PCM16 playback via AudioBufferSourceNode, echo-cancellation-aware routing through MediaStreamDestination |
 | `packages/runtime/src/ai/prompt.ts` | Runtime | `buildClaudeCodeSystemPrompt()` injects voice mode section when `isVoiceMode` flag is set |
 | `packages/electron/src/main/mcp/httpServer.ts` | Main | MCP tools `voice_agent_speak` and `voice_agent_stop` exposed to coding agent |
+| `packages/electron/src/main/services/voice/voiceToolBridge.ts` | Main | Pure: converts extension AI tools (`voiceAgent: true`) into Realtime function-tool schemas + a realtime↔namespaced name map |
+| `packages/runtime/src/extensions/VoiceContextProviderRegistry.ts` | Renderer | Registry where extensions register voice session-context providers; produces the capped concatenated context |
+| `packages/runtime/src/ai/server/transcript/parsers/VoiceRawParser.ts` | Runtime | Parses `openai-realtime` raw messages (user/assistant speech, `[system]` diagnostics, and `voiceToolCall` JSON) into canonical transcript events, so voice-agent tool calls render as real tool widgets |
 
 ## Data Flow
 
@@ -220,6 +223,36 @@ The OpenAI Realtime API session is configured with these function-calling tools:
 | `create_session` | Create a new coding session and switch to it. The voice agent's linked session updates automatically via `voiceModeListeners.syncLinkedSession`. |
 | `propose_commit` | Trigger the "Commit with AI" feature. Sends `voice-mode:propose-commit` to the renderer, which runs the same logic as the Smart Commit button in `GitOperationsPanel`: pre-fetches files via `git:get-commit-context`, then dispatches an `ai:sendMessage` with the canonical `Use the developer_git_commit_proposal tool to create a commit.` prefix so the `CommitRequestCard` widget appears in the transcript. The resulting `git_commit_proposal_request` interactive prompt flows back to the voice agent through the existing interactive-prompt forwarding for verbal approve/reject. |
 
+## Extension Voice Tools & Context Providers (general core hooks)
+
+Any extension can contribute to the voice agent, not just a dedicated grounding extension. There are two general hooks, both bridging the renderer (where extension code runs) to the main process (where the voice session runs).
+
+### Core hook 1 — Extension voice tools
+
+An extension AI tool opts in by setting `voiceAgent: true` on its `ExtensionAITool`. The same tool shape/handler/`inputSchema` serves both the coding agent and the voice agent.
+
+- The flag is threaded through the existing tool registry: `MCPToolDefinition` (renderer, `ExtensionAIToolsBridge`) → `ExtensionToolDefinition` (main, `mcpWorkspaceResolver`). `getVoiceEnabledExtensionTools(workspacePath)` returns the opted-in tools for a workspace.
+- At voice session start, `VoiceModeService` queries those tools, converts each via `buildVoiceToolSet()` (`voiceToolBridge.ts`) into a Realtime function-tool schema (tool names are sanitized `.`→`_` because Realtime function names disallow dots; built-in tool names are reserved so they can't be shadowed), and hands them to `RealtimeAPIClient.setExtensionVoiceTools()`. The client appends them to the session `tools` array (`buildSessionTools()`).
+- Dispatch: any function call whose name is not a built-in routes through `RealtimeAPIClient`'s generic `onExtensionVoiceTool(namespacedName, args)` callback. `VoiceModeService` invokes the tool through the **existing extension execution path** (`handleExtensionTool`, the same route MCP uses), so the tool runs in the renderer with an `AIToolContext` (workspacePath, activeFilePath) mirroring the coding path.
+
+Voice tools should generally be `scope: 'global'` and self-contained (low latency, no required editor mount) since the voice agent has no reliable active-file context.
+
+### Core hook 2 — Voice session context providers
+
+An extension registers `context.services.ai.registerVoiceContextProvider((ctx) => string | Promise<string>)` to inject text into the voice agent's session context at start (e.g. top-N grounding facts). Providers live in the renderer-side `VoiceContextProviderRegistry`; on voice session start the main process requests the concatenated, capped output over a one-shot request/response IPC (`voice-mode:collect-extension-context`) and appends it to `sessionContext` in `loadSessionContext`. Each provider's output and the combined total are capped (the Realtime context window is expensive); providers run highest-priority-first and a throwing provider is isolated.
+
+Use a context provider for zero-latency grounding the agent should know up front; expose on-demand lookups as `voiceAgent: true` tools instead.
+
+### Core hook 3 — Backend-module voice tools (no renderer hop)
+
+Extension **backend modules** (utility-process runtimes) can also contribute voice/agent tools, without running their handler in the renderer. A backend module calls `services.registerMcpTools([{ name, description, inputSchema, voiceAgent }])`; the host stores them in a workspace-keyed `backendToolRegistry` (advertised as `<ext-short>.<name>`) and merges them into both the coding-agent MCP surface (`httpServer` ListTools/CallTool) and the voice tool set. A voice (or coding) call to a backend tool is dispatched **main→backend** via `handleBackendTool` → `PrivilegedExtensionHost.request(...)` — no renderer round-trip — so a native engine (e.g. better-sqlite3 + embeddings) answers in-process. Backend modules start/stop with the extension via `extensions/backendModuleLifecycle.ts` (start-on-enable, stop-on-disable, start-on-workspace-open).
+
+### Grounding extension — Nimbalyst Memory (`com.nimbalyst.memory`)
+
+The flagship consumer of the hooks above. Its backend module hosts the host-agnostic `MemoryEngine` (markdown indexer → rebuildable SQLite shadow index → hybrid dense+BM25+RRF retrieval) and registers `search_project_knowledge` / `recall` / `remember` (voice + coding) plus `expand` / `read_doc` / `status` (coding). Embeddings use OpenAI `text-embedding-3-small`, keyed only from the user's configured Nimbalyst OpenAI key (the `getApiKey` broker — never `process.env`). It indexes `design/**`, `docs/**`, `nimbalyst-local/plans/**`, the `CLAUDE.md` tree, and `nimbalyst-local/voice-memory/**`. A renderer-side voice context provider injects a short "you have a project memory — use these tools" note at session start (v1: static note; live top-N facts await a renderer→backend read bridge). This replaces the slow `ask_coding_agent` round-trip for grounded answers with a sub-second in-process lookup. Dev note: backend modules only auto-grant (no consent UI) when `npm run dev` runs with `NIMBALYST_ALLOW_DEV_BACKEND_MODULES=1` in a non-packaged build.
+
+**Brainstorm-loop tools (Phase 4).** The extension also closes the talk-it-through-on-a-bike-ride loop. Two host-agnostic backend voice tools — `get_latest_plan` (read back the most recently edited plan to summarize aloud) and `read_plan` (a plan by bare name or path) — let the agent summarize a just-written plan verbally; both cap their body for the Realtime budget. One Nimbalyst-specific renderer voice tool — `get_task_status` — answers "is it done yet?" by reading the active voice-linked session's `ai_sessions.status` (`running` / `waiting_for_input` / `idle` / `error`) through a new host API (`extensions:ai-get-task-status` → `ExtensionAIService.getTaskStatus()`), so the agent never blocks on the coding agent to report progress. Kickoff itself reuses the built-in `submit_agent_prompt` tool (the agent phrases `/design` and `/implement`); the extension's voice context provider injects the brainstorm→design→summarize→refine→implement choreography so the core voice prompt never assumes the memory tools exist.
+
 ## MCP Tools for Coding Agent
 
 The coding agent (Claude Code) has access to two MCP tools for voice interaction, registered in `httpServer.ts`:
@@ -267,8 +300,9 @@ Voice mode maintains two separate but linked sessions in the database:
 - Created with ID format `voice-{timestamp}-{random}` and provider `openai-realtime`
 - Transcript entries stored in `ai_agent_messages` incrementally as they arrive
 - Metadata (linked coding session ID, token usage, duration) stored in the session's metadata JSONB field
-- Sessions can be **resumed**: if a voice session for the same workspace was updated within the last 10 minutes (`VOICE_SESSION_TIMEOUT_MS`), new transcript entries append to it instead of creating a new session
+- Sessions can be **resumed**: if a voice session for the same workspace was updated within the last 30 minutes (`VOICE_SESSION_TIMEOUT_MS`), new transcript entries append to it instead of creating a new session
 - Diagnostic entries (file changes, state transitions) are written with `[system]` prefix and `diag-` ID prefix
+- Tool calls the voice agent makes (memory lookups, `ask_coding_agent`, etc.) are written as `voiceToolCall` JSON entries with a `tool-` ID prefix — emitted from `RealtimeAPIClient.handleFunctionCall` (started) and `sendFunctionCallResult` (completed), forwarded via `voice-mode:tool-call` IPC, and rendered as real tool widgets by `VoiceRawParser`. Previously these executed silently and were invisible in the transcript.
 
 ### Linked Coding Session (ai_sessions)
 

@@ -716,9 +716,20 @@ export const InstalledExtensionsPanel: React.FC<InstalledExtensionsPanelProps> =
                   {selectedExtension.enabled && extensionSettingsPanels.has(selectedExtension.id) && (() => {
                     const SettingsComponent = extensionSettingsPanels.get(selectedExtension.id)!;
                     const storage = createExtensionStorage(selectedExtension.id);
+                    // READ bridge to the extension's backend-module MCP tools
+                    // (e.g. live index status, facts list). The IPC handler
+                    // resolves the active workspace from this window.
+                    const callBackendTool = (toolName: string, args?: Record<string, unknown>) =>
+                      window.electronAPI.invoke('extensions:ai-call-backend-tool', {
+                        toolName,
+                        args: args ?? {},
+                        // Host-injected caller identity (not from extension code)
+                        // so main can enforce the tool belongs to THIS extension.
+                        callerExtensionId: selectedExtension.id,
+                      });
                     return (
                       <div className="pt-4 border-t border-[var(--nim-border)]">
-                        <SettingsComponent storage={storage} theme={theme} />
+                        <SettingsComponent storage={storage} theme={theme} callBackendTool={callBackendTool} />
                       </div>
                     );
                   })()}

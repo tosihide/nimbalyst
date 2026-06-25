@@ -19,6 +19,7 @@ import {
   getExtensionLoader,
   setOffscreenMountCallback,
   setEnsureEditorCallback,
+  collectVoiceSessionContext,
 } from '@nimbalyst/runtime';
 import { ExtensionPlatformServiceImpl } from '../services/ExtensionPlatformServiceImpl';
 import { initializeExtensionEditorBridge } from '../extensions/ExtensionEditorBridge';
@@ -46,6 +47,9 @@ let extensionStatusListenerSetup = false;
 
 // Track if extension tool execution listener is set up
 let extensionToolListenerSetup = false;
+
+// Track if the voice-context collection listener is set up
+let voiceContextListenerSetup = false;
 
 // Track if renderer eval listener is set up
 let rendererEvalListenerSetup = false;
@@ -722,6 +726,28 @@ export async function registerExtensionSystem(): Promise<void> {
         window.electronAPI.registerExtensionTools(currentWorkspacePath, tools);
       }
     });
+
+    // Core hook 2: when a voice session starts, the main process asks the
+    // renderer for any extension-contributed voice session context. Run the
+    // registered providers and reply on the one-shot result channel.
+    if (!voiceContextListenerSetup && window.electronAPI?.on && window.electronAPI?.send) {
+      voiceContextListenerSetup = true;
+      window.electronAPI.on(
+        'voice-mode:collect-extension-context',
+        async (data: {
+          input: { workspacePath?: string; activeFilePath?: string; voiceSessionId?: string; codingSessionId?: string };
+          resultChannel: string;
+        }) => {
+          let context = '';
+          try {
+            context = await collectVoiceSessionContext(data.input || {});
+          } catch (error) {
+            console.error('[ExtensionSystem] Failed to collect voice context:', error);
+          }
+          window.electronAPI.send(data.resultChannel, { context });
+        }
+      );
+    }
 
     // Set up IPC listener for extension tool execution
     if (!extensionToolListenerSetup && window.electronAPI?.onExecuteExtensionTool && window.electronAPI?.sendExtensionToolResult) {

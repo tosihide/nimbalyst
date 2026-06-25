@@ -58,6 +58,9 @@ import { resolveActiveWorkspacePathForWindowId } from '../../window/windowState'
 import { sessionFileTracker } from '../SessionFileTracker';
 import { enrichTranscriptMessagesWithToolCallDiffs } from '../TranscriptToolCallEnricher';
 import { extractFilePath } from './tools/extractFilePath';
+import { handleBackendTool } from '../../mcp/tools/backendToolHandler';
+import { findOwnedBackendTool } from '../../mcp/backendToolRegistry';
+import { resolveBackendWorkspacePath } from '../../mcp/mcpWorkspaceResolver';
 import { toolCallMatcher, unwrapShellCommand } from '../ToolCallMatcher';
 import { workspaceFileEditAttributionService } from '../WorkspaceFileEditAttributionService';
 import {AnalyticsService} from "../analytics/AnalyticsService.ts";
@@ -3660,6 +3663,72 @@ export class AIService {
       const response = result?.content || '';
 
       return { sessionId: session.id, response };
+    });
+
+    // Extension SDK: renderer->backend READ bridge. Lets an extension's renderer
+    // half (settings panel, voice context provider) call one of ITS OWN backend
+    // module's MCP tools and get the parsed result. Tool calls otherwise route
+    // main->backend with no renderer hop; this is the one path the renderer needs
+    // for read access (live index status, listing facts, triggering a rebuild).
+    //
+    // SECURITY: `callerExtensionId` is injected by the host that builds the
+    // bridge (ExtensionLoader / settings panel) from the extension's own
+    // manifest id — it is NOT supplied by extension code. We enforce that the
+    // resolved tool belongs to the calling extension so one enabled extension
+    // can't reach into another extension's backend tools (e.g. memory.delete_fact)
+    // just by knowing the name.
+    safeHandle('extensions:ai-call-backend-tool', async (
+      event,
+      options: {
+        toolName: string;
+        args?: Record<string, unknown>;
+        workspacePath?: string;
+        callerExtensionId?: string;
+      }
+    ) => {
+      const toolName = options?.toolName;
+      if (!toolName) {
+        throw new Error('toolName is required');
+      }
+      const callerExtensionId = options?.callerExtensionId;
+      if (!callerExtensionId) {
+        throw new Error('callerExtensionId is required for backend tool call');
+      }
+
+      // Resolve the workspace: explicit arg wins, else the window's active
+      // project (honors the project rail selection in Multi-Project mode).
+      let workspacePath = options?.workspacePath;
+      if (!workspacePath) {
+        const browserWindow = BrowserWindow.fromWebContents(event.sender);
+        const windowId = browserWindow ? getWindowId(browserWindow) : null;
+        workspacePath = resolveActiveWorkspacePathForWindowId(windowId) ?? undefined;
+      }
+      if (!workspacePath) {
+        throw new Error('No workspace path available for backend tool call');
+      }
+
+      // Resolve worktree paths to the project path the backend module was started
+      // for, then route to the module over the typed RPC bridge.
+      const resolved = await resolveBackendWorkspacePath(workspacePath);
+
+      // Enforce caller ownership of the tool. Fail closed: an unknown tool and a
+      // cross-extension call both reject without dispatching.
+      const entry = findOwnedBackendTool(resolved, toolName, callerExtensionId);
+      if (!entry) {
+        throw new Error(`Backend tool not available to this extension: ${toolName}`);
+      }
+
+      const result = await handleBackendTool(toolName, toolName, options?.args ?? {}, resolved);
+      const text = result.content?.[0]?.text ?? '';
+      if (result.isError) {
+        throw new Error(text || `Backend tool ${toolName} failed`);
+      }
+      try {
+        return JSON.parse(text);
+      } catch {
+        // Tool returned a non-JSON string payload; hand it back as-is.
+        return text;
+      }
     });
 
     // Extension SDK: List available chat models

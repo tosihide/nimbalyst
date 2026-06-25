@@ -21,9 +21,13 @@ import { getAllowedClipOrigin, hasAllowedClipContentType } from "./clipRequestGu
 import {
   documentStateBySession,
   getAvailableExtensionTools,
+  getAvailableBackendTools,
+  resolveBackendWorkspacePath,
   registerWorkspaceMappingForConnection,
   ExtensionToolDefinition,
 } from "./mcpWorkspaceResolver";
+import { handleBackendTool, isBackendTool } from "./tools/backendToolHandler";
+import { setBackendToolsChangeNotifier } from "./backendToolRegistry";
 
 // Tool handlers + schemas
 import { handleVoiceAgentSpeak, handleVoiceAgentStop, voiceToolSchemas } from "./tools/voiceToolHandlers";
@@ -156,6 +160,19 @@ export function registerExtensionTools(
 ) {
   _registerExtensionTools(workspacePath, tools, serversByWorkspace);
 }
+
+// When a backend module (re)registers its MCP tools, tell connected sessions to
+// re-fetch their tool list. Notifying all connected servers is cheap and
+// idempotent (clients just re-list), so we skip per-workspace path resolution.
+setBackendToolsChangeNotifier((_workspacePath: string) => {
+  for (const servers of serversByWorkspace.values()) {
+    for (const server of servers) {
+      server.sendToolListChanged().catch(() => {
+        // Ignore - client may have disconnected.
+      });
+    }
+  }
+});
 
 // ---- Server Lifecycle ----
 
@@ -384,10 +401,16 @@ function createSharedMcpServer(
         workspacePath,
         currentFilePath
       );
-      allTools = selectExtensionToolsForEndpoint(
-        extensionTools,
-        endpoint.extensionShortName
-      ).map((tool) => ({
+      // Backend-module-registered tools (executed by the module, not the
+      // renderer) live in a parallel registry; merge them in for this endpoint.
+      const backendTools = await getAvailableBackendTools(
+        workspacePath,
+        currentFilePath
+      );
+      allTools = [
+        ...selectExtensionToolsForEndpoint(extensionTools, endpoint.extensionShortName),
+        ...selectExtensionToolsForEndpoint(backendTools, endpoint.extensionShortName),
+      ].map((tool) => ({
         name: sanitizeToolName(tool.name),
         description: tool.description,
         inputSchema: tool.inputSchema,
@@ -575,6 +598,17 @@ function createSharedMcpServer(
           }
           if (toolName === "update_session_meta") {
             return dispatchSessionMetaTool(name, args, sessionId ?? "");
+          }
+          // Backend-module tools execute IN the module (main↔backend RPC),
+          // unlike renderer extension tools. Route them before the renderer
+          // fallback so a backend tool never round-trips to the renderer. The
+          // registry/module are keyed by the project path, so resolve worktree
+          // paths first.
+          if (workspacePath) {
+            const resolvedBackendWs = await resolveBackendWorkspacePath(workspacePath);
+            if (isBackendTool(toolName, resolvedBackendWs)) {
+              return handleBackendTool(toolName, name, args, resolvedBackendWs);
+            }
           }
           return handleExtensionTool(toolName, name, args, sessionId, workspacePath);
       }

@@ -1084,6 +1084,41 @@ export function getAIProviderOverrides(workspacePath: string): AIProviderOverrid
   return normalizeAIProviderOverrides(overrides);
 }
 
+/**
+ * Lazily-opened `ai-settings` electron-store (where provider API keys live —
+ * `apiKeys`). Separate from the `app-settings` store exported as `store`.
+ */
+let _aiSettingsStore: Store<Record<string, unknown>> | null = null;
+function getAiSettingsStore(): Store<Record<string, unknown>> {
+  if (!_aiSettingsStore) {
+    _aiSettingsStore = new Store<Record<string, unknown>>({ name: 'ai-settings' });
+  }
+  return _aiSettingsStore;
+}
+
+/**
+ * Resolve a provider API key from EXPLICIT settings only — a per-workspace
+ * project override if present, else the global `ai-settings` `apiKeys[providerId]`.
+ * NEVER reads `process.env` (CLAUDE.md no-implicit-env-key rule). Returns null
+ * when not configured. Mirrors `AIService.getApiKeyForProvider` so the
+ * backend-module `getApiKey` broker hands an extension engine the same key the
+ * AI providers use (the key lives in `ai-settings`, NOT `app-settings`).
+ */
+export function getProviderApiKeyFromSettings(
+  providerId: string,
+  workspacePath?: string
+): string | null {
+  if (workspacePath) {
+    const overrideKey = getAIProviderOverrides(workspacePath)?.providers?.[providerId]?.apiKey;
+    if (typeof overrideKey === 'string' && overrideKey.length > 0) {
+      return overrideKey;
+    }
+  }
+  const apiKeys = getAiSettingsStore().get('apiKeys') as Record<string, string> | undefined;
+  const key = apiKeys?.[providerId];
+  return typeof key === 'string' && key.length > 0 ? key : null;
+}
+
 export function saveAIProviderOverrides(workspacePath: string, overrides: AIProviderOverrides | undefined): void {
   const normalizedOverrides = normalizeAIProviderOverrides(overrides);
   updateWorkspaceState(workspacePath, workspace => {

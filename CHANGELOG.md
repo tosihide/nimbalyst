@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- New Nimbalyst Memory extension: indexes your project notes and surfaces relevant facts to the AI and voice agent for grounded answers.
+- Extensions can now contribute tools and session context to the voice agent.
 - Search box on the Installed Extensions settings pane to filter the list.
 
 ### Changed

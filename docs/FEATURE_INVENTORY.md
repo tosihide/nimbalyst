@@ -181,6 +181,11 @@ A concise reference of all features in the product. Keep this up to date as feat
 - Idle timer management
 - Wake-from-sleep handling
 - Echo cancellation
+- Extension-contributed voice tools (`voiceAgent: true` AI tools) and voice session-context providers — any extension can expose tools and start-of-session context to the voice agent
+- Backend-module voice/agent tools — an extension's utility-process can register MCP tools dispatched in-process (no renderer hop), enabling native engines to answer the voice and coding agents sub-second
+- Project-knowledge grounding (Nimbalyst Memory extension) — local hybrid search over your design docs, plans, CLAUDE.md, and notes, available to the voice and coding agents
+- Hands-free brainstorm loop — talk an idea through, kick off a plan (`/design`), have the agent read the written plan back to refine it by voice, then `/implement`; ask "is it done yet?" anytime for live task status
+- Voice agent tool calls (memory lookups, coding-agent questions, and more) are recorded in the voice session transcript and render as tool widgets
 - Available on both desktop and iOS
 
 ## Mobile (iOS)
@@ -293,6 +298,7 @@ A concise reference of all features in the product. Keep this up to date as feat
 - Image Generation
 - iOS Dev Tools
 - MockupLM
+- Nimbalyst Memory — local project-knowledge brain (hybrid search + facts) for the voice and coding agents
 - PDF Viewer
 - Planning
 - Project Graph — navigable whole-project graph of plans, trackers, sessions, commits, and files, with a horizontally scrollable **Timeline mode** (phase-colored lifecycle bars per item; collapse items into per-tag activity lanes)

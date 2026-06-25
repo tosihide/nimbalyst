@@ -90,6 +90,15 @@ export {
 } from './ExtensionAIToolsBridge';
 export type { MCPToolDefinition } from './ExtensionAIToolsBridge';
 
+// Voice context provider registry (Core hook 2)
+export {
+  registerVoiceContextProvider,
+  unregisterVoiceContextProvidersForExtension,
+  collectVoiceSessionContext,
+  _clearVoiceContextProvidersForTest,
+} from './VoiceContextProviderRegistry';
+export type { CollectVoiceContextOptions } from './VoiceContextProviderRegistry';
+
 // Extension Editor API Registry
 export {
   registerEditorAPI,

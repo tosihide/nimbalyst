@@ -3,7 +3,16 @@
  */
 
 import { BrowserWindow, ipcMain, systemPreferences } from 'electron';
-import { RealtimeAPIClient } from './RealtimeAPIClient';
+import { RealtimeAPIClient, BUILTIN_VOICE_TOOL_NAMES } from './RealtimeAPIClient';
+import { buildVoiceToolSet } from './voiceToolBridge';
+import { mapAiSessionStatusToTaskStatus } from './taskStatus';
+import {
+  getVoiceEnabledExtensionTools,
+  getVoiceEnabledBackendToolsForWorkspace,
+  resolveBackendWorkspacePath,
+} from '../../mcp/mcpWorkspaceResolver';
+import { handleExtensionTool } from '../../mcp/tools/extensionToolHandler';
+import { handleBackendTool, isBackendTool } from '../../mcp/tools/backendToolHandler';
 import { safeHandle } from '../../utils/ipcRegistry';
 import Store from 'electron-store';
 import { AnalyticsService } from '../analytics/AnalyticsService';
@@ -44,6 +53,34 @@ function sendSessionEndedEvent(reason: string, startTime: number): void {
 }
 
 let activeVoiceSession: VoiceSession | null = null;
+
+/**
+ * Request the concatenated voice session context contributed by extensions
+ * (Core hook 2). Extension providers run in the renderer, so we send a request
+ * with a one-shot result channel and await the reply (capped timeout). Returns
+ * an empty string if no providers contribute or on timeout/error.
+ */
+function requestExtensionVoiceContext(
+  window: BrowserWindow,
+  input: { workspacePath?: string; activeFilePath?: string; voiceSessionId?: string; codingSessionId?: string }
+): Promise<string> {
+  return new Promise((resolve) => {
+    if (!window || window.isDestroyed()) {
+      resolve('');
+      return;
+    }
+    const resultChannel = `voice-mode:extension-context-result-${Date.now()}-${Math.random()}`;
+    const timeout = setTimeout(() => {
+      ipcMain.removeAllListeners(resultChannel);
+      resolve('');
+    }, 5000);
+    ipcMain.once(resultChannel, (_event, data: { context?: string }) => {
+      clearTimeout(timeout);
+      resolve(typeof data?.context === 'string' ? data.context : '');
+    });
+    window.webContents.send('voice-mode:collect-extension-context', { input, resultChannel });
+  });
+}
 
 /**
  * Check if voice mode is active for a given session
@@ -228,6 +265,31 @@ export function initVoiceModeService() {
   const settingsStore = new Store<Record<string, unknown>>({
     name: 'ai-settings',  // Same as AIService!
     watch: true,
+  });
+
+  /**
+   * Extension SDK: report the status of the agent task the voice agent is
+   * currently driving (the session it targets with submit_agent_prompt). Lets an
+   * extension voice tool (e.g. the memory extension's get_task_status) answer
+   * "is it still running?" verbally. Resolves the active voice-linked session,
+   * then reads its live status from ai_sessions (same source as list_sessions).
+   */
+  safeHandle('extensions:ai-get-task-status', async (_event, _options: { workspacePath?: string }) => {
+    const targetId = getActiveVoiceSessionId();
+    if (!targetId) return null;
+    try {
+      const db = getDatabase();
+      const { rows } = await db.query<{ id: string; title: string | null; status: string | null }>(
+        `SELECT id, title, status FROM ai_sessions WHERE id = $1`,
+        [targetId],
+      );
+      const row = rows[0];
+      if (!row) return null;
+      return mapAiSessionStatusToTaskStatus(row);
+    } catch (error) {
+      console.error('[VoiceModeService] get-task-status query failed:', error);
+      return null;
+    }
   });
 
   // Voice mode settings store (for voice mode specific settings including custom prompts)
@@ -440,8 +502,89 @@ export function initVoiceModeService() {
       };
       const selectedVoice = voiceModeSettings?.voice || 'alloy';
 
+      // Core hook 2: let extensions contribute to the voice session context at
+      // start (e.g. top-N grounding facts). Appended before the client is built
+      // so it ships in the initial session instructions.
+      try {
+        const extensionContext = await requestExtensionVoiceContext(window, {
+          workspacePath: workspacePath ?? undefined,
+          voiceSessionId: sessionId,
+          codingSessionId: sessionId,
+        });
+        if (extensionContext && extensionContext.trim().length > 0) {
+          sessionContext += `\n\n${extensionContext.trim()}`;
+          console.log(`[VoiceModeService] Appended ${extensionContext.length} chars of extension voice context`);
+        }
+      } catch (error) {
+        console.error('[VoiceModeService] Failed to collect extension voice context:', error);
+      }
+
       // Create PoC instance with agent session context, custom prompt, turn detection, and voice
       const poc = new RealtimeAPIClient(apiKey, sessionId, workspacePath, window, sessionContext, customPrompt, turnDetection, selectedVoice);
+
+      // Core hook 1: expose extension-contributed voice tools to the Realtime
+      // session. Must be set before connect() so the tool list ships in the
+      // session config. Dispatch reuses the existing extension-tool execution
+      // path (the same route MCP uses via handleExtensionTool).
+      try {
+        // Voice tools come from two sources: renderer-declared extension tools
+        // (dispatched to the renderer) and backend-module-registered tools
+        // (dispatched main->backend, no renderer hop — protects the voice
+        // latency budget). Merge both into the Realtime tool list.
+        const [extVoiceTools, backendVoiceTools] = await Promise.all([
+          getVoiceEnabledExtensionTools(workspacePath ?? undefined),
+          getVoiceEnabledBackendToolsForWorkspace(workspacePath ?? undefined),
+        ]);
+        const voiceTools = [...extVoiceTools, ...backendVoiceTools];
+        if (voiceTools.length > 0) {
+          const { schemas, nameMap } = buildVoiceToolSet(voiceTools, {
+            reservedNames: new Set(BUILTIN_VOICE_TOOL_NAMES),
+          });
+          poc.setExtensionVoiceTools(schemas, nameMap);
+          poc.setOnExtensionVoiceTool(async (namespacedName, args) => {
+            const targetWorkspace = activeVoiceSession?.workspacePath ?? workspacePath ?? undefined;
+            const targetSessionId = activeVoiceSession?.sessionId ?? sessionId;
+            try {
+              // Route backend tools to the module; everything else to the
+              // renderer extension path. Resolve worktree paths so the registry
+              // and module lookups hit the project the module started for.
+              let result;
+              const resolvedWs = targetWorkspace
+                ? await resolveBackendWorkspacePath(targetWorkspace)
+                : undefined;
+              if (resolvedWs && isBackendTool(namespacedName, resolvedWs)) {
+                result = await handleBackendTool(
+                  namespacedName,
+                  namespacedName,
+                  args,
+                  resolvedWs
+                );
+              } else {
+                result = await handleExtensionTool(
+                  namespacedName, // toolName -- matches the registered (dotted) name
+                  namespacedName, // originalName (for error messages)
+                  args,
+                  targetSessionId,
+                  targetWorkspace
+                );
+              }
+              const text = (result.content || [])
+                .map((c) => (typeof c?.text === 'string' ? c.text : ''))
+                .filter(Boolean)
+                .join('\n');
+              return { success: !result.isError, message: text };
+            } catch (error) {
+              console.error('[VoiceModeService] Extension voice tool dispatch failed:', namespacedName, error);
+              return { success: false, error: error instanceof Error ? error.message : String(error) };
+            }
+          });
+          console.log(
+            `[VoiceModeService] Exposed ${schemas.length} voice tool(s) (${extVoiceTools.length} extension, ${backendVoiceTools.length} backend): ${Array.from(nameMap.values()).join(', ')}`
+          );
+        }
+      } catch (error) {
+        console.error('[VoiceModeService] Failed to load voice tools:', error);
+      }
 
       // Helper: get the current linked session ID (may change if user switches sessions)
       const currentSessionId = () => activeVoiceSession?.sessionId ?? sessionId;
@@ -475,6 +618,12 @@ export function initVoiceModeService() {
       poc.setOnTokenUsage((usage) => {
         if (window && !window.isDestroyed()) {
           window.webContents.send('voice-mode:token-usage', { sessionId: currentSessionId(), usage });
+        }
+      });
+
+      poc.setOnToolCall((event) => {
+        if (window && !window.isDestroyed()) {
+          window.webContents.send('voice-mode:tool-call', { sessionId: currentSessionId(), event });
         }
       });
 

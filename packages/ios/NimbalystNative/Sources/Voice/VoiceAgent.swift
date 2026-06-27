@@ -908,7 +908,7 @@ public final class VoiceAgent: ObservableObject {
                     "properties": [
                         "session_id": [
                             "type": "string",
-                            "description": "The id of the session to switch to.",
+                            "description": "The opaque `id` field of the session from list_sessions. NOT the session title.",
                         ],
                     ],
                     "required": ["session_id"],
@@ -917,13 +917,13 @@ public final class VoiceAgent: ObservableObject {
             [
                 "type": "function",
                 "name": "get_session_summary",
-                "description": "Get a summary of a session (title, message count, last activity, recent assistant message), read from this device. Omit session_id to summarize the session the user is viewing.",
+                "description": "Get a summary of a session (title, message count, last activity, recent assistant message), read from this device. To summarize the session the user is viewing, OMIT session_id. To summarize a different session, first call list_sessions and pass that session's `id`.",
                 "parameters": [
                     "type": "object",
                     "properties": [
                         "session_id": [
                             "type": "string",
-                            "description": "Optional session id. Defaults to the active session.",
+                            "description": "Optional opaque session id (the `id` field from list_sessions). NOT the session title. Omit to summarize the session the user is viewing.",
                         ],
                     ],
                     "required": [] as [String],

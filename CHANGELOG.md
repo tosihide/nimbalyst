@@ -13,11 +13,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 <!-- Changes to existing functionality go here -->
+
+### Fixed
+<!-- Bug fixes go here -->
+
+### Removed
+<!-- Removed features go here -->
+
+## [0.66.8] - 2026-07-02
+
+
+### Added
+<!-- New features go here -->
+
+### Changed
+<!-- Changes to existing functionality go here -->
 - The iOS voice agent now runs the same gpt-realtime-2 model and session configuration as desktop, with automatic fallback when the model is unavailable.
 
 ### Fixed
 <!-- Bug fixes go here -->
 - Built-in extensions are once again included in packaged builds; a dependency regression had silently dropped them from released apps.
+- The memory extension now starts in packaged builds instead of failing to load its bundled dependencies.
 - Agent sessions that launch background tasks now wake and continue when those tasks finish, instead of the task being cancelled at the end of the turn.
 - Voice mode no longer interrupts itself from echo of its own speech on open speakers (desktop and iOS).
 - The voice selected in iOS Settings (or synced from desktop) is now actually used by the voice agent.

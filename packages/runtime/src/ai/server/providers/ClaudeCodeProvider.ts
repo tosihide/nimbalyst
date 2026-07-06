@@ -121,6 +121,11 @@ import {
   shouldArmStreamStallWatchdog,
 } from './claudeCode/streamStallWatchdog';
 import {
+  buildStreamClosedContinuationMessage,
+  classifyStreamClosedContinuation,
+  extractStreamClosedToolName,
+} from './claudeCode/streamClosedRecovery';
+import {
   isBunRuntimeSpawnCrash,
   collectSpawnCrashDiagnostics,
   armAgentSdkDebugLogging,
@@ -219,6 +224,13 @@ export class ClaudeCodeProvider extends BaseAgentProvider {
   // teammate message arrives or teammates complete. Abandon after MAX_CONTINUATIONS.
   private continuationCount: number = 0;
   private static readonly MAX_CONTINUATIONS = 3;
+  private sawStreamClosedThisTurn = false;
+  private streamClosedTranscriptLoggedThisTurn = false;
+  private streamClosedToolName: string | undefined;
+  private streamClosedRetryCount = 0;
+  private streamClosedContinuationPrepared = false;
+  private streamClosedContinuationMessagePending: string | null = null;
+  private static readonly MAX_STREAM_CLOSED_RETRIES = 2;
   // Resolve function to break the for-await loop immediately when interrupt is called.
   // Racing this against .next() lets us unblock without waiting for the SDK transport.
   private interruptResolve: (() => void) | null = null;
@@ -505,6 +517,7 @@ export class ClaudeCodeProvider extends BaseAgentProvider {
     // (e.g., auto-context /context command running while a queued prompt fires)
     const hideMessages = this.markMessagesAsHidden;
     this.markMessagesAsHidden = false;
+    this.resetStreamClosedTurnState();
 
     // Track session mode for MCP server configuration and tool filtering
     this.currentMode = (documentContext as any)?.mode || 'agent';
@@ -1014,6 +1027,16 @@ export class ClaudeCodeProvider extends BaseAgentProvider {
               && item.content.includes('Stream closed')
             );
             if (hasStreamClosedError) {
+              const streamClosedResult = chunk.message.content.find((item: any) =>
+                item?.type === 'tool_result'
+                && item.is_error === true
+                && typeof item.content === 'string'
+                && item.content.includes('Stream closed')
+              );
+              const rawToolUseId = typeof streamClosedResult?.tool_use_id === 'string'
+                ? streamClosedResult.tool_use_id
+                : undefined;
+              const rawToolName = rawToolUseId ? toolCallsById.get(rawToolUseId)?.name : undefined;
               const chunkJson = JSON.stringify(chunk);
               const timeSinceResult = resultReceivedTime !== null
                 ? `${Date.now() - resultReceivedTime}ms (result was chunk #${resultReceivedChunkCount})`
@@ -1023,6 +1046,12 @@ export class ClaudeCodeProvider extends BaseAgentProvider {
               if (stderrLines.length > 0) {
                 console.error(`[CLAUDE-CODE] STREAM_CLOSED_RAW_CHUNK stderr: ${stderrLines.join('').trim().substring(0, 500)}`);
               }
+              this.recordStreamClosedToolFailure({
+                sessionId,
+                hideMessages,
+                toolName: rawToolName,
+                resultText: streamClosedResult?.content ?? 'Stream closed',
+              });
             }
           }
 
@@ -1197,6 +1226,16 @@ export class ClaudeCodeProvider extends BaseAgentProvider {
                   // Diagnostic: detect "Stream closed" errors from the native binary
                   const resultText = typeof item.content === 'string' ? item.content : JSON.stringify(item.content);
                   if (item.isError && resultText.includes('Stream closed')) {
+                    this.recordStreamClosedToolFailure({
+                      sessionId,
+                      hideMessages,
+                      toolName: extractStreamClosedToolName({
+                        isError: item.isError,
+                        resultText,
+                        toolName: toolCall.name,
+                      }) ?? toolCall.name,
+                      resultText,
+                    });
                     const timeSinceResult = resultReceivedTime !== null
                       ? `${Date.now() - resultReceivedTime}ms (result was chunk #${resultReceivedChunkCount})`
                       : 'result not yet received';
@@ -1432,6 +1471,7 @@ export class ClaudeCodeProvider extends BaseAgentProvider {
             if (willDrainSubagents) {
               this.drainingBackgroundTasks = true;
             }
+            this.prepareStreamClosedContinuation(sessionId, hideMessages);
 
             yield {
               type: 'complete',
@@ -1673,6 +1713,7 @@ export class ClaudeCodeProvider extends BaseAgentProvider {
 
         // Canonical transcript: turn ended with usage
         transcriptAdapter?.turnEnded(usageData, modelUsageData);
+        this.prepareStreamClosedContinuation(sessionId, hideMessages);
 
         yield {
           type: 'complete',
@@ -1794,6 +1835,7 @@ export class ClaudeCodeProvider extends BaseAgentProvider {
         await this.flushPendingWrites();
         if (sessionId) await this.processTranscriptMessages(sessionId);
         if (!completeEmitted) {
+          this.prepareStreamClosedContinuation(sessionId, hideMessages);
           yield {
             type: 'complete'
           };
@@ -1840,6 +1882,8 @@ export class ClaudeCodeProvider extends BaseAgentProvider {
       // Note: markMessagesAsHidden is reset at the START of sendMessage to prevent race conditions
 
       this.handlePostLeadTurnTeammateState(sessionId, hideMessages);
+      this.emitPreparedStreamClosedContinuation(sessionId);
+      this.finishStreamClosedTurnState();
 
       this.transportDied = false;
     }
@@ -1847,6 +1891,8 @@ export class ClaudeCodeProvider extends BaseAgentProvider {
 
   abort(): void {
     console.log('[CLAUDE-CODE] Abort called, abortController:', this.abortController ? 'exists' : 'NULL');
+    this.streamClosedRetryCount = 0;
+    this.resetStreamClosedTurnState();
 
     // Resolve the interrupt promise so the Promise.race in the streaming loop
     // settles immediately, preventing the loop from hanging on a dead transport.
@@ -2228,6 +2274,108 @@ export class ClaudeCodeProvider extends BaseAgentProvider {
         this.continuationCount = 0;
       }
     }
+  }
+
+  private resetStreamClosedTurnState(): void {
+    this.sawStreamClosedThisTurn = false;
+    this.streamClosedTranscriptLoggedThisTurn = false;
+    this.streamClosedToolName = undefined;
+    this.streamClosedContinuationPrepared = false;
+    this.streamClosedContinuationMessagePending = null;
+  }
+
+  private finishStreamClosedTurnState(): void {
+    if (!this.sawStreamClosedThisTurn) {
+      this.streamClosedRetryCount = 0;
+    }
+    this.resetStreamClosedTurnState();
+  }
+
+  private recordStreamClosedToolFailure(params: {
+    sessionId?: string;
+    hideMessages: boolean;
+    toolName?: string;
+    resultText: string;
+  }): void {
+    const narrowedToolName = extractStreamClosedToolName({
+      isError: true,
+      resultText: params.resultText,
+      toolName: params.toolName,
+    });
+
+    this.sawStreamClosedThisTurn = true;
+    if (narrowedToolName) {
+      this.streamClosedToolName = narrowedToolName;
+    }
+
+    if (
+      params.sessionId
+      && !params.hideMessages
+      && !this.streamClosedTranscriptLoggedThisTurn
+    ) {
+      const message = buildStreamClosedContinuationMessage(this.streamClosedToolName);
+      this.logError(
+        params.sessionId,
+        'claude-code',
+        new Error(message),
+        'stream_closed_tool_result',
+        'stream_closed_transport',
+        false,
+      );
+      this.streamClosedTranscriptLoggedThisTurn = true;
+    }
+  }
+
+  private prepareStreamClosedContinuation(
+    sessionId: string | undefined,
+    hideMessages: boolean,
+  ): void {
+    if (this.streamClosedContinuationPrepared) return;
+    this.streamClosedContinuationPrepared = true;
+
+    const decision = classifyStreamClosedContinuation({
+      sawStreamClosed: this.sawStreamClosedThisTurn,
+      retryCount: this.streamClosedRetryCount,
+      maxRetries: ClaudeCodeProvider.MAX_STREAM_CLOSED_RETRIES,
+      drainExitCause: this.drainExitCause,
+      hasPendingUserStop: hideMessages,
+    });
+
+    if (!decision.continue) {
+      if (decision.reason === 'aborted' || decision.reason === 'not-applicable') {
+        this.streamClosedRetryCount = 0;
+      }
+      if (decision.reason === 'exhausted') {
+        console.warn(`[CLAUDE-CODE] Stream-closed recovery exhausted after ${this.streamClosedRetryCount}/${ClaudeCodeProvider.MAX_STREAM_CLOSED_RETRIES} retries`);
+      }
+      return;
+    }
+
+    if (
+      !sessionId
+      || this.teammateIdleMessagePending
+      || this.teammateManager.hasPendingTeammateMessages()
+      || this.teammateManager.hasActiveTeammates()
+      || this.drainingBackgroundTasks
+      || this.hasRunningTasks()
+    ) {
+      return;
+    }
+
+    this.streamClosedRetryCount++;
+    this.streamClosedContinuationMessagePending = buildStreamClosedContinuationMessage(this.streamClosedToolName);
+    // Set before yielding `complete`; AIService checks willResumeAfterCompletion()
+    // while handling that chunk, before this generator reaches finally.
+    this.teammateIdleMessagePending = true;
+    console.warn(`[CLAUDE-CODE] Stream-closed recovery scheduled (${this.streamClosedRetryCount}/${ClaudeCodeProvider.MAX_STREAM_CLOSED_RETRIES})`);
+  }
+
+  private emitPreparedStreamClosedContinuation(sessionId: string | undefined): void {
+    if (!sessionId || !this.streamClosedContinuationMessagePending) return;
+    this.emit('teammate:messageWhileIdle', {
+      sessionId,
+      message: this.streamClosedContinuationMessagePending,
+    });
   }
 
   private drainAndFormatPendingTeammateMessages(): { formattedMessage: string; summaries: string; count: number } | null {
@@ -2789,6 +2937,12 @@ export class ClaudeCodeProvider extends BaseAgentProvider {
   private async checkMcpServerStatuses(): Promise<void> {
     const q = this.mcpQuery;
     if (!q) return;
+    if (
+      this.permissions.pendingToolPermissions.size > 0
+      || (this.permissionService?.hasPendingPermissions() ?? false)
+    ) {
+      return;
+    }
 
     try {
       const statuses: McpServerStatusInfo[] = await q.mcpServerStatus();

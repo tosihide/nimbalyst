@@ -610,22 +610,31 @@ export class TrayManager {
     // macOS automatically tints template images white on dark menu bars and
     // dark on light menu bars. This tinting is handled by the OS at the
     // NSStatusBar level and is NOT affected by nativeTheme.themeSource.
-    if (!needsColorDot) {
+    //
+    // Linux never tints template images (setTemplateImage is a no-op there),
+    // so the pure-black template PNG is invisible on dark panels like
+    // Ubuntu's GNOME top bar. Linux falls through to the manual white
+    // rendering below for every state.
+    if (!needsColorDot && process.platform !== 'linux') {
       // Ensure the template flag is set (Electron auto-detects from filename
       // "trayTemplate.png" but be explicit)
       baseIcon.setTemplateImage(true);
       return baseIcon;
     }
 
-    // For attention/error states, we need a colored blue dot overlay.
-    // Template images are monochrome so we must render manually.
+    // For attention/error states (and all states on Linux), we render
+    // manually: template images are monochrome, and the dot overlay needs
+    // color.
     //
     // Work at @2x (32x32 pixels) for retina crispness.
     const scaleFactor = 2.0;
-    const physicalSize = 32; // 16pt * 2
 
-    // Get the raw bitmap at @2x scale (macOS uses BGRA byte order)
+    // Get the raw bitmap at @2x scale (BGRA byte order). If the @2x
+    // representation is missing, toBitmap returns the closest one, so derive
+    // the actual pixel size from the buffer instead of assuming 32.
     const baseBitmap = baseIcon.toBitmap({ scaleFactor });
+    const measuredSize = Math.round(Math.sqrt(baseBitmap.length / 4));
+    const physicalSize = measuredSize > 0 ? measuredSize : 32;
     const canvas = Buffer.from(baseBitmap);
 
     // Always use white (255) foreground for the attention/error icon.
@@ -651,19 +660,21 @@ export class TrayManager {
     }
 
     // Draw blue dot in bottom-right (BGRA byte order)
-    const dotCx = Math.floor(physicalSize * 0.78);
-    const dotCy = Math.floor(physicalSize * 0.78);
-    const dotR = Math.floor(physicalSize * 0.14);
-    for (let y = dotCy - dotR; y <= dotCy + dotR; y++) {
-      for (let x = dotCx - dotR; x <= dotCx + dotR; x++) {
-        if (x < 0 || x >= physicalSize || y < 0 || y >= physicalSize) continue;
-        const dx = x - dotCx, dy = y - dotCy;
-        if (dx * dx + dy * dy <= dotR * dotR) {
-          const offset = (y * physicalSize + x) * 4;
-          canvas[offset] = 246;     // B: #F6
-          canvas[offset + 1] = 130;  // G: #82
-          canvas[offset + 2] = 59;   // R: #3B
-          canvas[offset + 3] = 255;
+    if (needsColorDot) {
+      const dotCx = Math.floor(physicalSize * 0.78);
+      const dotCy = Math.floor(physicalSize * 0.78);
+      const dotR = Math.floor(physicalSize * 0.14);
+      for (let y = dotCy - dotR; y <= dotCy + dotR; y++) {
+        for (let x = dotCx - dotR; x <= dotCx + dotR; x++) {
+          if (x < 0 || x >= physicalSize || y < 0 || y >= physicalSize) continue;
+          const dx = x - dotCx, dy = y - dotCy;
+          if (dx * dx + dy * dy <= dotR * dotR) {
+            const offset = (y * physicalSize + x) * 4;
+            canvas[offset] = 246;     // B: #F6
+            canvas[offset + 1] = 130;  // G: #82
+            canvas[offset + 2] = 59;   // R: #3B
+            canvas[offset + 3] = 255;
+          }
         }
       }
     }
@@ -671,9 +682,13 @@ export class TrayManager {
     const image = nativeImage.createFromBuffer(canvas, {
       width: physicalSize,
       height: physicalSize,
-      scaleFactor,
+      // Linux panels don't apply DIP scaling to tray icons the way macOS
+      // does: hand the shell the full-resolution bitmap as a plain 1x image
+      // and let it scale to panel size.
+      scaleFactor: process.platform === 'linux' ? 1.0 : scaleFactor,
     });
-    // Must NOT be template -- we have colored pixels (blue dot)
+    // Must NOT be template -- we have colored pixels (blue dot) or
+    // pre-whitened pixels (Linux)
     image.setTemplateImage(false);
     return image;
   }

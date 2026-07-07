@@ -20,6 +20,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 - Linux `.deb` installs no longer crash the update check; new versions now show a notify-only toast whose Update Now button opens the download page.
+- The tray icon is now visible on Linux (it was rendered black-on-black on dark panels like Ubuntu's GNOME top bar).
 - Marketplace extension installs no longer hang mid-extraction and fail with "reply was never sent".
 - Settings navigation: the Marketplace item now works in project scope, and the Privileged Capabilities item now works in all scopes.
 - Mockup share links now render full-size in the browser instead of a tiny square.

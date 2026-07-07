@@ -15,9 +15,10 @@ import './index.css';
 import './styles/components.css';
 import posthog from "posthog-js";
 import {PostHogProvider} from "posthog-js/react";
-import {beforePostHogSendWeb} from "../main/services/analytics/analytics-utils.ts";
 import { initMonacoEditor } from './utils/monacoConfig';
 import { store } from '@nimbalyst/runtime/store';
+import { registerLocalAssetUrlConverter } from '@nimbalyst/runtime';
+import { nimAssetUrl } from './utils/assetUrl';
 import { initializeTheme } from './hooks/useTheme';
 import { offscreenEditorRenderer } from './services/OffscreenEditorRenderer';
 import {
@@ -27,6 +28,8 @@ import {
   initNotificationSettings,
   advancedSettingsAtom,
   initAdvancedSettings,
+  gutterCustomizationAtom,
+  initGutterCustomization,
   syncConfigAtom,
   initSyncConfig,
   aiDebugSettingsAtom,
@@ -39,17 +42,7 @@ import {
   initDeveloperFeatureSettings,
   externalEditorSettingsAtom,
   initExternalEditorSettings,
-  debugFlagsAtom,
-  initDebugFlags,
 } from './store/atoms/appSettings';
-import {
-  claudeUsageIndicatorEnabledAtom,
-  initClaudeUsageIndicatorSetting,
-} from './store/atoms/claudeUsageAtoms';
-import {
-  codexUsageIndicatorEnabledAtom,
-  initCodexUsageIndicatorSetting,
-} from './store/atoms/codexUsageAtoms';
 import { initVoiceModeListeners } from './store/listeners/voiceModeListeners';
 import {
   autoCommitEnabledAtom,
@@ -63,8 +56,18 @@ import {
   trackerAutomationAtom,
   initTrackerAutomationSettings,
 } from './store/atoms/trackerAutomationAtoms';
+import {
+  hydrateSettingsAtoms,
+  registerSettingsChangeListener,
+} from './store/atoms/settingAtomFamily';
 
 // console.log('[RENDERER] Imports complete at', new Date().toISOString());
+
+// Issue #146: route runtime local-asset URLs through the `nim-asset://`
+// custom protocol. The main window runs with `webSecurity: true`, which
+// blocks `<img src="file://...">`. Must register before any component
+// renders an image. Runs in both normal and capture mode.
+registerLocalAssetUrlConverter(nimAssetUrl);
 
 // Initialize offscreen editor renderer and set up IPC listeners.
 // This runs in BOTH normal mode and capture mode.
@@ -112,9 +115,30 @@ initializeTheme();
 // Expose offscreen renderer on window for main process access
 (window as any).offscreenEditorRenderer = offscreenEditorRenderer;
 
-// Initialize app settings atoms from main process
-// This loads settings and hydrates the Jotai atoms before React renders
-// MUST be awaited to ensure settings are loaded before components mount
+// Initialize the flat-key settings system (SettingsService).
+// Awaited before React mounts so every consumer of `useSetting(key)` reads
+// the real persisted value on its first render, never a default. The
+// broadcast listener keeps every window in lockstep on subsequent writes.
+// See nimbalyst-local/plans/settings-atomwithstorage-rewrite.md for the
+// design and shared/settings/keys.ts for the registry of keys.
+try {
+  const snapshot = await window.electronAPI.settingsGetAll();
+  hydrateSettingsAtoms(snapshot as any);
+  registerSettingsChangeListener();
+} catch (err) {
+  // Fail loud, fail fast: a missing settings snapshot means components would
+  // render against defaults and any setter would clobber real settings on
+  // disk via the legacy blob paths still in flight. Re-throw so the
+  // ErrorBoundary surfaces the failure.
+  console.error('[renderer] settings:getAll failed at startup; refusing to mount React', err);
+  throw err;
+}
+
+// Initialize legacy app settings atoms from main process.
+// These still drive most settings UI today; the flat-key SettingsService above
+// is the migration target. Domains are being migrated key-by-key (starting
+// with AI providers/keys), so for now we run both pipelines.
+// MUST be awaited to ensure settings are loaded before components mount.
 await Promise.allSettled([
   initVoiceModeSettings().then((settings) => {
     store.set(voiceModeSettingsAtom, settings);
@@ -124,6 +148,9 @@ await Promise.allSettled([
   }),
   initAdvancedSettings().then((settings) => {
     store.set(advancedSettingsAtom, settings);
+  }),
+  initGutterCustomization().then((state) => {
+    store.set(gutterCustomizationAtom, state);
   }),
   initSyncConfig().then((config) => {
     store.set(syncConfigAtom, config);
@@ -143,12 +170,6 @@ await Promise.allSettled([
   initExternalEditorSettings().then((settings) => {
     store.set(externalEditorSettingsAtom, settings);
   }),
-  initClaudeUsageIndicatorSetting().then((enabled) => {
-    store.set(claudeUsageIndicatorEnabledAtom, enabled);
-  }),
-  initCodexUsageIndicatorSetting().then((enabled) => {
-    store.set(codexUsageIndicatorEnabledAtom, enabled);
-  }),
   initAutoCommitSetting().then((enabled) => {
     store.set(autoCommitEnabledAtom, enabled);
   }),
@@ -157,9 +178,6 @@ await Promise.allSettled([
   }),
   initTrackerAutomationSettings().then((settings) => {
     store.set(trackerAutomationAtom, settings);
-  }),
-  initDebugFlags().then((flags) => {
-    store.set(debugFlagsAtom, flags);
   }),
 ]);
 
@@ -208,7 +226,7 @@ const posthogClient = posthog.init(
         posthog.people.set_once({ is_dev_user: true });
       }
     },
-    before_send: beforePostHogSendWeb,
+    before_send: (event) => process.env.PLAYWRIGHT_TEST ? null : event,
     debug: isDevInstallation
   }
 )

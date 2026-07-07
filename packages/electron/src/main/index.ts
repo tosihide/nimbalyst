@@ -20,6 +20,7 @@ import { registerFileHandlers } from './ipc/FileHandlers';
 import { registerWorkspaceHandlers } from './ipc/WorkspaceHandlers.ts';
 import { registerSettingsHandlers } from './ipc/SettingsHandlers';
 import { registerWindowHandlers } from './ipc/WindowHandlers';
+import { registerEditorStateHandlers } from './ipc/EditorStateHandlers';
 import { registerHistoryHandlers } from './ipc/HistoryHandlers';
 import { registerSessionHandlers } from './ipc/SessionHandlers';
 import { registerSessionStateHandlers, shutdownSessionStateHandlers, hasActiveStreamingSessions } from './ipc/SessionStateHandlers';
@@ -28,15 +29,19 @@ import { registerThemeHandlers } from './ipc/ThemeHandlers';
 import { registerWorkspaceWatcherHandlers } from './file/WorkspaceWatcher';
 import { setupSessionFileHandlers } from './ipc/SessionFileHandlers';
 import { registerSlashCommandHandlers } from './ipc/SlashCommandHandlers';
+import { registerActionPromptHandlers } from './ipc/ActionPromptHandlers';
 import { registerClaudeCodeHandlers } from './ipc/ClaudeCodeHandlers';
+import { registerCodexAuthHandlers } from './ipc/CodexAuthHandlers';
 import { initializeClaudeCodeSessionHandlers } from './ipc/ClaudeCodeSessionHandlers';
 import { registerNotificationHandlers } from './ipc/NotificationHandlers';
 import { registerPermissionHandlers } from './ipc/PermissionHandlers';
 import { registerGitStatusHandlers } from './ipc/GitStatusHandlers';
 import { registerGitHandlers } from './ipc/GitHandlers';
 import { registerProjectSelectionHandlers } from './ipc/ProjectSelectionHandlers';
+import { registerMultiProjectRailHandlers } from './ipc/MultiProjectRailHandlers';
 import { registerUsageAnalyticsHandlers } from './ipc/UsageAnalyticsHandlers';
 import { registerWorktreeHandlers } from './ipc/WorktreeHandlers';
+import { registerPullRequestHandlers, stopPullRequestPollScheduler } from './ipc/PullRequestHandlers';
 import { registerWakeupHandlers } from './ipc/WakeupHandlers';
 import { registerBlitzHandlers } from './ipc/BlitzHandlers';
 import { registerProjectMigrationHandlers } from './ipc/ProjectMigrationHandlers';
@@ -64,6 +69,9 @@ import {
     updateWorkspaceState,
     runMigrations,
     getAppSetting,
+    getClaudeCodeSettings,
+    isSettingsAgentToolsDisabled,
+    isTrackersAgentToolsEnabled,
     store
 } from './utils/store';
 import { getAIProviderOverridesWithWorktreeFallback } from './utils/aiSettingsMerge';
@@ -71,15 +79,47 @@ import { registerMCPConfigHandlers } from './ipc/MCPConfigHandlers';
 import { getOpenCodeConfigService, registerOpenCodeConfigHandlers } from './ipc/OpenCodeConfigHandlers';
 import { registerClaudeCodePluginHandlers } from './ipc/ClaudeCodePluginHandlers';
 import { registerExportHandlers } from './ipc/ExportHandlers';
+import { registerSemanticSearchHandlers } from './ipc/SemanticSearchHandlers';
+import { SemanticCatalogService } from './services/SemanticCatalogService';
 import { registerShareHandlers } from './ipc/ShareHandlers';
 import { MCPConfigService } from './services/MCPConfigService';
+import { setMcpConfigServiceGetter } from './mcpConfigServiceRef';
+import { ClaudeCliLauncherConfig } from './services/ai/claudeCliLauncherSingleton';
 import { registerDatabaseBrowserHandlers } from './ipc/DatabaseBrowserHandlers';
+import { registerDatabaseBrowserSqliteHandlers } from './ipc/DatabaseBrowserSqliteHandlers';
+import { registerMigrationHandlers } from './ipc/MigrationHandlers';
 import { registerTerminalHandlers, shutdownTerminalHandlers } from './ipc/TerminalHandlers';
 import { AIService } from './services/ai/AIService';
 import { detectFileWorkspace, suggestWorkspaceForFile, getAdditionalDirectoriesForWorkspace } from './utils/workspaceDetection';
 import { cliManager, initEnhancedPath, getEnhancedPath, getShellEnvironment } from './services/CLIManager';
-import { registerWorkspaceWindow, registerExtensionTools, shutdownHttpServer, startMcpHttpServer, updateDocumentState } from './mcp/httpServer';
-import { startSessionContextServer, cleanupSessionContextServer, shutdownSessionContextServer } from './mcp/sessionContextServer';
+import { registerWorkspaceWindow, registerExtensionTools, shutdownHttpServer, startMcpHttpServer, updateDocumentState, getActiveExtensionShortNames } from './mcp/httpServer';
+import { writeMcpEndpointDescriptor, removeMcpEndpointDescriptor, type EndpointWorkspace } from './mcp/mcpEndpointDescriptor';
+import {
+  startWorkspaceBackendModules,
+  syncEnabledBackendModulesOnStartup,
+  getDefaultBackendModuleLifecycleDeps,
+} from './extensions/backendModuleLifecycle';
+// MCP consolidation Phase 7: sessionContextServer / settingsServer no longer run
+// as standalone HTTP servers; their tool dispatch + schemas are imported by the
+// unified httpServer instead. Nothing to start/shutdown from here.
+import { generateMcpAuthToken, getMcpAuthToken } from './mcp/mcpAuth';
+import {
+  registerNimAssetSchemeAsPrivileged,
+  registerNimAssetProtocolHandler,
+  addNimAssetRoot,
+  removeNimAssetRoot,
+} from './protocols/nimAssetProtocol';
+import {
+  registerNimPreviewSchemeAsPrivileged,
+  registerNimPreviewProtocolHandler,
+  addNimPreviewWorkspaceRoot,
+} from './protocols/nimPreviewProtocol';
+import { registerBrowserSessionHandlers } from './ipc/BrowserSessionHandlers';
+import { BrowserSessionService } from './services/BrowserSessionService';
+import {
+  registerCollabAssetSchemeAsPrivileged,
+  installCollabAssetProtocolHandler,
+} from './protocols/collabAssetProtocol';
 import { SessionNamingService } from './services/SessionNamingService';
 import { SessionWakeupScheduler } from './services/SessionWakeupScheduler';
 import { getSessionWakeupsStore } from './services/RepositoryManager';
@@ -96,10 +136,20 @@ import { registerClaudeUsageHandlers } from './ipc/ClaudeUsageHandlers';
 import { claudeUsageService } from './services/ClaudeUsageService';
 import { registerCodexUsageHandlers } from './ipc/CodexUsageHandlers';
 import { codexUsageService } from './services/CodexUsageService';
+import { registerGeminiUsageHandlers } from './ipc/GeminiUsageHandlers';
+import { geminiUsageService } from './services/GeminiUsageService';
+import { codexAuthService } from './services/CodexAuthService';
 import { registerExtensionHandlers, getClaudePluginPaths, initializeExtensionFileTypes } from './ipc/ExtensionHandlers';
+import { registerExtensionPermissionHandlers } from './ipc/ExtensionPermissionHandlers';
+import { registerTrackerImporterHandlers } from './ipc/TrackerImporterHandlers';
+import { installExtensionAgentBridge } from './extensions/extensionAgentBridge';
+import { getAgentWorkflowService } from './services/AgentWorkflowService';
 import { queueMarketplaceInstallRequest, registerExtensionMarketplaceHandlers, runExtensionAutoUpdate } from './ipc/ExtensionMarketplaceHandlers';
 import { getRegisteredExtensions } from './extensions/RegisteredFileTypes';
 import { ClaudeCodeProvider, OpenAICodexProvider, OpenAICodexACPProvider, OpenCodeProvider, CopilotCLIProvider } from '@nimbalyst/runtime/ai/server';
+import { configureMcpServers } from '@nimbalyst/runtime/ai/server';
+import { matchesAllowPattern } from '@nimbalyst/runtime/ai/server/permissions/toolPermissionHelpers';
+import { resolveCodexPreEditHookScriptPath } from './services/ai/codexPreEditHookPath';
 import { sessionFileTracker } from './services/SessionFileTracker';
 import { historyManager } from './HistoryManager';
 import { readFileContentOrNull } from './services/ai/aiServiceUtils';
@@ -120,16 +170,22 @@ import { AnalyticsService } from "./services/analytics/AnalyticsService.ts";
 import { registerAnalyticsHandlers } from "./ipc/AnalyticsHandlers.ts";
 import { registerFeatureUsageHandlers } from "./ipc/FeatureUsageHandlers.ts";
 import { FeatureUsageService, FEATURES } from "./services/FeatureUsageService.ts";
-import { shutdownStytchAuth, handleAuthCallback } from './services/StytchAuthService';
+import { shutdownStytchAuth, handleAuthCallback, isAuthenticated } from './services/StytchAuthService';
 import { registerTrackerSyncHandlers, initializeTrackerSync } from './services/TrackerSyncManager';
 import { initTrackerSchemaService, updateTrackerSchemaWorkspace } from './services/TrackerSchemaService';
-import { registerTeamHandlers, autoMatchTeamForWorkspace } from './services/TeamService';
-import { registerOrgKeyHandlers } from './services/OrgKeyService';
+import { registerTeamHandlers, autoMatchTeamForWorkspace, getOrgScopedJwt, findTeamForWorkspace } from './services/TeamService';
+import { windowStates, windows, resolveActiveWorkspacePath } from './window/windowState';
+import { getRecentItems } from './utils/store';
+import { registerOrgKeyHandlers, getOrgKey } from './services/OrgKeyService';
 import { registerDocumentSyncHandlers } from './ipc/DocumentSyncHandlers';
+import { registerBuiltinCollabContentAdapters } from './services/collabContentAdapterRegistration';
+import { registerCollabV3TestHandlers } from './ipc/CollabV3TestHandlers';
 import { getPermissionService } from './services/PermissionService';
 import { ClaudeSettingsManager } from './services/ClaudeSettingsManager';
 import { TrayManager } from './tray/TrayManager';
 import { pathToFileURL } from 'url';
+import { registerLinuxAppImageProtocolHandler } from './services/LinuxProtocolRegistration';
+import { installWindowOpenGuard } from './window/windowOpenGuard';
 
 // CRITICAL: Hide dock icon when running as background Node process
 // This prevents Terminal icon from appearing when Claude Code spawns child processes
@@ -145,6 +201,19 @@ if (process.env.ELECTRON_RUN_AS_NODE === '1' && process.platform === 'darwin') {
 if (process.platform === 'win32') {
   app.setAppUserModelId('com.nimbalyst.electron');
 }
+
+// Issue #146: register the `nim-asset://` scheme as standard/secure BEFORE
+// `app.whenReady` resolves. Per Electron docs, schemes must be marked as
+// privileged before the app is ready or the renderer treats them as opaque
+// origins. The actual request handler is wired up after whenReady.
+registerNimAssetSchemeAsPrivileged();
+registerNimPreviewSchemeAsPrivileged();
+registerCollabAssetSchemeAsPrivileged();
+
+// NIM-1487: no window may be spawned by an unhandled window.open — relative
+// file links that slip past the renderer's link routing used to open blank
+// white child windows.
+installWindowOpenGuard();
 
 // NOTE: User data directory configuration is handled in bootstrap.ts
 // which runs BEFORE this file is imported, ensuring electron-store
@@ -173,6 +242,15 @@ let isAppRestarting = false;
 /** Check if the app is in a restart flow (session state already saved) */
 export function isRestarting(): boolean {
     return isAppRestarting;
+}
+
+/**
+ * Mark the app as restarting. Set by code paths that have already persisted
+ * session state and don't want window-close handlers to clobber it as
+ * windows tear down (e.g. auto-update quit-and-install, MCP restart).
+ */
+export function setRestarting(value: boolean): void {
+    isAppRestarting = value;
 }
 
 // Track app start time for memory monitoring
@@ -301,12 +379,12 @@ let mcpHttpServer: any = null;
 let mcpConfigService: MCPConfigService | null = null;
 let mcpConfigServiceCleanedUp = false;
 
-/**
- * Get the MCP config service instance (for use by other modules)
- */
-export function getMcpConfigService(): MCPConfigService | null {
-    return mcpConfigService;
-}
+// Publish a closure over the local variable so other modules can read the
+// live MCPConfigService without back-importing this entry-point file (which
+// would drag the whole app graph in at module load). See mcpConfigServiceRef.
+setMcpConfigServiceGetter(() => mcpConfigService);
+
+export { getMcpConfigService } from './mcpConfigServiceRef';
 
 // Set custom userData path if RUN_ONE_DEV_MODE environment variable is set
 // This allows running a dev instance alongside a production build without conflicts
@@ -458,6 +536,8 @@ if (process.defaultApp) {
     app.setAsDefaultProtocolClient('nimbalyst');
 }
 
+registerLinuxAppImageProtocolHandler();
+
 // Single-instance lock
 // Ensures only one instance runs at a time. When a second instance launches
 // (e.g., from a file double-click), it forwards its context to the primary instance.
@@ -487,6 +567,10 @@ if (!allowMultipleInstances) {
         if (fileArg) {
             logger.main.info(`[SingleInstance] Found file in argv: ${fileArg}`);
             try { writeFileSync(pendingOpenFilePath, fileArg, 'utf-8'); } catch (_) {}
+            app.quit();
+        } else if (process.argv.find(arg => arg.startsWith('nimbalyst://'))) {
+            // Primary instance will handle via second-instance event; quit immediately
+            logger.main.info('[SingleInstance] Second instance has deep link arg, quitting immediately');
             app.quit();
         } else {
             // No file in argv -- wait for open-file Apple Event
@@ -521,7 +605,7 @@ if (!allowMultipleInstances) {
             // On Windows the protocol URL is passed as the last argument
             const deepLinkUrl = argv.find(arg => arg.startsWith('nimbalyst://'));
             if (deepLinkUrl) {
-                logger.main.info(`[SingleInstance] Found deep link in argv: ${deepLinkUrl}`);
+                logger.main.info('[SingleInstance] Found deep link in argv:', summarizeDeepLink(deepLinkUrl));
                 handleDeepLink(deepLinkUrl);
             }
 
@@ -602,10 +686,64 @@ if (!allowMultipleInstances) {
 // Track pending deep link URL
 let pendingDeepLinkUrl: string | null = null;
 
+// Per-workspace queue of shared-document deep links waiting for the renderer
+// to be ready (e.g., a window we just created for the project). Drained via
+// the `deep-link:consume-pending-shared-doc` IPC during listener init.
+const pendingSharedDocLinks = new Map<string, { documentId: string; orgId: string }>();
+
+safeHandle('deep-link:consume-pending-shared-doc', (_event, workspacePath: string) => {
+    if (!workspacePath) return null;
+    const pending = pendingSharedDocLinks.get(workspacePath);
+    if (!pending) return null;
+    pendingSharedDocLinks.delete(workspacePath);
+    return { ...pending, workspacePath };
+});
+
+// Same pattern for tracker deep links: nimbalyst://tracker/{trackerId}?orgId=...
+const pendingTrackerLinks = new Map<string, { trackerId: string; orgId: string }>();
+
+safeHandle('deep-link:consume-pending-tracker', (_event, workspacePath: string) => {
+    if (!workspacePath) return null;
+    const pending = pendingTrackerLinks.get(workspacePath);
+    if (!pending) return null;
+    pendingTrackerLinks.delete(workspacePath);
+    return { ...pending, workspacePath };
+});
+
+// Sensitive query params that must not be logged verbatim. Anything not in
+// this set is logged as-is so worker-supplied error codes/messages are visible.
+const SENSITIVE_DEEP_LINK_PARAMS = new Set([
+    'session_token',
+    'session_jwt',
+    'token',
+    'stytch_token',
+    'oauth_state',
+    'state',
+]);
+
+/**
+ * Summarize a deep-link URL for logging. Keeps host/pathname intact, replaces
+ * any sensitive param value with `[redacted:N]` (length only), and passes
+ * everything else through. Worker error codes (`error`, `error_description`,
+ * `stytch_error_type`) end up logged verbatim so a failed sign-in is diagnosable.
+ */
+function summarizeDeepLink(url: string): { host: string; pathname: string; params: Record<string, string> } | { rawUrl: string; parseError: string } {
+    try {
+        const parsed = new URL(url);
+        const params: Record<string, string> = {};
+        for (const [key, value] of parsed.searchParams.entries()) {
+            params[key] = SENSITIVE_DEEP_LINK_PARAMS.has(key) ? `[redacted:${value.length}]` : value;
+        }
+        return { host: parsed.host, pathname: parsed.pathname, params };
+    } catch (err) {
+        return { rawUrl: url, parseError: String(err) };
+    }
+}
+
 // Handle deep link URLs (nimbalyst://...)
 app.on('open-url', (event, url) => {
     event.preventDefault();
-    logger.main.info(`open-url event received: ${url}`);
+    logger.main.info('[DeepLink] open-url event:', summarizeDeepLink(url));
 
     if (app.isReady()) {
         handleDeepLink(url);
@@ -627,6 +765,24 @@ async function handleDeepLink(url: string): Promise<void> {
             const userId = parsed.searchParams.get('user_id');
             const email = parsed.searchParams.get('email');
             const expiresAt = parsed.searchParams.get('expires_at');
+
+            // Surface any worker-supplied error indicators before checking for
+            // session_token. The collabv3 worker may redirect back with
+            // `?error=...&error_description=...` instead of a session, and
+            // until now we silently fell into the "missing session_token"
+            // branch with no clue why.
+            const errorCode = parsed.searchParams.get('error');
+            const errorDescription = parsed.searchParams.get('error_description');
+            const stytchErrorType = parsed.searchParams.get('stytch_error_type');
+            if (errorCode || errorDescription || stytchErrorType) {
+                logger.main.error('[DeepLink] Auth callback returned error from server:', {
+                    error: errorCode,
+                    errorDescription,
+                    stytchErrorType,
+                    allParams: summarizeDeepLink(url),
+                });
+                return;
+            }
 
             if (sessionToken) {
                 const orgId = parsed.searchParams.get('org_id');
@@ -664,7 +820,9 @@ async function handleDeepLink(url: string): Promise<void> {
                     logger.main.error('[DeepLink] Failed to reinitialize sync after auth:', syncError);
                 }
             } else {
-                logger.main.error('[DeepLink] Auth callback missing session_token');
+                // No session_token and no recognized error param -- log everything
+                // we got so the worker's actual response shape is visible.
+                logger.main.error('[DeepLink] Auth callback missing session_token; full params:', summarizeDeepLink(url));
             }
         } else if (parsed.host === 'install' || parsed.pathname?.startsWith('/install/')) {
             // Handle extension install: nimbalyst://install/com.nimbalyst.excalidraw
@@ -678,12 +836,245 @@ async function handleDeepLink(url: string): Promise<void> {
             } else {
                 logger.main.warn('[DeepLink] Extension install missing extension ID');
             }
+        } else if (parsed.host === 'doc' || parsed.pathname?.startsWith('/doc/')) {
+            // Handle shared document link: nimbalyst://doc/{documentId}?orgId={orgId}
+            const encoded = parsed.host === 'doc'
+                ? parsed.pathname?.replace(/^\//, '')
+                : parsed.pathname?.replace('/doc/', '');
+            let documentId: string | undefined;
+            try {
+                documentId = encoded ? decodeURIComponent(encoded) : undefined;
+            } catch {
+                logger.main.warn('[DeepLink] Shared doc link has malformed documentId:', summarizeDeepLink(url));
+                return;
+            }
+            const orgId = parsed.searchParams.get('orgId');
+
+            if (!documentId || !orgId) {
+                logger.main.warn('[DeepLink] Shared doc link missing documentId or orgId:', summarizeDeepLink(url));
+                return;
+            }
+
+            await openSharedDocumentFromDeepLink(documentId, orgId);
+        } else if (parsed.host === 'tracker' || parsed.pathname?.startsWith('/tracker/')) {
+            // Handle tracker link: nimbalyst://tracker/{trackerId}?orgId={orgId}
+            const encoded = parsed.host === 'tracker'
+                ? parsed.pathname?.replace(/^\//, '')
+                : parsed.pathname?.replace('/tracker/', '');
+            let trackerId: string | undefined;
+            try {
+                trackerId = encoded ? decodeURIComponent(encoded) : undefined;
+            } catch {
+                logger.main.warn('[DeepLink] Tracker link has malformed trackerId:', summarizeDeepLink(url));
+                return;
+            }
+            const orgId = parsed.searchParams.get('orgId');
+
+            if (!trackerId || !orgId) {
+                logger.main.warn('[DeepLink] Tracker link missing trackerId or orgId:', summarizeDeepLink(url));
+                return;
+            }
+
+            await openTrackerFromDeepLink(trackerId, orgId);
         } else {
-            logger.main.warn(`[DeepLink] Unknown deep link: ${url}`);
+            logger.main.warn('[DeepLink] Unknown deep link:', summarizeDeepLink(url));
         }
     } catch (error) {
         logger.main.error('[DeepLink] Failed to handle deep link:', error);
     }
+}
+
+/**
+ * Snapshot the workspaces currently open across all windows, for the `nim` CLI
+ * endpoint descriptor. Best-effort and de-duplicated; falls back to recent
+ * workspaces if no windows are open yet.
+ */
+/**
+ * Workspaces we've already kicked backend-module startup for, so the per-document
+ * `mcp:updateDocumentState` events don't re-scan extension dirs on every update.
+ */
+const backendModulesStartedForWorkspace = new Set<string>();
+
+/**
+ * Start the backend modules of every enabled extension across the workspaces of
+ * all currently-open windows, derived from `windowStates` (main-side, NOT the
+ * renderer). The per-workspace `mcp:updateDocumentState` hook only fires once
+ * the renderer pushes document state — which is driven by MCP/agent usage — so a
+ * freshly-restarted app with an enabled engine would otherwise not start it
+ * until something touched that window's MCP surface. This sweep (run shortly
+ * after startup and on window focus) makes enabled engines come up promptly.
+ * Idempotent: workspaces already swept are skipped, and `startModule` itself is
+ * idempotent.
+ */
+async function sweepOpenWindowsForBackendModules(): Promise<boolean> {
+    const seen = new Set<string>();
+    const workspaces: string[] = [];
+    for (const state of windowStates.values()) {
+        const candidates = [
+            resolveActiveWorkspacePath(state),
+            state?.workspacePath,
+            ...(state?.additionalWorkspacePaths ?? []),
+        ];
+        for (const p of candidates) {
+            if (p && !seen.has(p)) {
+                seen.add(p);
+                workspaces.push(p);
+            }
+        }
+    }
+    const fresh = workspaces.filter((p) => !backendModulesStartedForWorkspace.has(p));
+    if (fresh.length === 0) return false;
+    for (const p of fresh) backendModulesStartedForWorkspace.add(p);
+    const deps = { ...getDefaultBackendModuleLifecycleDeps(), collectWorkspaces: () => fresh };
+    await syncEnabledBackendModulesOnStartup(deps);
+    return true;
+}
+
+function collectOpenWorkspaces(): EndpointWorkspace[] {
+    const seen = new Set<string>();
+    const out: EndpointWorkspace[] = [];
+    try {
+        for (const state of windowStates.values()) {
+            const paths = new Set<string>();
+            const active = resolveActiveWorkspacePath(state);
+            if (active) paths.add(active);
+            if (state?.workspacePath) paths.add(state.workspacePath);
+            for (const p of state?.additionalWorkspacePaths ?? []) paths.add(p);
+            for (const p of paths) {
+                if (!p || seen.has(p)) continue;
+                seen.add(p);
+                out.push({ path: p, name: path.basename(p) });
+            }
+        }
+        if (out.length === 0) {
+            for (const item of getRecentItems('workspaces')) {
+                if (!item?.path || seen.has(item.path)) continue;
+                seen.add(item.path);
+                out.push({ path: item.path, name: (item as any).name ?? path.basename(item.path) });
+            }
+        }
+    } catch {
+        /* best-effort */
+    }
+    return out;
+}
+
+/**
+ * Find a workspace path whose team matches the given orgId. Looks first
+ * across all open windows (active + rail-warm), then falls back to the
+ * user's recent workspaces. Returns null if no known workspace matches.
+ */
+async function findWorkspaceForOrgId(orgId: string): Promise<string | null> {
+    const seen = new Set<string>();
+
+    // Open windows first — both active and rail-warm paths.
+    for (const state of windowStates.values()) {
+        const paths = new Set<string>();
+        const active = resolveActiveWorkspacePath(state);
+        if (active) paths.add(active);
+        if (state?.workspacePath) paths.add(state.workspacePath);
+        for (const p of state?.additionalWorkspacePaths ?? []) paths.add(p);
+
+        for (const workspacePath of paths) {
+            if (seen.has(workspacePath)) continue;
+            seen.add(workspacePath);
+            const team = await findTeamForWorkspace(workspacePath);
+            if (team?.orgId === orgId) return workspacePath;
+        }
+    }
+
+    // Fall back to recent workspaces the user has opened before.
+    const recent = getRecentItems('workspaces');
+    for (const item of recent) {
+        if (seen.has(item.path)) continue;
+        seen.add(item.path);
+        const team = await findTeamForWorkspace(item.path);
+        if (team?.orgId === orgId) return item.path;
+    }
+
+    return null;
+}
+
+/**
+ * Route a shared-document deep link to the renderer holding the matching
+ * team workspace. Queues the payload in `pendingSharedDocLinks` so a freshly
+ * created window's renderer can drain it on listener init.
+ */
+async function openSharedDocumentFromDeepLink(documentId: string, orgId: string): Promise<void> {
+    const reason = !isAuthenticated() ? 'not-authenticated' : 'no-workspace';
+    const workspacePath = isAuthenticated() ? await findWorkspaceForOrgId(orgId) : null;
+
+    if (!workspacePath) {
+        logger.main.warn('[DeepLink] Cannot route shared doc:', { reason, orgId, documentId });
+        const fallback = getMostRecentlyFocusedWorkspaceWindow();
+        if (fallback) {
+            if (fallback.isMinimized()) fallback.restore();
+            fallback.focus();
+            fallback.webContents.send('deep-link:shared-document-not-available', { documentId, orgId, reason });
+        }
+        return;
+    }
+
+    // Queue first; the renderer drains by workspacePath on listener init.
+    // For an already-loaded window we also fire the live event below; the
+    // renderer treats it as idempotent against the pending queue.
+    pendingSharedDocLinks.set(workspacePath, { documentId, orgId });
+
+    const existing = findWindowByWorkspace(workspacePath);
+    if (existing && !existing.isDestroyed()) {
+        if (existing.isMinimized()) existing.restore();
+        existing.focus();
+        existing.webContents.send('deep-link:open-shared-document', {
+            documentId,
+            orgId,
+            workspacePath,
+        });
+        logger.main.info('[DeepLink] Routed shared doc to existing window:', { workspacePath, documentId });
+        return;
+    }
+
+    // No window has this workspace open — create one. The renderer's
+    // deep-link listener will drain the pending queue once it mounts.
+    logger.main.info('[DeepLink] Opening new window for shared doc workspace:', { workspacePath, documentId });
+    createWindow(false, true, workspacePath);
+}
+
+/**
+ * Route a tracker deep link to the matching team workspace. Mirrors the
+ * shared-document flow, but targets tracker mode + tracker-item selection.
+ */
+async function openTrackerFromDeepLink(trackerId: string, orgId: string): Promise<void> {
+    const reason = !isAuthenticated() ? 'not-authenticated' : 'no-workspace';
+    const workspacePath = isAuthenticated() ? await findWorkspaceForOrgId(orgId) : null;
+
+    if (!workspacePath) {
+        logger.main.warn('[DeepLink] Cannot route tracker:', { reason, orgId, trackerId });
+        const fallback = getMostRecentlyFocusedWorkspaceWindow();
+        if (fallback) {
+            if (fallback.isMinimized()) fallback.restore();
+            fallback.focus();
+            fallback.webContents.send('deep-link:tracker-not-available', { trackerId, orgId, reason });
+        }
+        return;
+    }
+
+    pendingTrackerLinks.set(workspacePath, { trackerId, orgId });
+
+    const existing = findWindowByWorkspace(workspacePath);
+    if (existing && !existing.isDestroyed()) {
+        if (existing.isMinimized()) existing.restore();
+        existing.focus();
+        existing.webContents.send('deep-link:open-tracker', {
+            trackerId,
+            orgId,
+            workspacePath,
+        });
+        logger.main.info('[DeepLink] Routed tracker to existing window:', { workspacePath, trackerId });
+        return;
+    }
+
+    logger.main.info('[DeepLink] Opening new window for tracker workspace:', { workspacePath, trackerId });
+    createWindow(false, true, workspacePath);
 }
 
 // Handle file open from OS (macOS)
@@ -724,6 +1115,7 @@ async function openFileWithWorkspaceDetection(filePath: string): Promise<void> {
         } else {
             // Create new workspace window for this workspace
             workspaceWindow = createWindow(false, true, workspacePath);
+            updateTrackerSchemaWorkspace(workspacePath);
             workspaceWindow.once('ready-to-show', async () => {
                 workspaceWindow!.show();
                 // Window state is already set by createWindow with workspace path
@@ -745,6 +1137,7 @@ async function openFileWithWorkspaceDetection(filePath: string): Promise<void> {
                 logger.main.info(`Opening suggested workspace: ${suggestedWorkspace}`);
                 addToRecentItems('workspaces', suggestedWorkspace, path.basename(suggestedWorkspace));
                 const newWindow = createWindow(false, true, suggestedWorkspace);
+                updateTrackerSchemaWorkspace(suggestedWorkspace);
                 newWindow.once('ready-to-show', async () => {
                     newWindow.show();
                     await loadFileIntoWindow(newWindow, filePath);
@@ -755,6 +1148,7 @@ async function openFileWithWorkspaceDetection(filePath: string): Promise<void> {
                 logger.main.info(`Using file directory as workspace: ${fileDir}`);
                 addToRecentItems('workspaces', fileDir, path.basename(fileDir));
                 const newWindow = createWindow(false, true, fileDir);
+                updateTrackerSchemaWorkspace(fileDir);
                 newWindow.once('ready-to-show', async () => {
                     newWindow.show();
                     await loadFileIntoWindow(newWindow, filePath);
@@ -783,6 +1177,9 @@ function parseCommandLineArgs() {
         } else if (arg === '--filter' && i + 1 < args.length) {
             pendingFilter = args[i + 1];
             logger.main.info(`✓ Filter from CLI: ${pendingFilter}`);
+        } else if (arg.startsWith('nimbalyst://')) {
+            pendingDeepLinkUrl = arg;
+            logger.main.info(`[SingleInstance] Found deep link in argv: ${arg.substring(0, 60)}...`);
         } else if (!arg.startsWith('--') && !arg.startsWith('-')) {
             // Handle plain file path argument (e.g., "preditor file.md")
             const argExists = existsSync(arg);
@@ -868,6 +1265,36 @@ app.whenReady().then(async () => {
     if (spellcheckEnabled === false) {
         session.defaultSession.setSpellCheckerEnabled(false);
     }
+
+    // Issue #146: wire up the `nim-asset://` request handler. Workspaces are
+    // added to its allowlist below, as windows register their workspace path.
+    registerNimAssetProtocolHandler();
+
+    // `nim-preview://` serves HTML/CSS/JS assets from active workspaces to the
+    // BrowserSessionService's WebContentsView. Workspaces are added to the
+    // allowlist alongside nim-asset below.
+    registerNimPreviewProtocolHandler();
+
+    // Browser session IPC handlers + state-changed event broadcast. The
+    // service itself owns the WebContentsView pool.
+    registerBrowserSessionHandlers();
+
+    // collab-asset:// E2E-encrypted document attachment handler.
+    // Same-origins the production worker request from Chromium's perspective,
+    // so we can keep webSecurity:true. The per-doc registry is populated by
+    // document-sync:open / torn down by document-sync:close-doc.
+    installCollabAssetProtocolHandler({
+        getOrgKey,
+        getOrgScopedJwt,
+        getCollabHttpUrl: () => {
+            const config = getSessionSyncConfig();
+            const isDev = process.env.NODE_ENV !== 'production';
+            const env = isDev ? config?.environment : undefined;
+            return env === 'development'
+                ? 'http://localhost:8790'
+                : 'https://sync.nimbalyst.com';
+        },
+    });
 
     // Show splash screen immediately so the user sees something while we initialize
     // Skip splash in Playwright tests - the splash window would be returned by firstWindow()
@@ -1051,6 +1478,7 @@ app.whenReady().then(async () => {
     registerWorkspaceWatcherHandlers();
     registerSettingsHandlers();
     registerWindowHandlers();
+    registerEditorStateHandlers();
     await registerHistoryHandlers();
     await registerSessionHandlers();
     await registerSessionStateHandlers();
@@ -1058,10 +1486,13 @@ app.whenReady().then(async () => {
     setupWorkspaceManagerHandlers();
     setupSessionFileHandlers();
     registerSlashCommandHandlers();
+    registerActionPromptHandlers();
     await registerUsageAnalyticsHandlers();
     registerAttachmentHandlers();
     registerProjectSelectionHandlers();
+    registerMultiProjectRailHandlers();
     registerClaudeCodeHandlers();
+    registerCodexAuthHandlers();
     initializeClaudeCodeSessionHandlers();  // Initialize Claude Code session import
     registerAnalyticsHandlers();
     registerFeatureUsageHandlers();
@@ -1070,10 +1501,13 @@ app.whenReady().then(async () => {
     claudeUsageService.initialize();
     registerCodexUsageHandlers();
     codexUsageService.initialize();
+    registerGeminiUsageHandlers();
+    geminiUsageService.initialize();
     registerPermissionHandlers();
     registerGitStatusHandlers();
     registerGitHandlers();
     registerWorktreeHandlers();
+    registerPullRequestHandlers();
     registerWakeupHandlers();
     registerBlitzHandlers();
     registerProjectMigrationHandlers();
@@ -1081,11 +1515,26 @@ app.whenReady().then(async () => {
     registerMCPConfigHandlers();
     registerOpenCodeConfigHandlers();
     registerClaudeCodePluginHandlers();
-    registerDatabaseBrowserHandlers();
+    const activeSqlite = database.getActiveSQLiteDatabase();
+    if (database.getEngine() === 'sqlite' && activeSqlite) {
+        const userDataPath = process.env.NIMBALYST_USER_DATA_PATH || app.getPath('userData');
+        registerDatabaseBrowserSqliteHandlers({
+            sqlite: activeSqlite,
+            backupService: database.getBackupService() as any,
+            sqliteFilePath: join(userDataPath, 'sqlite-db', 'nimbalyst.sqlite'),
+        });
+    } else {
+        registerDatabaseBrowserHandlers();
+    }
+    registerMigrationHandlers();
     registerTerminalHandlers();
     registerExportHandlers();
     registerShareHandlers();
     registerTrackerSyncHandlers();
+    registerSemanticSearchHandlers();
+    // Reactively catalog trackers into the memory engine (when enabled) and
+    // serve Quick Open semantic search.
+    SemanticCatalogService.getInstance().start();
     initTrackerSchemaService(); // Register IPC handlers + load built-in schemas
 
     // Initialize commit-tracker linking (listens to GitRefWatcher for all commits)
@@ -1094,7 +1543,9 @@ app.whenReady().then(async () => {
 
     registerTeamHandlers();
     registerOrgKeyHandlers();
+    registerBuiltinCollabContentAdapters();
     registerDocumentSyncHandlers();
+    registerCollabV3TestHandlers();
     markEnd('ipc-handlers');
 
     // Initialize system tray for session status visibility
@@ -1217,10 +1668,38 @@ app.whenReady().then(async () => {
         return enabledServers;
     });
 
+    // Claude CLI (subscription) launcher shares the Claude Agent MCP filter —
+    // the genuine CLI hits the identical MCP handlers as the SDK path (NIM-806).
+    ClaudeCliLauncherConfig.setMcpConfigLoader(async (workspacePath?: string) => {
+        if (!mcpConfigService) {
+            throw new Error('MCP config service not initialized');
+        }
+        const mergedConfig = await mcpConfigService.getMergedConfig(workspacePath);
+        const allServers = mergedConfig.mcpServers || {};
+
+        const enabledServers: Record<string, any> = {};
+        for (const [name, config] of Object.entries(allServers)) {
+            if (isMCPServerEnabledForProvider(config as MCPServerConfig, MCP_PROVIDER_IDS.CLAUDE_AGENT)) {
+                const isAuthorized = await mcpConfigService.isOAuthAuthorized(config as MCPServerConfig);
+                if (!isAuthorized) {
+                    logger.mcp.info(`[MCP] Skipping unauthorized OAuth server for Claude CLI: ${name}`);
+                    continue;
+                }
+                enabledServers[name] = mcpConfigService.processServerConfigForRuntime(config as any);
+            }
+        }
+        return enabledServers;
+    });
+
     // Inject extension plugins loader into ClaudeCodeProvider
     // This allows extensions to provide Claude SDK plugins with custom commands/agents
     // Uses main-process-native implementation that reads extension manifests directly
-    ClaudeCodeProvider.setExtensionPluginsLoader(getClaudePluginPaths);
+    ClaudeCodeProvider.setExtensionPluginsLoader(async (workspacePath?: string) => {
+        if (!workspacePath) {
+            return getClaudePluginPaths(workspacePath);
+        }
+        return getAgentWorkflowService(workspacePath).getClaudeProviderPluginPaths();
+    });
 
     // ScheduleWakeup handler: the CLI emits ScheduleWakeup tool calls but its tool_result is
     // informational only. Re-queue the prompt at fire time via SessionWakeupScheduler.
@@ -1256,7 +1735,6 @@ app.whenReady().then(async () => {
     // Inject Claude Code settings loader
     // This allows user/project commands to be enabled/disabled via settings
     ClaudeCodeProvider.setClaudeCodeSettingsLoader(async () => {
-        const { getClaudeCodeSettings } = await import('./utils/store');
         return getClaudeCodeSettings();
     });
 
@@ -1359,9 +1837,63 @@ app.whenReady().then(async () => {
       });
     }
 
-    // Inject additional directories loader
-    // This allows Claude to access SDK docs when working on extension projects
+    // Inject additional directories loader. Adds the parent project root and
+    // sibling worktrees so agents can read shared configs, traverse the .git
+    // common dir from a worktree, and (for Codex) escape its workspace-write
+    // sandbox when an orchestrator session needs to edit sibling worktrees.
+    // Issue #37 problem 1.
     ClaudeCodeProvider.setAdditionalDirectoriesLoader(getAdditionalDirectoriesForWorkspace);
+    OpenAICodexProvider.setAdditionalDirectoriesLoader(getAdditionalDirectoriesForWorkspace);
+
+    // Wire the Codex PreToolUse hook (LEGACY -- only consulted by the SDK
+    // transport, which is no longer the default). The hook script ships
+    // under packages/electron/resources/ and is invoked synchronously by
+    // Codex before every apply_patch, snapshotting each affected path's
+    // pre-edit content to a per-session sidecar dir under userData. The
+    // provider reads from the sidecar at item.started time, bypassing the
+    // race where Codex emits item.started after the patch is already on
+    // disk. The new app-server transport recovers pre-edit content from the
+    // diff text in item/completed and does not need this hook.
+    OpenAICodexProvider.setPreEditHookScriptPathResolver(resolveCodexPreEditHookScriptPath);
+    OpenAICodexProvider.setPreEditSidecarDirResolver((sessionId: string) => {
+      if (!sessionId) return undefined;
+      const safeId = sessionId.replace(/[^A-Za-z0-9_-]/g, '_');
+      return join(app.getPath('userData'), 'codex-pre-edit-snapshots', safeId);
+    });
+
+    // Codex transport selection. Default to 'app-server' for new sessions
+    // unless the user has explicitly opted into the legacy 'sdk' transport
+    // via the `openaiCodex.transport` app setting (the documented escape
+    // hatch). Captured at provider-construct time per session so a settings
+    // change takes effect on the next codex session without an app restart.
+    OpenAICodexProvider.setCodexTransportResolver(() => {
+      const setting = getAppSetting<{ transport?: 'sdk' | 'app-server' }>('openaiCodex')?.transport;
+      return setting === 'sdk' ? 'sdk' : 'app-server';
+    });
+
+    // Pre-flight auth gate for the codex app-server transport. Reuses the
+    // long-lived codexAuthService child (no extra spawn per turn). Returning a
+    // permissive `{ requiresOpenaiAuth: false }` on failure means the provider
+    // falls through to its normal createSession path -- the child will surface
+    // any real auth issue mid-stream as before, so we never block a turn on a
+    // gate that itself broke.
+    //
+    // We force `refreshToken: true` so codex re-reads ~/.codex/auth.json (and
+    // refreshes the OAuth token if expired) before answering. Without this the
+    // long-lived child can stay cached on a "not signed in" view it loaded
+    // before the user completed the browser flow. We treat `account === null`
+    // as the only valid "not signed in" signal -- `requiresOpenaiAuth` can be
+    // true on signed-in-but-no-codex-access plans, which is a different state
+    // and should surface as a 401 mid-turn, not as a sign-in prompt.
+    OpenAICodexProvider.setCodexAuthGate(async () => {
+      try {
+        const status = await codexAuthService.getStatus(true);
+        return { requiresOpenaiAuth: status.account === null };
+      } catch (err) {
+        console.warn('[CODEX] codexAuthService.getStatus() failed in auth gate:', err);
+        return { requiresOpenaiAuth: false };
+      }
+    });
 
     // Wire shared permission infrastructure for all agent providers.
     // Both Claude Code and OpenAI Codex use the same pattern storage,
@@ -1372,9 +1904,19 @@ app.whenReady().then(async () => {
     const patternSaver = async (workspacePath: string, pattern: string) => {
       await claudeSettingsManager.addAllowedTool(workspacePath, pattern);
     };
+    // Claude Code allow patterns are prefix-wildcards, not exact strings:
+    // `Bash(git:*)` covers `Bash(git status:*)`, `WebFetch` covers any
+    // `WebFetch(domain:...)`, and `mcp__server` covers every tool under
+    // that server. The old `.includes(pattern)` check only ever matched
+    // exact strings, so a user with broad allows in `~/.claude/settings.json`
+    // still saw a permission dialog for every distinct subcommand. The
+    // wildcard-aware `matchesAllowPattern` brings Nimbalyst's pre-screen
+    // in line with Claude Code's own pattern semantics. Fixes #152.
     const patternChecker = async (workspacePath: string, pattern: string) => {
       const effectiveSettings = await claudeSettingsManager.getEffectiveSettings(workspacePath);
-      return effectiveSettings.permissions.allow.includes(pattern);
+      return effectiveSettings.permissions.allow.some((allow) =>
+        matchesAllowPattern(pattern, allow),
+      );
     };
     // NOTE: For worktree sessions, AIService pre-resolves the worktree path to the parent
     // project (worktreeProjectPath) and passes it via documentContext.permissionsPath.
@@ -1382,7 +1924,11 @@ app.whenReady().then(async () => {
     // checker receives the parent project path, not the worktree path.
     const trustChecker = (workspacePath: string) => {
       const mode = permissionService.getPermissionMode(workspacePath);
-      return { trusted: mode !== null, mode };
+      return {
+        trusted: mode !== null,
+        mode,
+        allowAllUsesClassifier: permissionService.getAllowAllUsesClassifier(workspacePath),
+      };
     };
 
     if (process.env.NODE_ENV === 'development') {
@@ -1484,8 +2030,32 @@ app.whenReady().then(async () => {
     registerMockupHandlers();
     registerDataModelHandlers();
     registerExtensionHandlers();
+    registerExtensionPermissionHandlers();
+    registerTrackerImporterHandlers();
     registerExtensionMarketplaceHandlers();
     registerOffscreenEditorHandlers();
+
+    // Phase 4: install the extension-agent bridge so the runtime-side
+    // `ExtensionAgentProvider` wrapper can route to PrivilegedExtensionHost.
+    // Workspace resolution prefers the focused window's active workspace;
+    // falls back to any window with one open. Returns null if no window has
+    // a workspace path -- the bridge surfaces this as a `no-workspace` error.
+    installExtensionAgentBridge({
+      resolveActiveWorkspacePath: () => {
+        const { BrowserWindow } = require('electron') as typeof import('electron');
+        const focused = BrowserWindow.getFocusedWindow();
+        if (focused) {
+          const state = windowStates.get(focused.id);
+          const path = resolveActiveWorkspacePath(state);
+          if (path) return path;
+        }
+        for (const state of windowStates.values()) {
+          const path = resolveActiveWorkspacePath(state);
+          if (path) return path;
+        }
+        return null;
+      },
+    });
 
     // Initialize extension file types (must happen before file operations)
     markStart('extension-file-types');
@@ -1499,6 +2069,28 @@ app.whenReady().then(async () => {
     }
     aiService = new AIService(runtimeSessionStore);
     markEnd('ai-service-init');
+
+    // Recovery sweep: any queued_prompts row that was 'executing' when the
+    // app shut down is now invisible to listPending. sweepExecutingOnBoot
+    // distinguishes "delivered, but the agent was paused on a user prompt
+    // (AskUserQuestion / ExitPlanMode / permission request) at quit" from
+    // "crashed before the user message was ever sent" by checking whether
+    // an ai_agent_messages input row exists for the session at or after
+    // claimed_at. Delivered rows are marked completed; undelivered rows
+    // are rolled back to pending for retry. Without this split, a session
+    // paused on AskUserQuestion at quit gets its original user prompt
+    // re-sent on next launch (NIM-615).
+    try {
+      const { getQueuedPromptsStore } = await import('./services/RepositoryManager');
+      const { completed, rolledBack } = await getQueuedPromptsStore().sweepExecutingOnBoot();
+      if (completed > 0 || rolledBack > 0) {
+        logger.main.info(
+          `[Main] Boot sweep: ${completed} delivered prompt(s) marked completed, ${rolledBack} undelivered prompt(s) rolled back to pending`
+        );
+      }
+    } catch (sweepErr) {
+      logger.main.error('[Main] Boot sweep failed:', sweepErr);
+    }
 
     // Check for pending restart continuations and queue continuation prompts
     await checkForRestartContinuation(aiService);
@@ -1517,6 +2109,29 @@ app.whenReady().then(async () => {
 
     // Start MCP SSE server
     markStart('mcp-servers');
+
+    // Generate the per-launch bearer token before any MCP server starts.
+    // The same token is shared across all five internal MCP servers (they all
+    // run in this process). It is held in memory only -- never persisted.
+    // Issue #146: required so a malicious page in the user's browser can't
+    // invoke MCP tools against the localhost ports.
+    const mcpAuthToken = generateMcpAuthToken();
+    configureMcpServers({ mcpAuthToken });
+
+    // Test-only IPC handler: lets E2E tests verify the bearer token is
+    // enforced by the MCP servers. Mirrors the pattern used for
+    // `meta-agent:get-server-port`.
+    if (process.env.PLAYWRIGHT === '1' || process.env.PLAYWRIGHT_TEST === 'true' || process.env.NODE_ENV === 'test') {
+        safeHandle('mcp:get-server-port', async () => {
+            const port = (global as any).mcpServerPort;
+            return { success: typeof port === 'number', port: typeof port === 'number' ? port : null };
+        });
+        safeHandle('mcp:get-auth-token', async () => {
+            const token = getMcpAuthToken();
+            return { success: token !== null, token };
+        });
+    }
+
     try {
         const result = await startMcpHttpServer(3456);
         mcpHttpServer = result.httpServer;
@@ -1525,48 +2140,99 @@ app.whenReady().then(async () => {
         // Store the actual port for providers to use
         (global as any).mcpServerPort = result.port;
 
-        // Inject the port into ClaudeCodeProvider so it can configure the MCP server
-        ClaudeCodeProvider.setMcpServerPort(result.port);
-        OpenAICodexProvider.setMcpServerPort(result.port);
-        OpenAICodexACPProvider.setMcpServerPort(result.port);
-        OpenCodeProvider.setMcpServerPort(result.port);
-        CopilotCLIProvider.setMcpServerPort(result.port);
+        // MCP consolidation: all internal MCP-server enablement (port, per-ext
+        // servers, tracker opt-out) goes through the shared registry once —
+        // every provider + the CLI launcher read it via getMcpConfigService.
+        //
+        // Per-extension servers (Phase 3): each active extension gets its own
+        // deferred `nimbalyst-<ext>` server; read fresh per session-start so
+        // newly-loaded extensions get a server without an app restart.
+        //
+        // Tracker opt-out (Phase 4): read `trackers.enabled` from workspace state
+        // per config build so the Trackers settings toggle takes effect on the
+        // next session start without a restart. Returns "disabled" (true => omit
+        // `nimbalyst-trackers`); default on.
+        configureMcpServers({
+            mcpServerPort: result.port,
+            extensionMcpServerNamesLoader: (workspacePath?: string) =>
+                getActiveExtensionShortNames(workspacePath),
+            trackersAgentToolsDisabledLoader: (workspacePath?: string) =>
+                workspacePath ? !isTrackersAgentToolsEnabled(workspacePath) : false,
+        });
+
+        // Publish the loopback endpoint + per-launch token so the `nim`
+        // companion CLI can discover and talk to this running instance (live
+        // mode). The file is 0600 and removed on quit; the CLI checks pid
+        // liveness before trusting it. See mcpEndpointDescriptor.ts.
+        try {
+            writeMcpEndpointDescriptor({
+                port: result.port,
+                token: mcpAuthToken,
+                workspaces: collectOpenWorkspaces(),
+            });
+        } catch (descriptorError) {
+            logger.mcp.error('Failed to publish MCP endpoint descriptor:', descriptorError);
+        }
+
+        // Backend modules: sweep open windows after startup so enabled extension
+        // engines (e.g. project-memory) come up without waiting for an agent to
+        // touch the window's MCP surface (which is what drives the renderer
+        // mcp:updateDocumentState the per-workspace hook relies on). `windowStates`
+        // populates as windows finish restoring — AFTER this point — so retry on a
+        // short interval until a sweep finds open workspaces, then stop (later
+        // opens are covered by the focus listener + per-workspace hook). Capped so
+        // a windowless run doesn't poll forever. All paths are idempotent.
+        let backendSweepAttempts = 0;
+        const backendSweepTimer = setInterval(() => {
+            backendSweepAttempts += 1;
+            void sweepOpenWindowsForBackendModules()
+                .then((sweptAny) => {
+                    if (sweptAny || backendSweepAttempts >= 20) {
+                        clearInterval(backendSweepTimer);
+                    }
+                })
+                .catch((err) => {
+                    logger.mcp.error('Startup backend-module sweep failed:', err);
+                    if (backendSweepAttempts >= 20) clearInterval(backendSweepTimer);
+                });
+        }, 3000);
+        app.on('browser-window-focus', () => {
+            void sweepOpenWindowsForBackendModules().catch((err) =>
+                logger.mcp.error('Focus backend-module sweep failed:', err)
+            );
+        });
     } catch (error) {
             logger.mcp.error('Failed to start MCP SSE server:', error);
     }
 
-    // Start session naming MCP server
+    // Session metadata fns injection (MCP consolidation Phase 7: no standalone
+    // HTTP server — `update_session_meta` is served by the unified `/mcp/core`).
+    // The service still injects the title/metadata/query fns that dispatch uses.
     try {
         const sessionNamingService = SessionNamingService.getInstance();
         await sessionNamingService.start();
-        // logger.mcp.info('Session naming MCP server started');
     } catch (error) {
-        logger.mcp.error('Failed to start session naming MCP server:', error);
+        logger.mcp.error('Failed to start session naming service:', error);
     }
 
-    // Start extension dev MCP server (for Extension Developer Kit)
+    // Start extension dev MCP server (for Extension Developer Kit). Still its own
+    // standalone HTTP server (profile-gated); registers its port via the shared
+    // MCP config registry.
     try {
         const extensionDevService = ExtensionDevService.getInstance();
         await extensionDevService.start();
-        // logger.mcp.info('Extension dev MCP server started');
     } catch (error) {
         logger.mcp.error('Failed to start extension dev MCP server:', error);
     }
 
-    // Super Loop progress MCP server disabled - was leaking into non-super-loop sessions
-    // TODO: Re-enable with proper gating so it only appears in super loop sessions
-
-    // Start session context MCP server (session summary, workstream overview, recent sessions)
-    try {
-        const result = await startSessionContextServer();
-        ClaudeCodeProvider.setSessionContextServerPort(result.port);
-        OpenAICodexProvider.setSessionContextServerPort(result.port);
-        OpenAICodexACPProvider.setSessionContextServerPort(result.port);
-        OpenCodeProvider.setSessionContextServerPort(result.port);
-        CopilotCLIProvider.setSessionContextServerPort(result.port);
-    } catch (error) {
-        logger.mcp.error('Failed to start session context MCP server:', error);
-    }
+    // MCP consolidation Phase 7: session-context + settings tools fold onto the
+    // unified server (`/mcp/host`); no standalone HTTP servers. The settings
+    // kill-switch (read fresh from the store per config build, so flipping
+    // `settingsAgentToolsDisabled` in Settings > Advanced takes effect on the
+    // next session start) is the only thing still wired here.
+    configureMcpServers({
+        settingsAgentToolsDisabledLoader: () => isSettingsAgentToolsDisabled(),
+    });
 
     try {
         const metaAgentService = MetaAgentService.getInstance();
@@ -1585,7 +2251,7 @@ app.whenReady().then(async () => {
                 if (!aiSvcRef) {
                     return { triggered: false };
                 }
-                await aiSvcRef.queuePromptForSession(sessionId, prompt);
+                await aiSvcRef.queuePromptForSession(sessionId, prompt, undefined, { promptOrigin: 'wakeup_resume' });
                 const triggered = await aiSvcRef.triggerQueuedPromptProcessingForSession(
                     sessionId,
                     workspacePath,
@@ -1620,6 +2286,26 @@ app.whenReady().then(async () => {
         if (state?.workspacePath && windowId) {
             // logger.mcp.info(`Registering workspace ${state.workspacePath} -> window ${windowId}`);
             registerWorkspaceWindow(state.workspacePath, windowId);
+
+            // First time we see this workspace, start the backend modules of any
+            // enabled extension in it. This is the reliable "workspace is open in
+            // a window" signal (the renderer reports document state after init),
+            // so it doubles as the startup path for already-enabled extensions
+            // and the open-path for newly-opened workspaces. startModule is
+            // idempotent, so the guard is only an efficiency measure.
+            if (!backendModulesStartedForWorkspace.has(state.workspacePath)) {
+                backendModulesStartedForWorkspace.add(state.workspacePath);
+                const ws = state.workspacePath;
+                void startWorkspaceBackendModules(ws, getDefaultBackendModuleLifecycleDeps()).catch(
+                    (err) => logger.mcp.error(`Backend-module start failed for workspace ${ws}:`, err)
+                );
+            }
+            // Issue #146: also allow `nim-asset://` to serve images from the
+            // workspace. addNimAssetRoot is idempotent.
+            addNimAssetRoot(state.workspacePath);
+            // Browser previews serve HTML/CSS/JS from the same workspace via
+            // the `nim-preview://` scheme.
+            addNimPreviewWorkspaceRoot(state.workspacePath);
         } else {
             logger.mcp.warn(`Cannot register workspace: workspacePath=${state?.workspacePath}, windowId=${windowId}`);
         }
@@ -1639,6 +2325,7 @@ app.whenReady().then(async () => {
     // Set up IPC handler for theme changes from renderer
     safeOn('set-theme', (event, theme: AppTheme, isDark?: boolean) => {
         setTheme(theme, isDark);
+        FeatureUsageService.getInstance().recordUsage(FEATURES.THEME_CHANGED);
         // User explicitly applied a theme — clear any pending fallback banner
         clearPendingThemeFallback();
         updateNativeTheme();
@@ -1677,25 +2364,8 @@ app.whenReady().then(async () => {
     const sessionRestored = shouldSkipSessionRestore ? false : await restoreSessionState();
     markEnd('session-restore');
 
-    // Set up a loader that reads customClaudeCodePath fresh from the store on each query,
-    // so changes in the UI take effect without restarting the app. The workspace path is
-    // required: getAIProviderOverridesWithWorktreeFallback handles direct overrides plus
-    // worktree-to-parent inheritance. Only fall through to the global setting when no
-    // project-level override exists at all (which is the intended fallback, not a routing
-    // failure). A missing workspacePath here would mean an upstream wiring bug, so throw.
-    ClaudeCodeProvider.setCustomClaudeCodePathLoader((workspacePath: string) => {
-      if (!workspacePath) {
-        throw new Error('[ClaudeCodeProvider] customClaudeCodePathLoader called without a workspacePath');
-      }
-
-      const projectOverride = getAIProviderOverridesWithWorktreeFallback(workspacePath)?.customClaudeCodePath;
-      if (projectOverride !== undefined) {
-        return projectOverride;
-      }
-
-      return (store.get('customClaudeCodePath', '') as string) || '';
-    });
-    logger.main.info('[ClaudeCodeProvider] Initialized customClaudeCodePath loader (workspace-aware)');
+    // Note: customClaudeCodePathLoader is now set up in AIService constructor,
+    // where it has direct access to the ai-settings store that owns this value.
 
     // Close splash screen now that initialization is done and a real window is about to show.
     // The last restored window activates the app via its own ready-to-show handler.
@@ -1896,8 +2566,10 @@ app.whenReady().then(async () => {
 
     // Save session periodically (every 30 seconds)
     sessionSaveInterval = setInterval(async () => {
-        // Only save if app is not quitting
-        if (!isAppQuitting) {
+        // Only save if app is not quitting or restarting. During a restart the
+        // good state is saved once in `before-quit`; a periodic save firing
+        // afterward (over an emptied windows map) would clobber it (NIM-869).
+        if (!isAppQuitting && !isRestarting()) {
             await saveSessionState();
         }
     }, 30000);
@@ -1991,6 +2663,16 @@ app.on('before-quit', async (event) => {
         console.log('[QUIT] Restart signal detected, saving session state before restart');
         // Mark as restarting BEFORE saving to prevent window close handlers from overwriting
         isAppRestarting = true;
+        // Stop the periodic session-save timer and mark quitting so NO further
+        // save can fire after windows tear down. Without this the periodic save
+        // (guarded only by !isAppQuitting) could run over an emptied windows map
+        // and overwrite the good state with `{ windows: [] }` -- the restart
+        // would then come back to the Workspace Manager with no projects (NIM-869).
+        isAppQuitting = true;
+        if (sessionSaveInterval) {
+            clearInterval(sessionSaveInterval);
+            sessionSaveInterval = null;
+        }
         // Save session state so the session is restored after restart
         try {
             await saveSessionState();
@@ -2021,26 +2703,25 @@ app.on('before-quit', async (event) => {
             cancelId: 1
         });
 
-        if (response.response === 0) {
-            // User clicked "Quit Anyway" - proceed with quit
-            console.log('[QUIT] User confirmed quit with active AI session');
-            analytics.sendEvent('quit_confirmation_result', {
-                result: 'quit_anyway'
-            });
-            // Set isAppQuitting before calling app.quit() to prevent re-showing dialog
-            isAppQuitting = true;
-            app.quit();
-        } else {
-            // User cancelled
+        if (response.response !== 0) {
+            // User cancelled - stay running.
             console.log('[QUIT] User cancelled quit due to active AI session');
             analytics.sendEvent('quit_confirmation_result', {
                 result: 'cancelled'
             });
             return;
         }
-        // If user confirmed quit, app.quit() was called above and before-quit will fire again
-        // with isAppQuitting=true, so we return here to avoid duplicate cleanup
-        return;
+
+        // User clicked "Quit Anyway". Fall through to the graceful cleanup block
+        // below (event.preventDefault was already called above) so the database
+        // is checkpointed, closed, and its lock released. The old code called
+        // app.quit() and returned here, which skipped cleanup on BOTH passes (the
+        // second before-quit short-circuits on isAppQuitting), leaking
+        // nimbalyst-db.pid and forcing the next launch onto stale-lock detection.
+        console.log('[QUIT] User confirmed quit with active AI session');
+        analytics.sendEvent('quit_confirmation_result', {
+            result: 'quit_anyway'
+        });
     }
 
     // Prevent default to do async cleanup
@@ -2050,9 +2731,13 @@ app.on('before-quit', async (event) => {
     isAppQuitting = true;
 
     // Setup force quit timer - allow enough time for database backup + close
-    // Database operations: backup (up to 5s) + close worker (up to 2s) + buffer (3s)
+    // Database operations: backup (up to 5s) + close worker (up to 5s) + buffer (5s/3s)
+    // The close budget is 5s instead of 2s because PGLite runs Postgres in --single
+    // mode (no background checkpointer), so close() now issues an explicit CHECKPOINT
+    // first; on a large WAL that can take several seconds. Force-quit total bumped
+    // accordingly so the new close budget isn't preempted.
     // This is CRITICAL for Windows where forced shutdowns need proper cleanup time
-    const forceQuitDelay = app.isPackaged ? 12000 : 10000;
+    const forceQuitDelay = app.isPackaged ? 15000 : 13000;
     setupForceQuit(forceQuitDelay);
 
     let debugLog: string | null = null;
@@ -2105,6 +2790,13 @@ app.on('before-quit', async (event) => {
             memoryMonitorInterval = null;
         }
 
+        // Stop the PR review polling scheduler (issue #307, Phase D).
+        try {
+            stopPullRequestPollScheduler();
+        } catch (e) {
+            console.error('[QUIT] Failed to stop PR poll scheduler:', e);
+        }
+
         // CRITICAL: Stop performance monitoring - this has an interval that keeps the process alive!
         stopPerformanceMonitoring();
 
@@ -2140,6 +2832,14 @@ app.on('before-quit', async (event) => {
         const t3 = Date.now();
         console.log(`[QUIT] [${t3}] stopAllWorkspaceWatchers returned (${t3-t2}ms)`);
 
+        // Tear down any in-flight browser preview sessions so we don't leak
+        // WebContentsViews if the host windows are torn down asynchronously.
+        try {
+            BrowserSessionService.getInstance().cleanup();
+        } catch (e) {
+            console.warn('[QUIT] BrowserSessionService cleanup error:', e);
+        }
+
         if (canWriteLogs && debugLog) {
             try {
                 fs.appendFileSync(debugLog, '[QUIT] File watchers cleaned up\n');
@@ -2170,6 +2870,13 @@ app.on('before-quit', async (event) => {
         // Shutdown terminal sessions
         await shutdownTerminalHandlers();
         console.log(`[QUIT] Terminal sessions shutdown`);
+
+        // Tear down the codex auth app-server child if it was lazily started.
+        try {
+            codexAuthService.shutdown();
+        } catch (e) {
+            console.warn('[QUIT] codexAuthService shutdown failed:', e);
+        }
     } catch (error) {
         console.error('[QUIT] Error shutting down session state manager:', error);
         if (canWriteLogs && debugLog) {
@@ -2221,6 +2928,12 @@ app.on('before-quit', async (event) => {
         console.log(`[QUIT] [${t7}] MCP HTTP server shutdown complete (${t7-t6}ms)`);
 
         mcpHttpServer = null;
+
+        // Remove the nim CLI endpoint descriptor so a stale token/port can't be
+        // discovered after this instance exits.
+        try {
+            removeMcpEndpointDescriptor();
+        } catch (e) {}
 
         // Clean up MCP config service file watchers
         if (mcpConfigService && !mcpConfigServiceCleanedUp) {
@@ -2306,32 +3019,17 @@ app.on('before-quit', async (event) => {
 
     // Super Loop progress MCP server shutdown skipped (server disabled)
 
-    try {
-        // Shutdown session context MCP server
-        const shutdownPromise = shutdownSessionContextServer();
-        const timeoutPromise = new Promise((resolve) => setTimeout(resolve, 500));
-        await Promise.race([shutdownPromise, timeoutPromise]);
-        ClaudeCodeProvider.setSessionContextServerPort(null);
-        OpenAICodexProvider.setSessionContextServerPort(null);
-        OpenAICodexACPProvider.setSessionContextServerPort(null);
-        OpenCodeProvider.setSessionContextServerPort(null);
-        CopilotCLIProvider.setSessionContextServerPort(null);
-        console.log('[QUIT] Session context MCP server shutdown complete');
-    } catch (error) {
-        console.error('[QUIT] Error closing session context MCP server:', error);
-    }
-
+    // MCP consolidation Phase 7: session-context / settings / meta-agent tools
+    // are served by the unified server; no standalone HTTP servers to tear down.
+    // The meta-agent service shutdown still detaches its state listener.
     try {
         const metaAgentService = MetaAgentService.getInstance();
         const shutdownPromise = metaAgentService.shutdown();
         const timeoutPromise = new Promise((resolve) => setTimeout(resolve, 500));
         await Promise.race([shutdownPromise, timeoutPromise]);
-        ClaudeCodeProvider.setMetaAgentServerPort(null);
-        OpenAICodexProvider.setMetaAgentServerPort(null);
-        OpenAICodexACPProvider.setMetaAgentServerPort(null);
-        console.log('[QUIT] Meta-agent MCP server shutdown complete');
+        console.log('[QUIT] Meta-agent service shutdown complete');
     } catch (error) {
-        console.error('[QUIT] Error closing meta-agent MCP server:', error);
+        console.error('[QUIT] Error shutting down meta-agent service:', error);
     }
 
     try {
@@ -2392,8 +3090,14 @@ app.on('before-quit', async (event) => {
         }
 
         // Import database and create backup (with timeout)
-        const { getDatabase } = await import('./database/initialize');
+        const { getDatabase, stopPeriodicBackupTimer } = await import('./database/initialize');
         const db = getDatabase();
+
+        // Stop the 4h periodic backup timer before doing anything else.
+        // If it fires after we close the DB, better-sqlite3's setImmediate-
+        // driven backup step throws "database connection is not open" from
+        // inside an async chain we no longer await.
+        stopPeriodicBackupTimer();
 
         if (db) {
             const backupPromise = db.createBackup();
@@ -2417,7 +3121,7 @@ app.on('before-quit', async (event) => {
             const backupService = db.getBackupService();
             if (backupService) {
                 try {
-                    await backupService.cleanupOldCorruptedBackups();
+                    await backupService.cleanupOldCorruptedBackups?.();
                     console.log('[QUIT] Old corrupted backups cleaned up');
                     if (canWriteLogs && debugLog) {
                         try { fs.appendFileSync(debugLog, '[QUIT] Old backups cleaned up\n'); } catch (e) {}
@@ -2437,7 +3141,10 @@ app.on('before-quit', async (event) => {
 
             try {
                 const closePromise = db.close();
-                const timeoutPromise = new Promise((resolve) => setTimeout(resolve, 2000));
+                // 5s instead of 2s: db.close() now issues an explicit CHECKPOINT first
+                // (PGLite --single mode has no background checkpointer), which can take
+                // several seconds when WAL is large.
+                const timeoutPromise = new Promise((resolve) => setTimeout(resolve, 5000));
                 await Promise.race([closePromise, timeoutPromise]);
                 const t11d = Date.now();
                 console.log(`[QUIT] [${t11d}] Database worker closed (${t11d-t11c}ms)`);

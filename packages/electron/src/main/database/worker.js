@@ -18,6 +18,90 @@
 const { parentPort, workerData } = require('worker_threads');
 const { PGlite } = require('@electric-sql/pglite');
 const path = require('path');
+const inspector = require('node:inspector');
+const { performance } = require('node:perf_hooks');
+const { serializeWorkerError } = require('./workerErrorSerialization');
+
+// ---------------------------------------------------------------------------
+// CPU profile auto-capture for the PGLite worker.
+// Same pattern as the SQLite worker: poll event-loop utilization, capture a
+// 5s CPU profile via inspector.Session when ELU stays >= 0.8, write to the
+// same logs dir as main.log. inspector.Session on main can't see this isolate,
+// so without this we have no signal when PGLite pegs CPU.
+// ---------------------------------------------------------------------------
+const WORKER_PROFILE_TTL_MS = 60_000;
+const WORKER_PROFILE_DURATION_MS = 5_000;
+const WORKER_ELU_THRESHOLD = 0.8;
+const WORKER_ELU_TRIGGER_SAMPLES = 2;
+let pgliteProfileInFlight = false;
+let pgliteLastProfileAt = 0;
+let pgliteHighEluStreak = 0;
+
+async function capturePgliteWorkerCpuProfile(triggerElu) {
+  if (pgliteProfileInFlight) return;
+  const now = Date.now();
+  if (now - pgliteLastProfileAt < WORKER_PROFILE_TTL_MS) return;
+  pgliteProfileInFlight = true;
+  pgliteLastProfileAt = now;
+
+  const session = new inspector.Session();
+  try {
+    session.connect();
+    const post = (method, params) =>
+      new Promise((resolve, reject) => {
+        session.post(method, params, (err, result) => {
+          if (err) reject(err); else resolve(result);
+        });
+      });
+    await post('Profiler.enable');
+    await post('Profiler.start');
+    await new Promise((r) => setTimeout(r, WORKER_PROFILE_DURATION_MS));
+    const { profile } = await post('Profiler.stop');
+
+    const fs = require('fs').promises;
+    const logsDir = path.join(workerData.userDataPath, 'logs');
+    await fs.mkdir(logsDir, { recursive: true });
+    const filename = `cpu-pglite-worker-${new Date().toISOString().replace(/[:.]/g, '-')}.cpuprofile`;
+    const fullPath = path.join(logsDir, filename);
+    await fs.writeFile(fullPath, JSON.stringify(profile));
+    console.log(`[PERF] Captured PGLite worker CPU profile (elu=${triggerElu.toFixed(2)}) -> ${fullPath}`);
+  } catch (err) {
+    console.log('[PERF] PGLite worker CPU profile capture failed:', err);
+  } finally {
+    try { session.disconnect(); } catch { /* already disconnected */ }
+    pgliteProfileInFlight = false;
+  }
+}
+
+function startPgliteWorkerCpuMonitor() {
+  let prev = performance.eventLoopUtilization();
+  const timer = setInterval(() => {
+    const next = performance.eventLoopUtilization();
+    const delta = performance.eventLoopUtilization(next, prev);
+    prev = next;
+    if (delta.utilization >= WORKER_ELU_THRESHOLD) {
+      pgliteHighEluStreak++;
+      if (pgliteHighEluStreak >= WORKER_ELU_TRIGGER_SAMPLES) {
+        pgliteHighEluStreak = 0;
+        capturePgliteWorkerCpuProfile(delta.utilization);
+      }
+    } else {
+      pgliteHighEluStreak = 0;
+    }
+  }, 10_000);
+  if (typeof timer.unref === 'function') timer.unref();
+}
+
+startPgliteWorkerCpuMonitor();
+
+// WAL maintenance: total bytes across pg_wal/ that triggers an idle CHECKPOINT.
+// Why this number: PGLite's runtime settings are min_wal_size=80MB, max_wal_size=1GB
+// (verified via current_setting()). Postgres always keeps at least min_wal_size,
+// so any threshold below 80MB would fire on every check. Picked 200MB so the
+// trigger only fires once WAL has grown well past the floor but still well below
+// the 1GB cap, avoiding the multi-hundred-MB replay cost users were hitting.
+const WAL_CHECKPOINT_THRESHOLD_BYTES = 200 * 1024 * 1024;
+const WAL_CHECK_INTERVAL_MS = 60 * 1000;
 
 class PGLiteWorker {
   constructor() {
@@ -25,8 +109,55 @@ class PGLiteWorker {
     this.dataDir = path.join(workerData.userDataPath, 'pglite-db');
     // Our own lock file with actual PID - separate from PGLite's postmaster.pid
     this.lockFilePath = path.join(workerData.userDataPath, 'nimbalyst-db.pid');
+    // Counter of in-flight query/exec calls; the WAL maintenance check skips
+    // when this is non-zero so a CHECKPOINT can never run during a user query
+    // (--single mode serializes them anyway, but skipping avoids visibly long blocks).
+    this.activeOps = 0;
+    this.walMaintenanceInterval = null;
     console.log('[PGLite Worker] Worker thread instantiated, dataDir:', this.dataDir);
     this.setupMessageHandler();
+  }
+
+  /**
+   * Periodic WAL maintenance. Runs only when no query/exec is in flight.
+   * Reads pg_wal/ size from disk; if it exceeds the threshold, issues CHECKPOINT.
+   */
+  async runWalMaintenance() {
+    if (!this.db) return;
+    if (this.activeOps > 0) return;
+
+    const walDir = path.join(this.dataDir, 'pg_wal');
+    let totalBytes = 0;
+    try {
+      const fs = require('fs');
+      const entries = fs.readdirSync(walDir);
+      for (const name of entries) {
+        try {
+          const stat = fs.statSync(path.join(walDir, name));
+          if (stat.isFile()) totalBytes += stat.size;
+        } catch {
+          // Entry vanished mid-scan; ignore.
+        }
+      }
+    } catch (err) {
+      console.warn('[PGLite Worker] WAL maintenance: could not read pg_wal/:', err?.message || err);
+      return;
+    }
+
+    if (totalBytes < WAL_CHECKPOINT_THRESHOLD_BYTES) return;
+
+    // Re-check activeOps right before issuing CHECKPOINT in case a request landed
+    // between the directory read and now.
+    if (this.activeOps > 0) return;
+
+    try {
+      const ckptStart = performance.now();
+      await this.db.exec('CHECKPOINT');
+      const elapsed = performance.now() - ckptStart;
+      console.log(`[PGLite Worker] WAL maintenance CHECKPOINT (was ${(totalBytes / 1024 / 1024).toFixed(1)}MB) took ${elapsed.toFixed(0)}ms`);
+    } catch (err) {
+      console.warn('[PGLite Worker] WAL maintenance CHECKPOINT failed:', err?.message || err);
+    }
   }
 
   /**
@@ -71,22 +202,60 @@ class PGLiteWorker {
             }
           }
 
-          // Check if the process is still running
-          let isRunning = false;
-          if (!isStaleFromReboot) {
+          // Check if the process is still running. The decision is
+          // extracted to ./lockStaleness.js so it can be unit-tested
+          // without spawning a real worker thread. See nimbalyst#272 for
+          // the Windows-pid-reuse hazard the timestamp gate guards
+          // against, and the closed PR #316 review thread for the
+          // 'ambiguous' branch that asks the user instead of guessing.
+          const { decideLockIsRunning } = require('./lockStaleness');
+          // Identify the PID holder so a reused PID (the original Nimbalyst died
+          // and the OS handed its PID to another process) is detected as stale
+          // instead of falsely "running". Returns the image name or null; null
+          // makes decideLockIsRunning fail closed (stay 'running').
+          const processIdentityFn = (pid) => {
+            if (!Number.isInteger(pid) || pid <= 0) return null;
             try {
-              // process.kill with signal 0 tests if process exists without killing it
-              process.kill(lockPid, 0);
-              isRunning = true;
-            } catch (e) {
-              // ESRCH: No such process (stale lock from crash)
-              // EPERM: Process exists but we can't signal it (still running, different user)
-              isRunning = e.code === 'EPERM';
+              const cp = require('child_process');
+              if (process.platform === 'win32') {
+                const out = cp
+                  .execSync(`tasklist /FI "PID eq ${pid}" /FO CSV /NH`, {
+                    timeout: 4000,
+                    windowsHide: true,
+                  })
+                  .toString();
+                const m = out.match(/^"([^"]+)"/m);
+                return m ? m[1] : null;
+              }
+              const out = cp
+                .execSync(`ps -p ${pid} -o comm=`, { timeout: 4000 })
+                .toString()
+                .trim();
+              return out || null;
+            } catch {
+              return null;
             }
+          };
+          let livenessDecision = 'stale';
+          let livenessReason = '';
+          if (isStaleFromReboot) {
+            livenessDecision = 'stale';
+            livenessReason = 'lock predates last reboot';
+          } else {
+            const result = decideLockIsRunning({
+              lockPid,
+              lockTimestamp,
+              killFn: process.kill.bind(process),
+              processIdentityFn,
+            });
+            livenessDecision = result.decision;
+            livenessReason = result.reason;
+            console.log(`[PGLite Worker] Lock liveness check: ${result.reason}`);
           }
 
-          if (isRunning) {
-            // Another instance is actually running - block!
+          if (livenessDecision === 'running') {
+            // Another instance is confirmed alive (kill(0) succeeded, OR
+            // unrecognised errno). Refuse the launch unconditionally.
             const error = new Error(
               `Database is locked by another Nimbalyst process.\n\n` +
               `Lock holder PID: ${lockPid}\n` +
@@ -98,12 +267,35 @@ class PGLiteWorker {
             error.code = 'DATABASE_LOCKED';
             error.lockPid = lockPid;
             return { acquired: false, error };
-          } else {
-            // Process is dead - stale lock from a crash
-            console.log(`[PGLite Worker] Removing stale lock file from crashed process (PID ${lockPid} no longer running)`);
-            console.log(`[PGLite Worker] Previous lock was acquired at: ${lockTimestamp}`);
-            fs.unlinkSync(this.lockFilePath);
           }
+          if (livenessDecision === 'ambiguous') {
+            // EPERM with a fresh timestamp (<60s old). Either a live
+            // sibling we cannot signal (different user / privilege level)
+            // OR a fast PID reuse on a slow-disk machine where the
+            // original lock was written less than 60s before crash.
+            // Surface a distinct error code so the main process can show
+            // a dialog letting the user choose between "Open Anyway"
+            // (force-unlock) and "Cancel". Per @ghinkle's review on the
+            // closed PR #316.
+            const error = new Error(
+              `Cannot tell whether another Nimbalyst is running.\n\n` +
+              `Lock holder PID: ${lockPid}\n` +
+              `Lock acquired: ${lockTimestamp}\n` +
+              `Lock host: ${lockHostname}\n\n` +
+              `Reason: ${livenessReason}`
+            );
+            error.code = 'DATABASE_LOCKED_AMBIGUOUS';
+            error.lockPid = lockPid;
+            error.lockFilePath = this.lockFilePath;
+            error.lockTimestamp = lockTimestamp;
+            error.lockHostname = lockHostname;
+            return { acquired: false, error };
+          }
+          // livenessDecision === 'stale'. Process is dead, or lock
+          // predates the last reboot, or EPERM with a stale timestamp.
+          console.log(`[PGLite Worker] Removing stale lock file from crashed process (PID ${lockPid} no longer running)`);
+          console.log(`[PGLite Worker] Previous lock was acquired at: ${lockTimestamp}`);
+          fs.unlinkSync(this.lockFilePath);
         }
       }
 
@@ -187,7 +379,8 @@ class PGLiteWorker {
         parentPort.postMessage({
           id: message.id,
           success: false,
-          error: error.message || String(error)
+          error: error.message || String(error),
+          errorData: serializeWorkerError(error)
         });
       }
     });
@@ -199,6 +392,8 @@ class PGLiteWorker {
         return await this.initialize(message);
       case 'query':
         return await this.query(message);
+      case 'queryReadOnly':
+        return await this.queryReadOnly(message);
       case 'exec':
         return await this.exec(message);
       case 'close':
@@ -327,6 +522,36 @@ class PGLiteWorker {
       const schemaStartTime = performance.now();
       await this.createSchemas();
       console.log(`[PGLite Worker] Schema creation took ${(performance.now() - schemaStartTime).toFixed(0)}ms`);
+
+      // Start periodic WAL maintenance. Replaces the missing background checkpointer
+      // that --single mode does not run. Only fires when activeOps === 0.
+      if (this.walMaintenanceInterval) {
+        clearInterval(this.walMaintenanceInterval);
+      }
+      this.walMaintenanceInterval = setInterval(() => {
+        this.runWalMaintenance().catch((err) => {
+          console.warn('[PGLite Worker] WAL maintenance threw:', err?.message || err);
+        });
+      }, WAL_CHECK_INTERVAL_MS);
+      // Don't keep the worker alive for this timer alone.
+      if (typeof this.walMaintenanceInterval.unref === 'function') {
+        this.walMaintenanceInterval.unref();
+      }
+
+      // Force a CHECKPOINT after init.
+      // Why: PGLite runs Postgres in --single mode, so there is no checkpointer/bgwriter
+      // background process. WAL is only recycled by inline triggers, explicit CHECKPOINT,
+      // or smart-shutdown. If the previous run was force-killed (e.g. because of slow
+      // queries blocking shutdown), pg_wal can be huge on next launch and replay slows
+      // every subsequent query down. Issuing CHECKPOINT here flushes that backlog before
+      // the renderer starts hammering the DB. Non-fatal on failure.
+      try {
+        const ckptStart = performance.now();
+        await this.db.exec('CHECKPOINT');
+        console.log(`[PGLite Worker] Startup CHECKPOINT took ${(performance.now() - ckptStart).toFixed(0)}ms`);
+      } catch (ckptError) {
+        console.warn('[PGLite Worker] Startup CHECKPOINT failed (non-fatal):', ckptError?.message || ckptError);
+      }
 
       // Check if we recovered from corruption
       const recovered = initAttempt > 1;
@@ -639,7 +864,8 @@ class PGLiteWorker {
       CREATE INDEX IF NOT EXISTS idx_session_files_workspace ON session_files(workspace_id);
       CREATE INDEX IF NOT EXISTS idx_session_files_workspace_file ON session_files(workspace_id, file_path);
       CREATE INDEX IF NOT EXISTS idx_session_files_unique ON session_files(session_id, file_path, link_type);
-      -- Optimized index for DISTINCT ON (file_path) ... ORDER BY file_path, timestamp DESC queries
+      -- Optimized index for "latest session per file" lookup
+      -- (ROW_NUMBER() OVER PARTITION BY file_path ORDER BY timestamp DESC)
       CREATE INDEX IF NOT EXISTS idx_session_files_uncommitted_lookup ON session_files(workspace_id, link_type, file_path, timestamp DESC);
     `);
 
@@ -729,6 +955,35 @@ class PGLiteWorker {
       throw error;
     }
 
+    // Add searchable_text + message_kind columns (Phase 1A of canonical
+    // transcript deprecation; see nimbalyst-local/plans/canonical-transcript-deprecation.md).
+    // searchable_text carries user-visible plaintext extracted from the raw
+    // payload at insert time. message_kind is the provider-agnostic
+    // categorization ('user' | 'assistant' | 'tool' | 'system' | 'meta').
+    // Both default NULL; a separate backfill pass populates existing rows.
+    try {
+      await this.db.exec(`
+        DO $$
+        BEGIN
+          IF NOT EXISTS (
+            SELECT 1 FROM information_schema.columns
+            WHERE table_name = 'ai_agent_messages' AND column_name = 'searchable_text'
+          ) THEN
+            ALTER TABLE ai_agent_messages ADD COLUMN searchable_text TEXT;
+          END IF;
+          IF NOT EXISTS (
+            SELECT 1 FROM information_schema.columns
+            WHERE table_name = 'ai_agent_messages' AND column_name = 'message_kind'
+          ) THEN
+            ALTER TABLE ai_agent_messages ADD COLUMN message_kind TEXT;
+          END IF;
+        END $$;
+      `);
+    } catch (error) {
+      console.error('[PGLite Worker] Failed to add searchable_text/message_kind columns:', error);
+      throw error;
+    }
+
     // NOTE: We used to drop the old FTS index here unconditionally, but that was wrong
     // because it would drop the index that the user just built via the dialog.
     // The old non-partial index (without WHERE searchable = true) is no longer created,
@@ -766,6 +1021,20 @@ class PGLiteWorker {
     } catch (error) {
       // Non-fatal: searches will still work, just slower without the index
       console.warn('[PGLite Worker] Failed to create FTS GIN index:', error);
+    }
+
+    // Phase 2 of canonical-transcript-deprecation: GIN index over
+    // ai_agent_messages.searchable_text so the raw table can serve FTS
+    // directly. The legacy `content` GIN index above stays in place until
+    // the transcript_events drop in Phase 4; both indexes coexist briefly.
+    try {
+      await this.db.exec(`
+        CREATE INDEX IF NOT EXISTS idx_ai_agent_messages_searchable_text_fts
+        ON ai_agent_messages USING GIN(to_tsvector('english', COALESCE(searchable_text, '')))
+        WHERE searchable_text IS NOT NULL
+      `);
+    } catch (error) {
+      console.warn('[PGLite Worker] Failed to create searchable_text GIN index:', error);
     }
 
     // AI Tool Call <-> File Edit linkage table
@@ -827,6 +1096,10 @@ class PGLiteWorker {
         CREATE INDEX IF NOT EXISTS idx_tracker_created ON tracker_items(created);
         CREATE INDEX IF NOT EXISTS idx_tracker_updated ON tracker_items(updated);
         CREATE INDEX IF NOT EXISTS idx_tracker_data_gin ON tracker_items USING GIN(data);
+        -- External-source importers: accelerate urn -> local item lookups and
+        -- re-import dedup. Mirrors the SQLite expression index in
+        -- schemas/0010_tracker_origin_urn.sql; same JSON path, same lookup query.
+        CREATE INDEX IF NOT EXISTS idx_tracker_origin_urn ON tracker_items ((data->'origin'->'external'->>'urn'));
       `);
       // console.log('[PGLite Worker] tracker_items table created successfully');
     } catch (error) {
@@ -1083,6 +1356,143 @@ class PGLiteWorker {
       // Non-fatal
     }
 
+    // ========================================================================
+    // tracker-sync-redesign D9: metadata-layer schema reshape
+    // ========================================================================
+    //
+    // Drops the v1 field-stamp LWW model (`_fieldUpdatedAt` inside `data`)
+    // and adds the columns the metadata sync layer expects:
+    //   - sync_id BIGINT: server-assigned monotonic version of the most
+    //     recent accepted mutation for this row. Drives delta queries.
+    //   - body_version BIGINT: pointer to the most recent body Y.Doc
+    //     snapshot in DocumentRoom. Bumped on every body write; used to
+    //     invalidate `tracker_body_cache`.
+    //   - deleted_at TIMESTAMPTZ: tombstone marker. Rows with deleted_at
+    //     set are hidden from queries but kept so the engine can replay
+    //     deltas without re-fetching.
+    //
+    // Per the design doc's "delete decisively" guidance, the migration
+    // unconditionally strips `_fieldUpdatedAt` from `data`. Backwards
+    // compatibility for the v1 protocol is intentionally not preserved.
+    try {
+      const trackerSyncIdCheck = await this.db.query(`
+        SELECT
+          EXISTS (
+            SELECT 1 FROM information_schema.columns
+            WHERE table_name = 'tracker_items' AND column_name = 'sync_id'
+          ) as has_sync_id,
+          EXISTS (
+            SELECT 1 FROM information_schema.columns
+            WHERE table_name = 'tracker_items' AND column_name = 'body_version'
+          ) as has_body_version,
+          EXISTS (
+            SELECT 1 FROM information_schema.columns
+            WHERE table_name = 'tracker_items' AND column_name = 'deleted_at'
+          ) as has_deleted_at
+      `);
+      const {
+        has_sync_id: hasSyncIdCol,
+        has_body_version: hasBodyVersionCol,
+        has_deleted_at: hasDeletedAtCol,
+      } = trackerSyncIdCheck.rows[0] || {};
+
+      if (!hasSyncIdCol) {
+        console.log('[PGLite Worker] Adding sync_id to tracker_items (tracker-sync-redesign D9)...');
+        await this.db.exec(`
+          ALTER TABLE tracker_items ADD COLUMN sync_id BIGINT;
+          CREATE INDEX IF NOT EXISTS idx_tracker_workspace_sync_id ON tracker_items(workspace, sync_id);
+        `);
+      }
+      if (!hasBodyVersionCol) {
+        console.log('[PGLite Worker] Adding body_version to tracker_items...');
+        await this.db.exec(`
+          ALTER TABLE tracker_items ADD COLUMN body_version BIGINT NOT NULL DEFAULT 0;
+        `);
+      }
+      if (!hasDeletedAtCol) {
+        console.log('[PGLite Worker] Adding deleted_at to tracker_items...');
+        await this.db.exec(`
+          ALTER TABLE tracker_items ADD COLUMN deleted_at TIMESTAMPTZ;
+          CREATE INDEX IF NOT EXISTS idx_tracker_deleted_at ON tracker_items(deleted_at) WHERE deleted_at IS NOT NULL;
+        `);
+      }
+    } catch (error) {
+      console.error('[PGLite Worker] Failed to add D9 sync columns:', error);
+      throw error;
+    }
+
+    // Strip `_fieldUpdatedAt` from every `data` JSONB. The new architecture
+    // orders writes by server-assigned `sync_id` -- the per-field timestamp
+    // map is dead weight that the old upload path used to forge. Run on
+    // every startup; cheap when there's nothing to strip.
+    try {
+      const staleStampCount = await this.db.query(`
+        SELECT COUNT(*) as cnt FROM tracker_items
+        WHERE data ? '_fieldUpdatedAt'
+      `);
+      if (staleStampCount.rows[0]?.cnt > 0) {
+        console.log(
+          '[PGLite Worker] Stripping _fieldUpdatedAt from',
+          staleStampCount.rows[0].cnt,
+          'tracker_items rows (D9 cleanup)...',
+        );
+        await this.db.exec(`
+          UPDATE tracker_items SET data = data - '_fieldUpdatedAt'
+          WHERE data ? '_fieldUpdatedAt';
+        `);
+      }
+    } catch (error) {
+      console.error('[PGLite Worker] Failed to strip _fieldUpdatedAt:', error);
+      // Non-fatal; the new client engine ignores the key.
+    }
+
+    // Body cache for cold reads (full-text search, no-roundtrip detail open).
+    // Populated by phase 4 (Body Y.Doc cache). Phase 1 just provisions the
+    // schema so the projection target exists before any code reaches for it.
+    console.log('[PGLite Worker] Creating tracker_body_cache table...');
+    try {
+      await this.db.exec(`
+        CREATE TABLE IF NOT EXISTS tracker_body_cache (
+          item_id TEXT NOT NULL,
+          body_version BIGINT NOT NULL,
+          content TEXT NOT NULL,
+          cached_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+          PRIMARY KEY (item_id, body_version)
+        );
+        CREATE INDEX IF NOT EXISTS idx_tracker_body_cache_item ON tracker_body_cache(item_id);
+      `);
+    } catch (error) {
+      console.error('[PGLite Worker] Failed to create tracker_body_cache table:', error);
+      throw error;
+    }
+
+    // Offline transaction queue. Linear's four-state model (D6):
+    //   created -> queued -> executing -> persistedEnqueue.
+    // Phase 3 (client engine) reads/writes this; the renderer never
+    // touches it directly.
+    console.log('[PGLite Worker] Creating tracker_transactions table...');
+    try {
+      await this.db.exec(`
+        CREATE TABLE IF NOT EXISTS tracker_transactions (
+          client_mutation_id TEXT PRIMARY KEY,
+          item_id TEXT NOT NULL,
+          workspace_path TEXT NOT NULL,
+          state TEXT NOT NULL CHECK (state IN ('created','queued','executing','persistedEnqueue')),
+          kind TEXT NOT NULL CHECK (kind IN ('create','update','delete')),
+          payload JSONB,
+          enqueued_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+          started_at TIMESTAMPTZ,
+          confirmed_sync_id BIGINT,
+          last_rejection JSONB
+        );
+        CREATE INDEX IF NOT EXISTS idx_tracker_txn_workspace_state ON tracker_transactions(workspace_path, state);
+        CREATE INDEX IF NOT EXISTS idx_tracker_txn_item ON tracker_transactions(item_id);
+      `);
+    } catch (error) {
+      console.error('[PGLite Worker] Failed to create tracker_transactions table:', error);
+      throw error;
+    }
+
     // AI Agent Messages table - write-only raw storage for AI interactions
     console.log('[PGLite Worker] Creating ai_agent_messages table...');
     try {
@@ -1168,6 +1578,35 @@ class PGLiteWorker {
       throw error;
     }
 
+    // Add searchable_text + message_kind columns (Phase 1A of canonical
+    // transcript deprecation; see nimbalyst-local/plans/canonical-transcript-deprecation.md).
+    // searchable_text carries user-visible plaintext extracted from the raw
+    // payload at insert time. message_kind is the provider-agnostic
+    // categorization ('user' | 'assistant' | 'tool' | 'system' | 'meta').
+    // Both default NULL; a separate backfill pass populates existing rows.
+    try {
+      await this.db.exec(`
+        DO $$
+        BEGIN
+          IF NOT EXISTS (
+            SELECT 1 FROM information_schema.columns
+            WHERE table_name = 'ai_agent_messages' AND column_name = 'searchable_text'
+          ) THEN
+            ALTER TABLE ai_agent_messages ADD COLUMN searchable_text TEXT;
+          END IF;
+          IF NOT EXISTS (
+            SELECT 1 FROM information_schema.columns
+            WHERE table_name = 'ai_agent_messages' AND column_name = 'message_kind'
+          ) THEN
+            ALTER TABLE ai_agent_messages ADD COLUMN message_kind TEXT;
+          END IF;
+        END $$;
+      `);
+    } catch (error) {
+      console.error('[PGLite Worker] Failed to add searchable_text/message_kind columns:', error);
+      throw error;
+    }
+
     // NOTE: We used to drop the old FTS index here unconditionally, but that was wrong
     // because it would drop the index that the user just built via the dialog.
     // The old non-partial index (without WHERE searchable = true) is no longer created,
@@ -1205,6 +1644,20 @@ class PGLiteWorker {
     } catch (error) {
       // Non-fatal: searches will still work, just slower without the index
       console.warn('[PGLite Worker] Failed to create FTS GIN index:', error);
+    }
+
+    // Phase 2 of canonical-transcript-deprecation: GIN index over
+    // ai_agent_messages.searchable_text so the raw table can serve FTS
+    // directly. Coexists briefly with the legacy `content` GIN index until
+    // Phase 4 drops ai_transcript_events.
+    try {
+      await this.db.exec(`
+        CREATE INDEX IF NOT EXISTS idx_ai_agent_messages_searchable_text_fts
+        ON ai_agent_messages USING GIN(to_tsvector('english', COALESCE(searchable_text, '')))
+        WHERE searchable_text IS NOT NULL
+      `);
+    } catch (error) {
+      console.warn('[PGLite Worker] Failed to create searchable_text GIN index:', error);
     }
 
     // Queued Prompts table - stores prompts queued from any device for execution
@@ -1771,6 +2224,46 @@ class PGLiteWorker {
       // Non-fatal
     }
 
+    // Remove accidental worktree workstreams: a worktree IS the workstream — the
+    // `worktrees` row is the container, and every session inside it is a flat
+    // sibling keyed by worktree_id. Older /launch-new-session and convert-to-
+    // workstream paths incorrectly created `session_type='workstream'` rows
+    // either inside a worktree (worktree_id set on the workstream) or as a
+    // hidden parent of worktree-resident children. These containers carry no
+    // user content (no messages of their own) — they exist only as a side
+    // effect of the bug — so we delete them outright rather than try to
+    // preserve them as flat sessions. The FK on parent_session_id is
+    // ON DELETE SET NULL, so children get auto-unparented (their worktree_id
+    // is unchanged), and the renderer's worktreeGroupsData re-groups them
+    // flat under the worktree.
+    //
+    // Safety guard: skip any workstream that somehow has its own messages.
+    // The bug should never have created one with messages, but a per-row
+    // check costs almost nothing and prevents accidental content loss on
+    // a stranger's database.
+    try {
+      await this.db.exec(`
+        DELETE FROM ai_sessions
+        WHERE session_type = 'workstream'
+          AND NOT EXISTS (
+            SELECT 1 FROM ai_agent_messages m WHERE m.session_id = ai_sessions.id
+          )
+          AND (
+            worktree_id IS NOT NULL
+            OR id IN (
+              SELECT DISTINCT parent_session_id
+              FROM ai_sessions
+              WHERE parent_session_id IS NOT NULL
+                AND worktree_id IS NOT NULL
+            )
+          );
+      `);
+      console.log('[PGLite Worker] Deleted accidental worktree workstreams (children auto-unparented via FK SET NULL)');
+    } catch (error) {
+      console.error('[PGLite Worker] Failed to delete worktree workstreams:', error);
+      // Non-fatal - bug only affects left-pane grouping, not data integrity
+    }
+
     // Migration: Add file_timestamp column to ai_tool_call_file_edits
     try {
       await this.db.exec(`
@@ -1800,70 +2293,211 @@ class PGLiteWorker {
       // Non-fatal
     }
 
-    // Migration: Create ai_transcript_events table for canonical transcript storage
-    // This is the product-facing canonical layer; ai_agent_messages remains the raw source log.
-    const { TRANSCRIPT_EVENTS_CREATE_TABLE, TRANSCRIPT_EVENTS_INDEXES } = require('./schemas/transcriptEvents');
-    try {
-      await this.db.exec(TRANSCRIPT_EVENTS_CREATE_TABLE);
-      // PGLite requires one statement per exec for indexes
-      for (const indexStmt of TRANSCRIPT_EVENTS_INDEXES) {
-        await this.db.exec(indexStmt);
-      }
-      console.log('[PGLite Worker] ai_transcript_events table created successfully');
-    } catch (error) {
-      console.error('[PGLite Worker] Failed to create ai_transcript_events table:', error);
-      // Non-fatal - transcript features will be unavailable but app continues
-    }
+    // Phase 4 of canonical-transcript-deprecation: ai_transcript_events is
+    // gone. The forward-only drop at the bottom of createSchemas ensures any
+    // legacy installs lose the table and its watermark columns on the next
+    // launch; we no longer create it here.
 
-    // Migration: Add canonical transform projection columns to ai_sessions
+    // Migration: local-only shared-document origin bindings for re-upload.
     try {
       await this.db.exec(`
-        DO $$
-        BEGIN
-          IF NOT EXISTS (
-            SELECT 1 FROM information_schema.columns
-            WHERE table_name = 'ai_sessions' AND column_name = 'canonical_transform_version'
-          ) THEN
-            ALTER TABLE ai_sessions ADD COLUMN canonical_transform_version INTEGER;
-          END IF;
-
-          IF NOT EXISTS (
-            SELECT 1 FROM information_schema.columns
-            WHERE table_name = 'ai_sessions' AND column_name = 'canonical_last_raw_message_id'
-          ) THEN
-            ALTER TABLE ai_sessions ADD COLUMN canonical_last_raw_message_id BIGINT;
-          END IF;
-
-          IF NOT EXISTS (
-            SELECT 1 FROM information_schema.columns
-            WHERE table_name = 'ai_sessions' AND column_name = 'canonical_last_transformed_at'
-          ) THEN
-            ALTER TABLE ai_sessions ADD COLUMN canonical_last_transformed_at TIMESTAMPTZ;
-          END IF;
-
-          IF NOT EXISTS (
-            SELECT 1 FROM information_schema.columns
-            WHERE table_name = 'ai_sessions' AND column_name = 'canonical_transform_status'
-          ) THEN
-            ALTER TABLE ai_sessions ADD COLUMN canonical_transform_status TEXT
-              CHECK (canonical_transform_status IN ('pending', 'complete', 'error'));
-          END IF;
-        END $$;
+        CREATE TABLE IF NOT EXISTS collab_local_origins (
+          org_id TEXT NOT NULL,
+          document_id TEXT NOT NULL,
+          git_remote_hash TEXT,
+          workspace_path_hash TEXT,
+          relative_path TEXT NOT NULL,
+          document_type TEXT NOT NULL,
+          source_basename TEXT NOT NULL,
+          last_local_content_hash TEXT,
+          last_collab_content_hash TEXT,
+          last_synced_at TIMESTAMPTZ,
+          last_seen_mtime_ms BIGINT,
+          last_seen_size_bytes BIGINT,
+          resolution_status TEXT NOT NULL DEFAULT 'resolved'
+            CHECK (resolution_status IN ('resolved', 'missing', 'relinked', 'conflict')),
+          resolution_error TEXT,
+          created_at TIMESTAMPTZ NOT NULL,
+          updated_at TIMESTAMPTZ NOT NULL,
+          PRIMARY KEY (org_id, document_id)
+        );
       `);
-      console.log('[PGLite Worker] canonical transform columns added to ai_sessions');
+      await this.db.exec(`
+        CREATE INDEX IF NOT EXISTS idx_collab_local_origins_git_remote_hash
+          ON collab_local_origins (git_remote_hash);
+      `);
+      await this.db.exec(`
+        CREATE INDEX IF NOT EXISTS idx_collab_local_origins_relative_path
+          ON collab_local_origins (org_id, relative_path);
+      `);
+      // Epic H3 P0: project-scope shared-document bindings. NULL = the org's
+      // primary project (legacy rows), matching the server read-time default.
+      // Holds the server tracker-room routing key (teamProjectId). Mirrors the
+      // SQLite migration 0015_collab_local_origins_project_id.sql.
+      await this.db.exec(`
+        ALTER TABLE collab_local_origins ADD COLUMN IF NOT EXISTS project_id TEXT;
+      `);
+      await this.db.exec(`
+        CREATE INDEX IF NOT EXISTS idx_collab_local_origins_project_id
+          ON collab_local_origins (project_id);
+      `);
+      console.log('[PGLite Worker] collab_local_origins table created successfully');
     } catch (error) {
-      console.error('[PGLite Worker] Failed to add canonical transform columns:', error);
-      // Non-fatal - lazy transformation will be unavailable but app continues
+      console.error('[PGLite Worker] Failed to create collab_local_origins table:', error);
+      throw error;
+    }
+
+    // Migration: durable last-synced baseline for personal docs sync (System A).
+    // Lets the write-time conflict guard detect locally-diverged files across an
+    // app restart, so an older server snapshot can never clobber newer local
+    // content (NIM-853, Layer 3).
+    try {
+      await this.db.exec(`
+        CREATE TABLE IF NOT EXISTS project_file_sync_baseline (
+          project_id TEXT NOT NULL,
+          sync_id TEXT NOT NULL,
+          content_hash TEXT NOT NULL,
+          last_synced_mtime BIGINT NOT NULL,
+          updated_at TIMESTAMPTZ NOT NULL,
+          PRIMARY KEY (project_id, sync_id)
+        );
+      `);
+      console.log('[PGLite Worker] project_file_sync_baseline table created successfully');
+    } catch (error) {
+      console.error('[PGLite Worker] Failed to create project_file_sync_baseline table:', error);
+      throw error;
+    }
+
+    // Migration: materialized tracker type definitions (schema version 12).
+    // Makes the database the local source of truth for custom tracker schemas
+    // (previously only YAML files + the in-memory registry), so offline
+    // consumers like the `nim` CLI can resolve a custom type's role->field map.
+    // `model` is JSON TEXT (not JSONB) so it reads identically across backends.
+    // sync_id / sync_status mirror tracker_items for a future schema-sync path.
+    try {
+      await this.db.exec(`
+        CREATE TABLE IF NOT EXISTS tracker_type_defs (
+          id          TEXT PRIMARY KEY,
+          workspace   TEXT NOT NULL,
+          type        TEXT NOT NULL,
+          model       TEXT NOT NULL,
+          source      TEXT,
+          updated     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+          deleted_at  TIMESTAMPTZ,
+          sync_id     BIGINT,
+          sync_status TEXT DEFAULT 'local'
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_tracker_type_defs_ws_type
+          ON tracker_type_defs (workspace, type);
+      `);
+      console.log('[PGLite Worker] tracker_type_defs table created successfully');
+    } catch (error) {
+      console.error('[PGLite Worker] Failed to create tracker_type_defs table:', error);
+      throw error;
+    }
+
+    // Migration: org / project / membership model (Epic H1, schema version 13).
+    // Local projection of the server-authoritative per-org TeamRoom DO
+    // (member_roles + project_access). 2-level Org->Project hierarchy; "team" is
+    // the paid org flavor, not an entity. Project roles ship in v1; `guest` org
+    // role is modeled now but not surfaced in v1 UI. Mirror of SQLite migration
+    // 0013_orgs_and_projects.sql -- keep the two in sync.
+    try {
+      await this.db.exec(`
+        CREATE TABLE IF NOT EXISTS orgs (
+          id            TEXT PRIMARY KEY,
+          stytch_org_id TEXT NOT NULL UNIQUE,
+          slug          TEXT NOT NULL UNIQUE,
+          flavor        TEXT NOT NULL,
+          created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+          updated_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        );
+        CREATE TABLE IF NOT EXISTS org_members (
+          org_id     TEXT NOT NULL,
+          user_id    TEXT NOT NULL,
+          email      TEXT,
+          role       TEXT NOT NULL DEFAULT 'member',
+          created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+          updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+          PRIMARY KEY (org_id, user_id)
+        );
+        CREATE TABLE IF NOT EXISTS projects (
+          id              TEXT PRIMARY KEY,
+          org_id          TEXT NOT NULL,
+          slug            TEXT NOT NULL,
+          git_origin_hash TEXT,
+          created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+          updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+          UNIQUE (org_id, slug)
+        );
+        CREATE TABLE IF NOT EXISTS project_access (
+          project_id   TEXT NOT NULL,
+          user_id      TEXT NOT NULL,
+          project_role TEXT NOT NULL,
+          created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+          PRIMARY KEY (project_id, user_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_org_members_user ON org_members (user_id);
+        CREATE INDEX IF NOT EXISTS idx_projects_org ON projects (org_id);
+        CREATE INDEX IF NOT EXISTS idx_projects_git_origin ON projects (git_origin_hash);
+        CREATE INDEX IF NOT EXISTS idx_project_access_user ON project_access (user_id);
+      `);
+      console.log('[PGLite Worker] orgs/projects tables created successfully');
+    } catch (error) {
+      console.error('[PGLite Worker] Failed to create orgs/projects tables:', error);
+      throw error;
+    }
+
+    // Migration: derived relationship index (Epic C Phase 2, schema version 14).
+    // LOCAL-ONLY projection of relationship FIELD values (which themselves sync
+    // on the metadata socket like labels). Rebuildable from item JSON; never on
+    // the wire (no sync columns). Mirror of SQLite migration
+    // 0014_tracker_relationship_index.sql -- keep the two in sync.
+    try {
+      await this.db.exec(`
+        CREATE TABLE IF NOT EXISTS tracker_relationship_index (
+          id                    TEXT PRIMARY KEY,
+          workspace             TEXT NOT NULL,
+          source_item_id        TEXT NOT NULL,
+          source_field_id       TEXT NOT NULL,
+          relationship_type_key TEXT,
+          target_item_id        TEXT NOT NULL,
+          target_tracker_type   TEXT,
+          source_updated_at     TIMESTAMPTZ,
+          metadata              JSONB NOT NULL DEFAULT '{}'::jsonb
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_tracker_rel_index_unique
+          ON tracker_relationship_index (workspace, source_item_id, source_field_id, target_item_id);
+        CREATE INDEX IF NOT EXISTS idx_tracker_rel_index_source
+          ON tracker_relationship_index (workspace, source_item_id);
+        CREATE INDEX IF NOT EXISTS idx_tracker_rel_index_target
+          ON tracker_relationship_index (workspace, target_item_id);
+        CREATE INDEX IF NOT EXISTS idx_tracker_rel_index_type
+          ON tracker_relationship_index (workspace, relationship_type_key);
+      `);
+      console.log('[PGLite Worker] tracker_relationship_index table created successfully');
+    } catch (error) {
+      console.error('[PGLite Worker] Failed to create tracker_relationship_index table:', error);
+      throw error;
     }
 
     // Migration: Ensure ai_tool_call_file_edits FK points to ai_agent_messages (not ai_transcript_events).
     // A previous buggy migration may have re-pointed it to ai_transcript_events.
+    //
+    // Join through pg_class.relname instead of `'ai_transcript_events'::regclass`
+    // — Phase 4 of canonical-transcript-deprecation drops that table, and
+    // bare `::regclass` against a missing relation throws "relation does not
+    // exist", which the catch below converts into avoidable error noise on
+    // every startup of a fresh / already-cleaned database.
     try {
       const fkCheck = await this.db.query(`
-        SELECT conname FROM pg_constraint
-        WHERE conrelid = 'ai_tool_call_file_edits'::regclass
-          AND conname = 'fk_atcfe_message'
-          AND confrelid = 'ai_transcript_events'::regclass
+        SELECT c.conname
+        FROM pg_constraint c
+        JOIN pg_class cr ON cr.oid = c.conrelid
+        JOIN pg_class cf ON cf.oid = c.confrelid
+        WHERE cr.relname = 'ai_tool_call_file_edits'
+          AND c.conname = 'fk_atcfe_message'
+          AND cf.relname = 'ai_transcript_events'
       `);
       if (fkCheck.rows.length > 0) {
         await this.db.exec(`TRUNCATE ai_tool_call_file_edits`);
@@ -1878,39 +2512,317 @@ class PGLiteWorker {
     } catch (error) {
       console.error('[PGLite Worker] Failed to fix ai_tool_call_file_edits FK:', error);
     }
+
+    // Phase 4 of canonical-transcript-deprecation: drop the persisted
+    // canonical transcript events table and its watermark columns on
+    // ai_sessions. Canonical events live in TranscriptRuntime's in-memory
+    // per-session cache; raw ai_agent_messages is the sole persisted source.
+    try {
+      await this.db.exec(`DROP TABLE IF EXISTS ai_transcript_events CASCADE`);
+      console.log('[PGLite Worker] ai_transcript_events table dropped');
+    } catch (error) {
+      console.error('[PGLite Worker] Failed to drop ai_transcript_events:', error);
+    }
+    try {
+      await this.db.exec(`
+        DO $$
+        BEGIN
+          IF EXISTS (
+            SELECT 1 FROM information_schema.columns
+            WHERE table_name = 'ai_sessions' AND column_name = 'canonical_transform_version'
+          ) THEN
+            ALTER TABLE ai_sessions DROP COLUMN canonical_transform_version;
+          END IF;
+          IF EXISTS (
+            SELECT 1 FROM information_schema.columns
+            WHERE table_name = 'ai_sessions' AND column_name = 'canonical_last_raw_message_id'
+          ) THEN
+            ALTER TABLE ai_sessions DROP COLUMN canonical_last_raw_message_id;
+          END IF;
+          IF EXISTS (
+            SELECT 1 FROM information_schema.columns
+            WHERE table_name = 'ai_sessions' AND column_name = 'canonical_last_transformed_at'
+          ) THEN
+            ALTER TABLE ai_sessions DROP COLUMN canonical_last_transformed_at;
+          END IF;
+          IF EXISTS (
+            SELECT 1 FROM information_schema.columns
+            WHERE table_name = 'ai_sessions' AND column_name = 'canonical_transform_status'
+          ) THEN
+            ALTER TABLE ai_sessions DROP COLUMN canonical_transform_status;
+          END IF;
+        END $$;
+      `);
+    } catch (error) {
+      console.error('[PGLite Worker] Failed to drop canonical_transform_* columns:', error);
+    }
+
+    // ------------------------------------------------------------------------
+    // 0009_worktree_pr_linkage — PR review panel cache (issue #307, Phase B)
+    //
+    // Mirrors packages/electron/src/main/database/sqlite/schemas/
+    //   0009_worktree_pr_linkage.sql but uses native PG types:
+    //   * TIMESTAMPTZ instead of TEXT (with default now())
+    //   * JSONB instead of TEXT (defensive parse still required per
+    //     packages/electron/DATABASE.md to stay symmetric with the
+    //     SQLite backend, which stores these as JSON strings).
+    // ------------------------------------------------------------------------
+    console.log('[PGLite Worker] Creating pull_requests table...');
+    try {
+      await this.db.exec(`
+        CREATE TABLE IF NOT EXISTS pull_requests (
+          id TEXT PRIMARY KEY,
+          workspace_id TEXT NOT NULL,
+          remote TEXT NOT NULL,
+          number INTEGER NOT NULL,
+          title TEXT NOT NULL,
+          body TEXT,
+          state TEXT NOT NULL,
+          is_draft BOOLEAN NOT NULL DEFAULT FALSE,
+          author_login TEXT,
+          author_avatar_url TEXT,
+          head_ref TEXT NOT NULL,
+          head_sha TEXT NOT NULL,
+          base_ref TEXT NOT NULL,
+          mergeable TEXT,
+          comments_count INTEGER NOT NULL DEFAULT 0,
+          review_comments_count INTEGER NOT NULL DEFAULT 0,
+          additions INTEGER NOT NULL DEFAULT 0,
+          deletions INTEGER NOT NULL DEFAULT 0,
+          changed_files INTEGER NOT NULL DEFAULT 0,
+          ci_status TEXT,
+          reviewers JSONB NOT NULL DEFAULT '[]'::jsonb,
+          labels JSONB NOT NULL DEFAULT '[]'::jsonb,
+          raw JSONB NOT NULL,
+          etag TEXT,
+          created_at TIMESTAMPTZ NOT NULL,
+          updated_at TIMESTAMPTZ NOT NULL,
+          fetched_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_pull_requests_workspace_remote_number
+          ON pull_requests(workspace_id, remote, number);
+        CREATE INDEX IF NOT EXISTS idx_pull_requests_workspace_state
+          ON pull_requests(workspace_id, state);
+        CREATE INDEX IF NOT EXISTS idx_pull_requests_updated
+          ON pull_requests(updated_at);
+        CREATE INDEX IF NOT EXISTS idx_pull_requests_author
+          ON pull_requests(author_login);
+      `);
+      console.log('[PGLite Worker] pull_requests table created successfully');
+    } catch (error) {
+      console.error('[PGLite Worker] Failed to create pull_requests table:', error);
+      throw error;
+    }
+
+    console.log('[PGLite Worker] Creating pull_request_files table...');
+    try {
+      await this.db.exec(`
+        CREATE TABLE IF NOT EXISTS pull_request_files (
+          pr_id TEXT NOT NULL REFERENCES pull_requests(id) ON DELETE CASCADE,
+          path TEXT NOT NULL,
+          status TEXT NOT NULL,
+          additions INTEGER NOT NULL DEFAULT 0,
+          deletions INTEGER NOT NULL DEFAULT 0,
+          patch TEXT,
+          previous_path TEXT,
+          fetched_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          PRIMARY KEY (pr_id, path)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_pull_request_files_pr ON pull_request_files(pr_id);
+      `);
+      console.log('[PGLite Worker] pull_request_files table created successfully');
+    } catch (error) {
+      console.error('[PGLite Worker] Failed to create pull_request_files table:', error);
+      throw error;
+    }
+
+    console.log('[PGLite Worker] Creating pull_request_commits table...');
+    try {
+      await this.db.exec(`
+        CREATE TABLE IF NOT EXISTS pull_request_commits (
+          pr_id TEXT NOT NULL REFERENCES pull_requests(id) ON DELETE CASCADE,
+          sha TEXT NOT NULL,
+          message TEXT NOT NULL,
+          author_login TEXT,
+          authored_at TIMESTAMPTZ NOT NULL,
+          additions INTEGER NOT NULL DEFAULT 0,
+          deletions INTEGER NOT NULL DEFAULT 0,
+          PRIMARY KEY (pr_id, sha)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_pull_request_commits_pr ON pull_request_commits(pr_id);
+      `);
+      console.log('[PGLite Worker] pull_request_commits table created successfully');
+    } catch (error) {
+      console.error('[PGLite Worker] Failed to create pull_request_commits table:', error);
+      throw error;
+    }
+
+    console.log('[PGLite Worker] Creating pull_request_checks table...');
+    try {
+      await this.db.exec(`
+        CREATE TABLE IF NOT EXISTS pull_request_checks (
+          pr_id TEXT NOT NULL REFERENCES pull_requests(id) ON DELETE CASCADE,
+          check_name TEXT NOT NULL,
+          status TEXT NOT NULL,
+          conclusion TEXT,
+          details_url TEXT,
+          started_at TIMESTAMPTZ,
+          completed_at TIMESTAMPTZ,
+          fetched_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          PRIMARY KEY (pr_id, check_name)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_pull_request_checks_pr ON pull_request_checks(pr_id);
+      `);
+      console.log('[PGLite Worker] pull_request_checks table created successfully');
+    } catch (error) {
+      console.error('[PGLite Worker] Failed to create pull_request_checks table:', error);
+      throw error;
+    }
+
+    // Worktree <-> PR linkage columns (one worktree <-> one PR).
+    try {
+      await this.db.exec(`
+        DO $$
+        BEGIN
+          IF NOT EXISTS (
+            SELECT 1 FROM information_schema.columns
+            WHERE table_name = 'worktrees' AND column_name = 'pr_number'
+          ) THEN
+            ALTER TABLE worktrees ADD COLUMN pr_number INTEGER;
+          END IF;
+          IF NOT EXISTS (
+            SELECT 1 FROM information_schema.columns
+            WHERE table_name = 'worktrees' AND column_name = 'pr_remote'
+          ) THEN
+            ALTER TABLE worktrees ADD COLUMN pr_remote TEXT;
+          END IF;
+          IF NOT EXISTS (
+            SELECT 1 FROM information_schema.columns
+            WHERE table_name = 'worktrees' AND column_name = 'pr_url'
+          ) THEN
+            ALTER TABLE worktrees ADD COLUMN pr_url TEXT;
+          END IF;
+        END $$;
+      `);
+      await this.db.exec(`
+        CREATE INDEX IF NOT EXISTS idx_worktrees_pr_lookup
+          ON worktrees(workspace_id, pr_remote, pr_number)
+          WHERE pr_number IS NOT NULL;
+      `);
+      console.log('[PGLite Worker] worktrees pr_* columns ensured');
+    } catch (error) {
+      console.error('[PGLite Worker] Failed to add worktrees pr_* columns:', error);
+      throw error;
+    }
   }
 
   async query(message) {
     if (!this.db) throw new Error('Database not initialized');
 
-    const execStart = performance.now();
-    const result = await this.db.query(message.payload.sql, message.payload.params);
-    const execMs = performance.now() - execStart;
-    return {
-      id: message.id,
-      success: true,
-      data: result,
-      execMs
-    };
+    this.activeOps++;
+    try {
+      const execStart = performance.now();
+      const result = await this.db.query(message.payload.sql, message.payload.params);
+      const execMs = performance.now() - execStart;
+      return {
+        id: message.id,
+        success: true,
+        data: result,
+        execMs
+      };
+    } finally {
+      this.activeOps--;
+    }
   }
 
   async exec(message) {
     if (!this.db) throw new Error('Database not initialized');
 
-    const execStart = performance.now();
-    await this.db.exec(message.payload.sql);
-    const execMs = performance.now() - execStart;
-    return {
-      id: message.id,
-      success: true,
-      execMs
-    };
+    this.activeOps++;
+    try {
+      const execStart = performance.now();
+      await this.db.exec(message.payload.sql);
+      const execMs = performance.now() - execStart;
+      return {
+        id: message.id,
+        success: true,
+        execMs
+      };
+    } finally {
+      this.activeOps--;
+    }
+  }
+
+  // Run a user-supplied SELECT inside a READ ONLY transaction with a bounded
+  // statement_timeout. Used by the extension `host.data.query` API so panel
+  // extensions can read the local PGLite store without being able to mutate it.
+  //
+  // The whole BEGIN/SET LOCAL/SELECT/COMMIT runs atomically inside PGLite's
+  // native db.transaction() so concurrent callers cannot interleave between
+  // the SET and the SELECT.
+  async queryReadOnly(message) {
+    if (!this.db) throw new Error('Database not initialized');
+
+    const sql = message.payload?.sql;
+    const params = message.payload?.params;
+    const rawTimeout = Number(message.payload?.timeoutMs);
+    const timeoutMs = Number.isFinite(rawTimeout) && rawTimeout > 0
+      ? Math.min(Math.floor(rawTimeout), 30000)
+      : 5000;
+
+    if (typeof sql !== 'string' || sql.length === 0) {
+      throw new Error('queryReadOnly: sql must be a non-empty string');
+    }
+
+    this.activeOps++;
+    try {
+      const execStart = performance.now();
+      const result = await this.db.transaction(async (tx) => {
+        await tx.exec('SET TRANSACTION READ ONLY');
+        // SET LOCAL reverts at COMMIT so this doesn't leak to the next caller
+        // on the same PGLite session.
+        await tx.exec(`SET LOCAL statement_timeout = '${timeoutMs}'`);
+        return await tx.query(sql, params);
+      });
+      const execMs = performance.now() - execStart;
+      return {
+        id: message.id,
+        success: true,
+        data: result,
+        execMs
+      };
+    } finally {
+      this.activeOps--;
+    }
   }
 
   async close(message) {
+    if (this.walMaintenanceInterval) {
+      clearInterval(this.walMaintenanceInterval);
+      this.walMaintenanceInterval = null;
+    }
     if (this.db) {
       console.log('[PGLite Worker] Closing database...');
       try {
+        // Force a CHECKPOINT before close.
+        // Why: --single mode has no background checkpointer, so WAL only shrinks via
+        // explicit CHECKPOINT or the smart-shutdown sequence. If the caller's close
+        // budget (2-5s) gets preempted by force-quit before smart-shutdown's internal
+        // checkpoint runs, WAL stays large and the next launch is slow. Doing it
+        // explicitly here makes the cleanup happen even if the subsequent db.close()
+        // is killed mid-flight. Non-fatal on failure.
+        try {
+          const ckptStart = performance.now();
+          await this.db.exec('CHECKPOINT');
+          console.log(`[PGLite Worker] Pre-close CHECKPOINT took ${(performance.now() - ckptStart).toFixed(0)}ms`);
+        } catch (ckptError) {
+          console.warn('[PGLite Worker] Pre-close CHECKPOINT failed (non-fatal):', ckptError?.message || ckptError);
+        }
+
         // Close the database connection
         await this.db.close();
         console.log('[PGLite Worker] Database closed successfully');

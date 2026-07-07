@@ -7,11 +7,12 @@ A concise reference of all features in the product. Keep this up to date as feat
 - **Lexical rich text editor** (`.md`, `.txt`, `.mdc`) -- WYSIWYG with markdown shortcuts, slash commands, embedded diagrams, collaborative editing
 - **Monaco code editor** (all code file types) -- syntax highlighting, IntelliSense, multi-cursor
 - **CSV spreadsheet editor** (`.csv`, `.tsv`) -- formula support, sorting, filtering
-- **Excalidraw diagram editor** (`.excalidraw`) -- whiteboard-style diagramming with Mermaid import and AI tools
+- **Excalidraw diagram editor** (`.excalidraw`) -- whiteboard-style diagramming with Mermaid import, AI tools, and real-time multi-client Share-to-Team collab
 - **DataModelLM editor** (`.prisma`, `.datamodel`) -- visual ER diagrams with export to SQL/JSON/DBML
 - **MockupLM editor** (`.mockup.html`) -- visual HTML/CSS mockup rendering with annotation layer
 - **PDF viewer** (`.pdf`)
 - **SQLite browser** (`.db`, `.sqlite`) -- table browsing, SQL query runner, AI tools
+- **Browser** (`.html`, `.htm`, `.browser.json`) -- native Chromium `WebContentsView` (not an iframe, so frame-blocking sites load), URL bar / back-forward / reload, workspace-scoped `nim-preview://` local preview, source-mode toggle, and agentic control AI tools (navigate, click, type, evaluate, scroll, get_page_info, screenshot) over editor-backed or agent-owned headless sessions
 - **Image generation project editor** (`.imgproj`) -- multi-variant AI image generation with iterative refinement
 - **Astro editor** (`.astro`) -- schema-aware frontmatter form header
 - **Image viewer** (`.png`, `.jpg`, `.gif`, `.svg`, `.webp`, `.bmp`, `.ico`)
@@ -67,6 +68,7 @@ A concise reference of all features in the product. Keep this up to date as feat
 - Collapsible columns
 - Configurable columns
 - Auto-exit kanban when navigating to a session
+- Agent-assisted cleanup (`/session-cleanup` slash command in the Planning extension) — audits sessions, proposes phase corrections and "mark complete" candidates for approval, and flags old sessions to archive
 
 ## Agent Mode
 
@@ -93,6 +95,7 @@ A concise reference of all features in the product. Keep this up to date as feat
 - Image attachment support
 - Queued prompts display
 - Slash command typeahead
+- Action prompts dropdown in composer (reusable prompt presets defined in `nimbalyst-local/ai-actions.md`; pick to insert verbatim into the draft, with undo support)
 
 ## Multi-Agent / Teams
 
@@ -143,6 +146,17 @@ A concise reference of all features in the product. Keep this up to date as feat
 - Git ref watcher (detects external git operations)
 - Gitignore-aware file watching
 
+### Pull Request Review Mode
+
+- Integrated GitHub PR view (Cmd+U, developer mode + GitHub remote): list, conversation, files-changed diffs, commits, checks
+- Approve and merge (squash/merge/rebase) from inside the app; `gh` CLI auth, no stored tokens
+- Open a PR in a git worktree with an agent session on its head branch
+- Tracker integration (reference-based, works with any tracker type): status badge + priority marker on list rows, editable status pill and tracker chips in the detail header, dynamic review-status filter chips
+- Jump PR ↔ tracker item ↔ review session in one click from any of the three surfaces
+- Link any tracker item to a PR from the PR detail; opening a worktree auto-links the session to referencing items
+- Merging transitions referencing tracker items via the opt-in `prMergedStatus` schema role (comment-only for types without it); externally merged PRs surface a one-click catch-up hint
+- Tracker kanban cards show an item's external identity (e.g. PR number) via the `externalKey` schema role
+
 ## File Management
 
 - File tree with expand/collapse and keyboard navigation
@@ -152,6 +166,7 @@ A concise reference of all features in the product. Keep this up to date as feat
 - File watching with auto-reload on external changes
 - .gitignore-aware filtering
 - New file dialog with type selection and folder picker
+- New browser tab (Cmd+Shift+B) -- opens a fileless Browser virtual tab in files mode
 - Quick open (Cmd+O)
 - Content search across files (Cmd+Shift+F)
 - Auto-save (configurable interval)
@@ -165,18 +180,26 @@ A concise reference of all features in the product. Keep this up to date as feat
 - Reopen closed tab (Cmd+Shift+T)
 - Navigate between tabs (Cmd+Option+Left/Right)
 - Close tab (Cmd+W)
+- Double-click a tab to maximize the editor to the whole window (collapses surrounding panels); double-click again to restore — works in Files, Agent, and Shared Docs modes
 - Unified editor header bar
 - Extension-contributed document headers
 
 ## Voice Mode
 
-- Voice control via OpenAI Realtime API
+- Voice control via OpenAI Realtime API (gpt-realtime-2 by default, with automatic fallback to gpt-realtime)
+- Selectable model and reasoning effort in settings
+- Automatic reconnect with backoff on dropped connections (transient "reconnecting" state; voice/model preserved)
 - Live transcription streaming
 - Voice commands with countdown before submit
 - Interactive prompt answering (verbal AskUserQuestion, plan approval, git commit)
 - Idle timer management
 - Wake-from-sleep handling
 - Echo cancellation
+- Extension-contributed voice tools (`voiceAgent: true` AI tools) and voice session-context providers — any extension can expose tools and start-of-session context to the voice agent
+- Backend-module voice/agent tools — an extension's utility-process can register MCP tools dispatched in-process (no renderer hop), enabling native engines to answer the voice and coding agents sub-second
+- Project-knowledge grounding (Nimbalyst Memory extension) — local hybrid search over your design docs, plans, CLAUDE.md, and notes, available to the voice and coding agents
+- Hands-free brainstorm loop — talk an idea through, kick off a plan (`/design`), have the agent read the written plan back to refine it by voice, then `/implement`; ask "is it done yet?" anytime for live task status
+- Voice agent tool calls (memory lookups, coding-agent questions, and more) are recorded in the voice session transcript and render as tool widgets, including a dedicated memory-recall widget showing the query and the returned source documents (title + snippet)
 - Available on both desktop and iOS
 
 ## Mobile (iOS)
@@ -197,28 +220,55 @@ A concise reference of all features in the product. Keep this up to date as feat
 - Context usage display
 - Queued prompt management
 - Hierarchical session navigation (workstream/worktree aware)
-- Mobile voice mode
+- Mobile voice mode (soft chime + haptic cue when the session connects and it's your turn to talk)
+- Mobile voice: asking the voice agent to start a new session opens it automatically on the device that asked
+- Mobile voice: the floating mic shows a tool-call indicator (animated ring + tool-icon badge) while the agent runs a tool
 
-## Collaboration (E2E Encrypted)
+## Collaboration
+
+> **Encryption posture.** Team collaboration data (trackers, documents, doc-index
+> titles) is **encrypted in transit and at rest, isolated per team, and operated
+> by Nimbalyst**. Two custody modes per team:
+> `legacy-e2e` (client-side zero-knowledge ECDH; the original default) and
+> `server-managed` (Epic H2 — the server holds a per-team KMS-wrapped key and
+> encrypts at rest, enabling web/CLI/cloud-agent access). **Server-managed team
+> data is not zero-knowledge.** **Personal sync** (your desktop ↔ phone: sessions,
+> prompts, drafts, settings, personal index) **stays zero-knowledge** — the server
+> never holds those keys. Customers who require true zero-knowledge for team data
+> run the software on their own infrastructure (self-host).
 
 - Real-time document editing (Lexical + yJS through Cloudflare Workers)
-- E2E encrypted tracker item sync
-- Team trust model with ECDH key exchange and key envelopes
+- Encrypted tracker item sync (zero-knowledge in `legacy-e2e`; server-managed at-rest in H2)
+- Team trust model with ECDH key exchange and key envelopes (legacy-e2e mode)
+- Server-managed per-team encryption keys (Epic H2): KMS-wrapped split-knowledge DEK, admin key-recovery, append-only audit log
 - Stytch B2B org management
 - Team invite / join / role management
 - Personal org + team org separation
+- Multiple projects per organization — add another workspace to an existing org as its own tracker space (sharing the org's roster and encryption)
+- Organization settings scope (User | Organization | Project) keyed off the org switcher — members & roles, projects & access, security & encryption in one org-admin surface
+- Move a project to another organization — relocates its trackers, documents, history, and schemas into the destination, transfers member access by email (auto-invite for members not yet in the destination, with a per-person opt-out and seat-delta preview), and redirects the old location (server-managed orgs only)
+- Merge one organization into another — consolidates every project, unions the rosters (higher role wins), and optionally deletes the drained org
 - Shared document list
 - Key envelope distribution for new members
 - Durable Objects per entity (session, document, tracker, team, index)
+- **Extension-provided collab editors** — SDK `useCollaborativeEditor` hook lets any extension (Excalidraw, CSV spreadsheet, DatamodelLM shipped; others can opt in via `collaboration.supported` manifest flag) share its file type to team with real-time multi-client editing, cursors, and selection
+- **Client-side snapshot compaction** — connected clients periodically send `docCompact` so initial sync stays fast as edit history grows (single-elector by lowest userId)
 
 ## Tracker System
 
-- Tracker mode (Cmd+T) with kanban and list views
+- Tracker mode (Cmd+T) with list, table, kanban, and tag-board views
+- Kanban columns honor each type's status order from its schema (no hardcoded order)
+- Tag-board view with one column per tag (items appear in every matching column, plus an Untagged column)
+- Saved views: name, save, apply, and delete reusable filter/layout views per workspace
 - Configurable tracker item types (bugs, tasks, architecture docs, decisions, etc.)
 - Tracker sidebar with type counts
 - Item detail panel
-- E2E encrypted sync across team members
+- Encrypted sync across team members (zero-knowledge in `legacy-e2e`; server-managed at-rest in H2)
 - Inline `#type` items in markdown (TrackerPlugin)
+- Live tracker reference links — `#` in a document references an existing tracker item, inserting a chip that shows the item's current status and title (resolved live, not a snapshot) and links to it; serialized as portable `[NIM-123](nimbalyst://NIM-123)` markdown; the same link renders as a live chip in the AI transcript; one-click "convert to tracked reference" turns a legacy inline embed into a real tracked item plus a reference chip
+- Tracker schema overrides in Trackers settings -- customize a built-in type into `.nimbalyst/trackers`, edit an existing override, reset back to the built-in default, and resync the local database mirror when schema files drift
+- External-source importers: import GitHub issues (extension-provided) into the tracker as native bug, task, or feature items with a back-link to the source, a "from GitHub" chip, re-snapshot ("pull latest from source") with conservative merge, and a Source filter; agent tools `tracker_importer_list` / `tracker_importer_search` / `tracker_import` / `tracker_resnapshot` / `tracker_get_by_urn`
+- Per-project "AI Agent Access" toggle in tracker settings -- allow or block AI agents from using tracker tools in that project (on by default)
 
 ## Shared Links
 
@@ -247,6 +297,7 @@ A concise reference of all features in the product. Keep this up to date as feat
 - Lexical node and transformer contribution
 - Claude slash command contribution
 - Settings panel contribution
+- Tracker importer contribution (`trackerImporters`) — external-source importers backed by a backend module
 - Extension hot reload
 - Extension developer kit with scaffolding
 - Extension marketplace (alpha)
@@ -260,11 +311,14 @@ A concise reference of all features in the product. Keep this up to date as feat
 - Developer Tools
 - Excalidraw
 - Extension Dev Kit
+- GitHub Issues Importer
 - Image Generation
 - iOS Dev Tools
 - MockupLM
+- Nimbalyst Memory — local project-knowledge brain (hybrid search + facts) for the voice and coding agents
 - PDF Viewer
 - Planning
+- Project Graph — navigable whole-project graph of plans, trackers, sessions, commits, and files, with a horizontally scrollable **Timeline mode** (phase-colored lifecycle bars per item; collapse items into per-tag activity lanes)
 - SQLite Browser
 
 ## MCP Servers (Internal)
@@ -272,6 +326,7 @@ A concise reference of all features in the product. Keep this up to date as feat
 - Session context (summaries, workstream overview, recent sessions, edited files, scheduled wakeups)
 - Session naming (name, tags, phase)
 - Meta-agent (`create_session`, `spawn_session`, `send_prompt`, `respond_to_prompt`, `get_session_status`, `get_session_result`, `list_spawned_sessions`, `list_worktrees`) — lets a session spawn and orchestrate child, sibling, or isolated sessions
+- Settings control (`settings_get_overview`, `workspace_create`, `workspace_open`, `sync_set_for_project`, `appearance_set_theme`, `analytics_set_enabled`, `ai_set_default_model`, `features_toggle`, `extension_set_enabled`, `tracker_set_sync_policy`, etc.) — lets the agent change Nimbalyst settings through a curated, allow-listed surface; never exposes API keys or auth credentials; kill-switch via `settingsAgentToolsDisabled`
 - Developer tools (extension lifecycle, database query, log access, renderer eval, environment info)
 - Super Loop progress reporting
 - Display tools (charts, images inline in transcript)
@@ -289,6 +344,11 @@ A concise reference of all features in the product. Keep this up to date as feat
 - Command running indicator per tab
 - Worktree-specific terminal sessions
 - Context menu (clear, rename)
+- Claude Code CLI sessions: raw-terminal drawer auto-reveals and focuses when the genuine CLI opens a native picker (`/model`, `/config`, `/login`, …)
+- Claude Code CLI sessions: raw-terminal drawer is vertically resizable and remembers its height and collapsed state per session
+- Claude Code CLI sessions: mid-session model switching from the model picker (drives the CLI's `/model` command; idle turns only)
+- Claude Fable 5 selectable across all Claude providers (chat, Claude Agent, Claude Code CLI)
+- Claude Sonnet 5 selectable across all Claude providers, with the previous Sonnet 4.6 still selectable as a pinned choice
 
 ## Settings
 
@@ -314,11 +374,13 @@ A concise reference of all features in the product. Keep this up to date as feat
 
 - Back/forward history (Cmd+[ / Cmd+])
 - Cross-mode navigation
-- Session quick open (Cmd+L)
+- Session quick open (Cmd+L) — Shift+Tab searches message contents, not just titles
 - Prompt quick open (Cmd+Shift+L)
 - Content search (Cmd+Shift+F)
+- Global semantic search (Cmd+Shift+O) — a Quick Open "Search" tab that finds any tracker or document by meaning (hybrid semantic + keyword), powered by the Nimbalyst Memory extension; appears only when that extension is enabled. Optionally indexes AI sessions too (off by default)
 - Mouse back/forward button support
 - Breadcrumb navigation
+- Customizable navigation gutter — hide/show any gutter icon (modes, extension panels, indicators) and drag-to-reorder within a group via a "Customize Gutter" popover (right-click the gutter) or right-click any icon to hide it; preferences are global across projects, and the account/settings button always stays visible
 
 ## Window & Application
 
@@ -348,7 +410,7 @@ A concise reference of all features in the product. Keep this up to date as feat
 - Inline log-gathering consent checkbox with anonymization warning
 - Each path launches a guided Claude agent session via the `nimbalyst-feedback` claude-plugin (`/nimbalyst-feedback:bug-report` and `/nimbalyst-feedback:feature-request`)
 - Two-pass anonymization: regex pass via `feedback_anonymize_text` MCP tool, then LLM second-pass review before any redacted text is shown to the user
-- Issue posting via `feedback_open_github_issue` MCP tool, which opens a pre-filled `github.com/nimbalyst/nimbalyst/issues/new` URL using the right template (`bug_report.md` or `feature_request.md`); falls back to copy-paste when the body exceeds the safe URL length
+- Issue posting via `feedback_open_github_issue` MCP tool, which opens a pre-filled `github.com/nimbalyst/nimbalyst/issues/new` URL using the right issue-form template (`bug_report.yml` or `feature_request.yml`) and routes the body into the template's primary textarea field; the template's frontmatter applies the GitHub issue type and `status:needs-triage` label automatically. Falls back to copy-paste when the body exceeds the safe URL length
 - Secondary links: Browse existing issues, Discuss on GitHub Discussions, Email private feedback to support@nimbalyst.com
 
 ## Analytics

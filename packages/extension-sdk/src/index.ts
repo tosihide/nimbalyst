@@ -42,6 +42,20 @@ export {
   type DiffState,
 } from './useEditorLifecycle.js';
 
+export {
+  useCollaborativeEditor,
+  COLLAB_INIT_ORIGIN,
+  type UseCollaborativeEditorConfig,
+  type UseCollaborativeEditorResult,
+} from './useCollaborativeEditor.js';
+
+export {
+  createTextCollabContentAdapter,
+  reconstructCollabContentAdapterFromDescriptor,
+  TEXT_COLLAB_DEFAULT_FIELD,
+  type TextCollabContentAdapterOptions,
+} from './collab/createTextCollabContentAdapter.js';
+
 // Re-export host-provided editor context and UI helpers for extensions.
 export {
   useDocumentPath,
@@ -65,3 +79,40 @@ export {
   printValidationResult,
   type ValidationResult,
 } from './validate.js';
+
+export {
+  validateBackendModules,
+  assertBackendModulesValid,
+  effectiveModulePermissions,
+  validateAgentProviders,
+  assertAgentProvidersValid,
+  extractBackendModuleIds,
+  MAX_AGENT_PROVIDERS_PER_EXTENSION,
+  type BackendModuleValidationIssue,
+  type AgentProviderValidationIssue,
+} from './manifestValidation.js';
+
+// Re-export agent-provider host surface (matches the
+// `@nimbalyst/extension-sdk/agents` subpath import documented in
+// the Phase 4 SDK design).
+//
+// The protocol `ToolResult` is re-exported as `ProtocolToolResult`
+// on the root barrel to avoid colliding with the deprecated
+// extension-tool `ToolResult` from `./types/extension.ts`. The two
+// shapes are unrelated; consumers importing from the subpath
+// (`@nimbalyst/extension-sdk/agents`) get the canonical
+// `ToolResult` name unchanged.
+export type {
+  AgentProtocol,
+  ProtocolEvent,
+  ProtocolMessage,
+  ProtocolSession,
+  SessionOptions,
+  ProtocolEventType,
+  ToolResult as ProtocolToolResult,
+  MCPServerConfig,
+  RawProtocolSession,
+  AgentProtocolHost,
+  PermissionMode,
+  McpToolDefinition,
+} from './agents/index.js';

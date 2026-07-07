@@ -9,6 +9,7 @@
 import {setupMarkdownDiffTest} from '../../utils/diffTestUtils';
 import { MARKDOWN_TEST_TRANSFORMERS } from "../../utils";
 import {$convertToMarkdownString} from '@lexical/markdown';
+import {$convertToEnhancedMarkdownString} from '../../../../../markdown';
 import {normalizeMarkdownForComparison} from '../../utils/replaceTestUtils';
 
 function expectMarkdownEquivalent(actual: string, expected: string): void {
@@ -36,12 +37,16 @@ describe('Additional Coverage Tests', () => {
       const target = `This is ~~strikethrough with *italic and **bold modified** text* inside~~.`;
 
       const result = setupMarkdownDiffTest(original, target);
+      // Use the enhanced exporter (the production export path). Upstream's
+      // own $convertToMarkdownString mishandles emphasis continuity across
+      // whitespace-only sibling text nodes that the diff plugin can leave
+      // behind; the enhanced exporter fixes that case (see
+      // EnhancedMarkdownExport.ts comment near hasTextFormat continuity check).
       const actualMarkdown = result.diffEditor.getEditorState().read(() => {
-        return $convertToMarkdownString(
-          MARKDOWN_TEST_TRANSFORMERS,
-          undefined,
-          true,
-        );
+        return $convertToEnhancedMarkdownString(MARKDOWN_TEST_TRANSFORMERS, {
+          shouldPreserveNewLines: true,
+          includeFrontmatter: false,
+        });
       });
       expectMarkdownEquivalent(actualMarkdown, result.expectedMarkdown);
     });
@@ -174,19 +179,22 @@ continues in next paragraph** end.`;
   });
 
   describe('Link Edge Cases', () => {
+    // These cases used to assert that the in-diff editor's markdown matched
+    // the target as a single line. That assertion only held by accident:
+    // a bug in the inline-diff identical-check ignored link URL/children
+    // changes, silently applying the new link with no diff markers, so the
+    // editor effectively showed only the target. After fixing that bug
+    // (URL/children changes now produce a removed + added link pair inline),
+    // the diff editor's markdown legitimately contains both old and new link
+    // content side-by-side. The meaningful assertion is the round-trip:
+    // approve must produce the target, reject must produce the original.
     test('Links with special characters in URLs', () => {
       const original = `Check [this link](https://example.com/path?query=value&other=test#fragment).`;
       const target = `Check [this modified link](https://example.com/path?query=value&other=test&new=param#fragment).`;
 
       const result = setupMarkdownDiffTest(original, target);
-      const actualMarkdown = result.diffEditor.getEditorState().read(() => {
-        return $convertToMarkdownString(
-          MARKDOWN_TEST_TRANSFORMERS,
-          undefined,
-          true,
-        );
-      });
-      expectMarkdownEquivalent(actualMarkdown, result.expectedMarkdown);
+      expect(result.getApprovedMarkdown()).toBe(result.targetMarkdown);
+      expect(result.getRejectedMarkdown()).toBe(result.originalMarkdown);
     });
 
     test('Links with markdown formatting in the text', () => {
@@ -194,14 +202,8 @@ continues in next paragraph** end.`;
       const target = `Click [**bold** and *italic* link](https://example.com).`;
 
       const result = setupMarkdownDiffTest(original, target);
-      const actualMarkdown = result.diffEditor.getEditorState().read(() => {
-        return $convertToMarkdownString(
-          MARKDOWN_TEST_TRANSFORMERS,
-          undefined,
-          true,
-        );
-      });
-      expectMarkdownEquivalent(actualMarkdown, result.expectedMarkdown);
+      expect(result.getApprovedMarkdown()).toBe(result.targetMarkdown);
+      expect(result.getRejectedMarkdown()).toBe(result.originalMarkdown);
     });
 
     test('Multiple identical links in the same paragraph', () => {
@@ -209,14 +211,8 @@ continues in next paragraph** end.`;
       const target = `Visit [site](https://example.com) and also check [site](https://different.com) again.`;
 
       const result = setupMarkdownDiffTest(original, target);
-      const actualMarkdown = result.diffEditor.getEditorState().read(() => {
-        return $convertToMarkdownString(
-          MARKDOWN_TEST_TRANSFORMERS,
-          undefined,
-          true,
-        );
-      });
-      expectMarkdownEquivalent(actualMarkdown, result.expectedMarkdown);
+      expect(result.getApprovedMarkdown()).toBe(result.targetMarkdown);
+      expect(result.getRejectedMarkdown()).toBe(result.originalMarkdown);
     });
   });
 
@@ -255,10 +251,12 @@ const x: number = 5;
         );
       });
 
-      // The markdown system may escape complex backtick patterns for safety
-      // The key is that the content modification ("modified") is preserved
+      // The markdown importer follows CommonMark: only the inner ``backticks``
+      // span is recognised as a code span; the outer double-backticks become
+      // literal text and are escaped on export. The key is that the content
+      // modification ("modified") is preserved.
       const expectedWithEscaping =
-        'Use ``modified code with `backticks` inside\\`\\`.';
+        'Use \\`\\`modified code with `backticks` inside\\`\\`.';
       expectMarkdownEquivalent(actualMarkdown, expectedWithEscaping);
     });
   });

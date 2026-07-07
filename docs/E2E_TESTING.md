@@ -49,7 +49,7 @@ When running E2E tests for a new feature or bug fix, always show the results vis
      -vf "fps=10,scale=1080:-1:flags=lanczos" -loop 0 \
      e2e_test_output/videos/test-results.gif
    ```
-3. **Display inline** using `mcp__nimbalyst-mcp__display_to_user` with the GIF path
+3. **Display inline** using `mcp__nimbalyst__display_to_user` with the GIF path
 
 This lets the user see the test run directly in the conversation without opening external files.
 
@@ -1146,6 +1146,8 @@ const editorRegistry = await page.evaluate(() => (window as any).__editorRegistr
 1. **Use \****`data-testid`** for critical interactive elements (buttons, inputs, dialogs)
 2. **Use \****\`data-*`**\*\* attributes** for state and mode indicators
 3. **Use semantic class names** that won't change with styling refactors
+   - Tailwind utility classes are not a substitute for a stable semantic root marker on meaningful components.
+   - Prefer roots like `className="history-dialog ..."` over utility-only root class strings.
 4. **Structure HTML** to make relationships between elements clear
 5. **Expose test hooks** for complex internal state when necessary
 6. **Document selectors** in `PLAYWRIGHT_TEST_SELECTORS` immediately when adding new UI

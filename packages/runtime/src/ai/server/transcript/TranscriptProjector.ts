@@ -26,13 +26,23 @@ export interface TranscriptViewModel {
   messages: TranscriptViewMessage[];
 }
 
+export interface ToolCallDiffResult {
+  filePath: string;
+  operation: string; // 'create' | 'edit' | 'delete' | 'bash'
+  diffs: Array<{ oldString: string; newString: string }>;
+  content?: string; // full content for create operations
+  linesAdded?: number;
+  linesRemoved?: number;
+  debugInfo?: string; // how this file was linked to the tool call
+}
+
 export interface TranscriptViewMessage {
   id: number;
   sequence: number;
   createdAt: Date;
   type: TranscriptEventType;
   text?: string;
-  mode?: 'agent' | 'planning';
+  mode?: 'agent' | 'planning' | 'auto';
   attachments?: UserMessagePayload['attachments'];
   toolCall?: {
     toolName: string;
@@ -48,6 +58,7 @@ export interface TranscriptViewMessage {
     exitCode?: number;
     durationMs?: number;
     changes?: Array<{ path: string; patch: string }>;
+    fileDiffs?: ToolCallDiffResult[];
     providerToolCallId: string | null;
     progress: Array<{
       elapsedSeconds: number;
@@ -72,6 +83,8 @@ export interface TranscriptViewMessage {
   isError?: boolean;
   /** True when the error is an authentication failure */
   isAuthError?: boolean;
+  /** True when this is a Codex app-server "user not signed in" pre-flight error -- renders a CTA widget. */
+  isCodexAuthRequired?: boolean;
   /** Provider-specific metadata (e.g., Codex raw events) */
   metadata?: Record<string, unknown>;
 }
@@ -273,6 +286,26 @@ function projectEvent(
       base.subagent = {
         ...p,
         childEvents: [],
+      };
+      base.toolCall = {
+        toolName: 'Task',
+        toolDisplayName: 'Task',
+        status: p.status === 'completed' ? 'completed' : 'running',
+        description: null,
+        arguments: {
+          prompt: p.prompt,
+          ...(p.isBackground ? { run_in_background: true } : {}),
+          ...(p.teammateName ? { name: p.teammateName } : {}),
+          ...(p.teamName ? { team_name: p.teamName } : {}),
+          ...(p.teammateMode ? { mode: p.teammateMode } : {}),
+          ...(p.model ? { model: p.model } : {}),
+        },
+        targetFilePath: null,
+        mcpServer: null,
+        mcpTool: null,
+        result: p.resultSummary,
+        providerToolCallId: event.providerToolCallId ?? event.subagentId,
+        progress: [],
       };
       break;
     }

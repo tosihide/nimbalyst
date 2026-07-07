@@ -31,10 +31,12 @@ import {
   selectedWorkstreamAtom,
   setSelectedWorkstreamAtom,
   sessionUnreadAtom,
+  sessionLastActivityAtom,
   sessionLastReadAtom,
   sessionHasPendingInteractivePromptAtom,
   sessionPendingPromptsAtom,
   sessionRegistryAtom,
+  sessionChildrenAtom,
   sessionStoreAtom,
   sessionDraftInputAtom,
   sessionLastSubmitAtAtom,
@@ -44,8 +46,17 @@ import {
 import { workstreamActiveChildAtom, workstreamStateAtom } from './atoms/workstreamState';
 import { setWindowModeAtom } from './atoms/windowMode';
 import { triggerWorktreeRefreshAtom } from './atoms/gitOperations';
+import { multiProjectModeAtom, openProjectsAtom } from './atoms/openProjects';
+import {
+  markSessionStreamingAtom,
+  clearSessionStreamingAtom,
+  markSessionUnreadAtom,
+  clearSessionUnreadAtom,
+  markSessionTurnActivityAtom,
+} from './atoms/sessionActivity';
 import type { TranscriptEvent } from '@nimbalyst/runtime/ai/server/transcript/types';
 import { TranscriptStreamAccumulator } from './transcriptStreamAccumulator';
+import { resolveOwnedWorkspacePath } from '../../shared/sessionWorkspaceRouting';
 
 /**
  * Per-session accumulator of canonical events received via IPC.
@@ -115,20 +126,42 @@ const READ_STATE_SYNC_DEBOUNCE_MS = 5000;
 
 // Active workspace-scoped subscription in main process.
 // Kept module-level so we can update routing without re-registering all IPC listeners.
-let subscribedWorkspacePath: string | undefined;
+//
+// Multi-project rail: in single-project mode the subscription is keyed to
+// the active workspace; in multi-project mode the subscription receives
+// events for every open (warm) project so a session that completes while
+// its project is hidden still flips the UI out of "Thinking…".
+let activeWorkspacePathSnapshot: string | null = null;
+let lastSubscriptionKey = '';
 
-function subscribeToSessionStateWorkspace(workspacePath?: string): void {
+function getCurrentSubscriptionPaths(): string[] | undefined {
+  const isMulti = store.get(multiProjectModeAtom);
+  if (isMulti) {
+    const open = store.get(openProjectsAtom);
+    if (open.length > 0) return open.map((p) => p.path);
+    return activeWorkspacePathSnapshot ? [activeWorkspacePathSnapshot] : undefined;
+  }
+  return activeWorkspacePathSnapshot ? [activeWorkspacePathSnapshot] : undefined;
+}
+
+function reconcileSessionStateSubscription(): void {
   if (!window.electronAPI?.sessionState) return;
 
-  if (subscribedWorkspacePath === workspacePath) {
-    return;
-  }
+  const paths = getCurrentSubscriptionPaths();
+  const key = paths ? [...paths].sort().join('\0') : '__no_filter__';
+  if (key === lastSubscriptionKey) return;
+  lastSubscriptionKey = key;
 
-  subscribedWorkspacePath = workspacePath;
-  window.electronAPI.sessionState.subscribe(workspacePath)
+  const arg: string | string[] | undefined = !paths
+    ? undefined
+    : paths.length === 1
+      ? paths[0]
+      : paths;
+
+  window.electronAPI.sessionState.subscribe(arg)
     .then((result: any) => {
-      if (!result.success) {
-        console.error('[sessionStateListeners] Failed to subscribe to session state manager:', result.error);
+      if (!result?.success) {
+        console.error('[sessionStateListeners] Failed to subscribe to session state manager:', result?.error);
       }
     })
     .catch((error: any) => {
@@ -137,7 +170,18 @@ function subscribeToSessionStateWorkspace(workspacePath?: string): void {
 }
 
 export function updateSessionStateListenerWorkspace(workspacePath: string): void {
-  subscribeToSessionStateWorkspace(workspacePath || undefined);
+  activeWorkspacePathSnapshot = workspacePath || null;
+  reconcileSessionStateSubscription();
+}
+
+// React to multi-project mode toggle / rail open-projects changes by
+// re-subscribing with the right set of workspace paths.
+let multiProjectSubscribersInstalled = false;
+function ensureMultiProjectSubscribers(): void {
+  if (multiProjectSubscribersInstalled) return;
+  multiProjectSubscribersInstalled = true;
+  store.sub(multiProjectModeAtom, reconcileSessionStateSubscription);
+  store.sub(openProjectsAtom, reconcileSessionStateSubscription);
 }
 
 /**
@@ -152,6 +196,41 @@ export function initSessionStateListeners(): () => void {
     return () => {};
   }
 
+  // Debounced trigger for the processing-state reconcile (assigned once the
+  // reconcile function is defined below). Fired on terminal session events so a
+  // stuck spinner clears within ~1s instead of waiting for the slow interval.
+  let scheduleProcessingReconcile: (() => void) | undefined;
+
+  // Wire reconciliation against multi-project rail state so subscriptions
+  // include every warm project, not just the visible one.
+  ensureMultiProjectSubscribers();
+  reconcileSessionStateSubscription();
+
+  /**
+   * If the session that just had turn-boundary or message activity has a
+   * workstream parent in the registry, also bump the parent's
+   * `markSessionTurnActivityAtom` for the same workspace. Without this, the
+   * agent-mode sort in SessionHistory reads `turnActivity.get(parent.id)`,
+   * gets undefined, and falls back to the parent's registry `updatedAt` —
+   * which never bumps during streaming (intentionally, to avoid render churn).
+   * The visible symptom: workstream containers stayed several rows down the
+   * TODAY group even while their active child was streaming new messages.
+   */
+  const bumpParentTurnActivity = (
+    sessionId: string,
+    workspacePath: string,
+    timestamp: number,
+  ) => {
+    const meta = store.get(sessionRegistryAtom).get(sessionId);
+    const parentId = meta?.parentSessionId;
+    if (!parentId) return;
+    store.set(markSessionTurnActivityAtom, {
+      sessionId: parentId,
+      workspacePath,
+      timestamp,
+    });
+  };
+
   /**
    * Handle session state change events.
    * These events come from the AI provider and track the session lifecycle.
@@ -165,41 +244,150 @@ export function initSessionStateListeners(): () => void {
     const { type, sessionId, workspacePath: eventWorkspacePath } = event;
     if (!sessionId) return;
 
-    const currentWorkspacePath = store.get(sessionListWorkspaceAtom);
     const registry = store.get(sessionRegistryAtom);
     const sessionMeta = registry.get(sessionId);
-    const resolvedWorkspacePath = eventWorkspacePath || sessionMeta?.workspaceId || currentWorkspacePath || null;
+    const sessionWorkspacePath = sessionMeta?.workspaceId || null;
+    const ownedWorkspacePath = resolveOwnedWorkspacePath({
+      eventWorkspacePath,
+      sessionWorkspacePath,
+    });
 
-    // Ignore lifecycle events for sessions owned by a different workspace window.
-    if (currentWorkspacePath && resolvedWorkspacePath && resolvedWorkspacePath !== currentWorkspacePath) {
+    // The main-process subscription is scoped to the set of workspace paths
+    // this window actually hosts (single project or rail-warm) and does the
+    // worktree-aware routing (see SessionStateHandlers), so any event that
+    // reaches us here is intended for us. We don't re-filter by the visible
+    // project — that would drop lifecycle events for sessions in inactive
+    // rail projects, leaving the UI stuck on "Thinking…" after a session
+    // completed while its project was hidden.
+    //
+    // We still require an owned workspacePath (event-carried or registry
+    // hit) for the non-terminal events (started / streaming / waiting),
+    // because those drive workspace-scoped state like
+    // `markSessionStreamingAtom` which needs a real workspacePath to
+    // bucket per project. Falling back to the active project's path would
+    // silently process started/streaming for unrelated sessions.
+    //
+    // For TERMINAL events (`session:completed` / `error` / `interrupted`)
+    // we instead clear `sessionProcessingAtom(sessionId)` unconditionally
+    // BEFORE the null-guard below. The processing atom is keyed only by
+    // sessionId (no workspace component) and represents "is this turn
+    // still running." The main process already routes the event to this
+    // window, so a missing workspacePath here means the session isn't yet
+    // in the registry — typically a startup race or post-HMR
+    // re-evaluation where the lifecycle event arrives before the session
+    // list has been hydrated. Dropping the terminal event silently in
+    // that case left the "Thinking…" indicator pinned forever; the user
+    // had to click Cancel to clear it. arcenik86 reported exactly this
+    // on extended-thinking sessions where slow turns increase the chance
+    // of the race. See #116.
+    const isTerminalEvent =
+      type === 'session:completed' ||
+      type === 'session:error' ||
+      type === 'session:interrupted';
+    if (isTerminalEvent) {
+      store.set(sessionProcessingAtom(sessionId), false);
+      store.set(sessionHasPendingInteractivePromptAtom(sessionId), false);
+      // Also clear the workspace-scoped streaming flag. The atom looks up
+      // workspacePath from `sessionActivityIndexAtom` when not provided, so
+      // cross-workspace rail activity for this session gets cleared even
+      // when the terminal event itself lacks workspacePath. Without this,
+      // the rail badge ("streaming" dot on inactive projects) stayed stuck
+      // after the session ended in the no-workspacePath race documented
+      // above. Per @ghinkle's review on the closed #293.
+      store.set(clearSessionStreamingAtom, { sessionId });
+      // A session reached a terminal state, so it left the backend's active set.
+      // Re-derive the processing atoms against that authoritative set now (debounced
+      // ~600ms) instead of waiting up to 15s for the interval. A meta-agent header
+      // reflects child processing too (sessionOrChildProcessingAtom), so when a
+      // child finishes this clears the parent's spinner within ~1s rather than
+      // leaving it stuck until the user clicks the child.
+      scheduleProcessingReconcile?.();
+    }
+
+    if (!ownedWorkspacePath) {
       return;
     }
+
+    const resolvedWorkspacePath = ownedWorkspacePath;
+    const turnBoundaryTimestamp = typeof event.timestamp === 'number' ? event.timestamp : Date.now();
 
     switch (type) {
       // Session is actively running
       case 'session:started':
         store.set(sessionProcessingAtom(sessionId), true);
+        store.set(markSessionStreamingAtom, { sessionId, workspacePath: resolvedWorkspacePath });
+        store.set(markSessionTurnActivityAtom, {
+          sessionId,
+          workspacePath: resolvedWorkspacePath,
+          timestamp: turnBoundaryTimestamp,
+        });
+        bumpParentTurnActivity(sessionId, resolvedWorkspacePath, turnBoundaryTimestamp);
         break;
 
       case 'session:streaming':
         store.set(sessionProcessingAtom(sessionId), true);
-        // AI resumed streaming - no longer waiting for user input
-        store.set(sessionHasPendingInteractivePromptAtom(sessionId), false);
+        // Intentionally do NOT clear sessionHasPendingInteractivePromptAtom here.
+        // session:streaming fires for any token chunk produced by the provider,
+        // including tail-end chunks that arrive after the model emits a tool_use
+        // for AskUserQuestion / ExitPlanMode / ToolPermission / GitCommitProposal.
+        // The pending flag is the responsibility of the explicit resolve events
+        // (ai:askUserQuestionAnswered, ai:exitPlanModeResolved,
+        // ai:toolPermissionResolved, ai:gitCommitProposalResolved, ai:sessionCancelled)
+        // and the terminal lifecycle events (session:completed/error/interrupted)
+        // below. Letting "streaming" clear it caused the warning indicator to
+        // flip back to a generic spinner mid-prompt — particularly visible in
+        // multi-project rail mode, where this window receives streaming events
+        // for sessions in inactive projects whose transcripts are not mounted
+        // and thus cannot re-derive the flag from messages.
+        store.set(markSessionStreamingAtom, { sessionId, workspacePath: resolvedWorkspacePath });
         break;
 
       // Session is waiting for user input (AskUserQuestion, ExitPlanMode, ToolPermission)
       case 'session:waiting':
         store.set(sessionProcessingAtom(sessionId), true);
-        store.set(sessionHasPendingInteractivePromptAtom(sessionId), true);
+        // NIM-850: the genuine Claude CLI (claude-code-cli) drives this event off
+        // a coarse `waiting` pid-file status that fires transiently mid-turn — e.g.
+        // while the CLI is merely blocked on a tool/MCP round-trip — not only for
+        // real user prompts. Letting it set the pending-interactive-prompt flag
+        // poisoned `isWaitingForResponse`, suppressing the "Thinking…" indicator
+        // for the rest of the turn (the flag is only cleared by terminal events;
+        // session:streaming deliberately doesn't clear it). For CLI sessions the
+        // flag is owned solely by the real durable-prompt events
+        // (ai:askUserQuestion / ai:exitPlanModeConfirm / ai:toolPermission /
+        // ai:requestUserInput), which set AND clear it explicitly. Keeping
+        // sessionProcessingAtom true above means the indicator keeps showing.
+        if (sessionMeta?.provider !== 'claude-code-cli') {
+          store.set(sessionHasPendingInteractivePromptAtom(sessionId), true);
+        }
+        // Treat "waiting on user" as still processing for rail badge purposes —
+        // the user typically hasn't switched away because of the prompt.
+        store.set(markSessionStreamingAtom, { sessionId, workspacePath: resolvedWorkspacePath });
+        store.set(markSessionTurnActivityAtom, {
+          sessionId,
+          workspacePath: resolvedWorkspacePath,
+          timestamp: turnBoundaryTimestamp,
+        });
+        bumpParentTurnActivity(sessionId, resolvedWorkspacePath, turnBoundaryTimestamp);
         break;
 
       // Session has finished (successfully or with error)
       case 'session:completed':
       case 'session:error':
       case 'session:interrupted':
-        store.set(sessionProcessingAtom(sessionId), false);
-        // Also clear pending interactive prompt state - if session ended, no longer waiting
-        store.set(sessionHasPendingInteractivePromptAtom(sessionId), false);
+        // The three atoms cleared in the unconditional terminal-event block
+        // above (processing, pendingInteractivePrompt, streaming) cover this
+        // case. We intentionally do NOT re-clear them here; the streaming
+        // atom is idempotent but the duplicate would obscure the invariant
+        // that terminal-event cleanup is workspace-agnostic.
+        // markSessionTurnActivityAtom stays here because it requires a
+        // concrete workspacePath and feeds sidebar ordering for the owning
+        // workspace only.
+        store.set(markSessionTurnActivityAtom, {
+          sessionId,
+          workspacePath: resolvedWorkspacePath,
+          timestamp: turnBoundaryTimestamp,
+        });
+        bumpParentTurnActivity(sessionId, resolvedWorkspacePath, turnBoundaryTimestamp);
 
         // Clear any pending throttle timer for this session - the final reload below
         // will fetch the complete state, so a stale throttled reload is unnecessary
@@ -331,21 +519,30 @@ export function initSessionStateListeners(): () => void {
    * Also marks sessions as unread when they receive output messages while not being
    * the currently viewed session.
    */
-  const handleMessageLogged = (data: { sessionId: string; direction: string }) => {
-    const { sessionId, direction } = data;
-    const currentWorkspacePath = store.get(sessionListWorkspaceAtom);
+  const handleMessageLogged = (data: { sessionId: string; direction: string; workspacePath?: string }) => {
+    const { sessionId, direction, workspacePath: eventWorkspacePath } = data;
+    if (!sessionId) return;
+
     const registry = store.get(sessionRegistryAtom);
     const sessionMeta = registry.get(sessionId);
-    const workspacePath = sessionMeta?.workspaceId || currentWorkspacePath;
-
-    // Guard against any cross-window leakage: only process events for this window's workspace.
-    if (currentWorkspacePath && sessionMeta?.workspaceId && sessionMeta.workspaceId !== currentWorkspacePath) {
+    // Prefer the workspacePath sent by main — it is the session's owning
+    // path (resolved against the worktree's parent workspace_id by the main
+    // process), which the registry only knows about while that project is
+    // the active one. After a rail switch the registry has been replaced
+    // with the new project's sessions and `sessionMeta?.workspaceId` is
+    // undefined, so a legacy fallback to the visible project would route
+    // the reload to the wrong workspace.
+    //
+    // Multi-project rail: any event we receive is intended for a workspace
+    // this window owns (the main process scopes the subscription). Don't
+    // re-filter against the visible project — that drops events for
+    // sessions in inactive rail projects and leaves their UI stale.
+    const ownedWorkspacePath = eventWorkspacePath || sessionMeta?.workspaceId || null;
+    if (!ownedWorkspacePath) {
       return;
     }
 
-    if (!workspacePath || !sessionId) {
-      return;
-    }
+    const workspacePath = ownedWorkspacePath;
 
     // Throttle session data reload per session (leading + trailing edge).
     // During active streaming, message-logged fires on every chunk which would
@@ -381,11 +578,33 @@ export function initSessionStateListeners(): () => void {
       }, RELOAD_THROTTLE_MS));
     }
 
-    // Update session metadata with updatedAt timestamp and ensure it's unarchived
-    // The database layer already sets is_archived = FALSE when a message is added,
-    // but we need to update the UI state to match
-    // This automatically syncs both sessionStoreAtom and sessionRegistryAtom
-    store.set(updateSessionStoreAtom, { sessionId, updates: { updatedAt: Date.now(), isArchived: false } });
+    // Bump the per-session activity atom. Individual list-item subscribers
+    // re-render their own relative-time labels without churning
+    // sessionRegistryAtom (which would cascade through sessionListRootAtom,
+    // SessionHistory's filter effect, and every workstream/group derivation).
+    // The registry's `updatedAt` stays at the value from the last DB refresh
+    // — sort order during a live turn is driven by `markSessionTurnActivityAtom`,
+    // not by per-message timestamps.
+    // Per-message bumps are limited to the row's own relative-time label.
+    // Do NOT write `markSessionTurnActivityAtom` here or bump the parent's
+    // turn-activity: those drive the agent-mode sort (via
+    // `workspaceSessionTurnActivityAtom`), and per-chunk writes re-fire the
+    // SessionHistory sort cascade and the downstream `session-files:get-by-session`
+    // storm that the May 28 fix (commit 3d613ecfc) eliminated. Parent
+    // workstream rows still rise to the top via the turn-boundary bumps in
+    // the `session:started`/`waiting`/`completed` cases above; that's the
+    // intended cadence for re-sorts.
+    store.set(sessionLastActivityAtom(sessionId), Date.now());
+
+    // Only mutate the registry to flip `isArchived: false` when it actually
+    // is currently archived. The database layer unarchives on insert; the
+    // unconditional registry write that used to happen here was the single
+    // biggest source of SessionHistory churn during streaming (706-entry
+    // Map rebuilt + sessionListRootAtom re-derived + setSessions cascade per
+    // streamed chunk).
+    if (sessionMeta?.isArchived) {
+      store.set(updateSessionStoreAtom, { sessionId, updates: { isArchived: false } });
+    }
 
     // Mark as unread if this is an output message (agent response) and the session
     // is not currently being viewed
@@ -404,6 +623,7 @@ export function initSessionStateListeners(): () => void {
       // If this message is for a session that's not currently viewed, mark it as unread
       if (sessionId !== currentlyViewedSessionId) {
         store.set(sessionUnreadAtom(sessionId), true);
+        store.set(markSessionUnreadAtom, { sessionId, workspacePath });
 
         // Persist to database metadata for cross-device sync
         window.electronAPI?.invoke('ai:updateSessionMetadata', sessionId, {
@@ -416,6 +636,7 @@ export function initSessionStateListeners(): () => void {
         // devices (iOS) know the user is reading these messages in real time.
         // Without this, iOS would show the session as unread because it sees
         // lastMessageAt increasing but lastReadAt staying stale.
+        store.set(clearSessionUnreadAtom, { sessionId, workspacePath });
         const existingReadTimer = readStateSyncTimers.get(sessionId);
         if (existingReadTimer) {
           clearTimeout(existingReadTimer);
@@ -430,6 +651,52 @@ export function initSessionStateListeners(): () => void {
         }, READ_STATE_SYNC_DEBOUNCE_MS));
       }
     }
+  };
+
+  /**
+   * Handle transcript reparse completion without mutating unread/activity
+   * state. A canonical reparse changes transcript structure, not session
+   * activity.
+   */
+  const handleTranscriptSessionReparsed = (data: { sessionId: string; workspacePath?: string }) => {
+    const { sessionId, workspacePath: eventWorkspacePath } = data;
+    if (!sessionId) return;
+
+    const registry = store.get(sessionRegistryAtom);
+    const sessionMeta = registry.get(sessionId);
+    const workspacePath = eventWorkspacePath || sessionMeta?.workspaceId || null;
+    if (!workspacePath) return;
+
+    store.set(reloadSessionDataAtom, { sessionId, workspacePath });
+  };
+
+  /**
+   * Handle coalesced batch-write events from AgentMessageWriteQueue.
+   *
+   * The queue emits one event per affected session per flush, replacing the
+   * per-chunk `ai:message-logged` events that used to fire from
+   * `logAgentMessageNonBlocking`. Adapt the batch payload to the existing
+   * per-row handler so the same throttled reload + unread-marking logic
+   * applies. A 'mixed' direction (input + output rows in the same flush)
+   * is treated as 'output' for unread purposes since it always contains at
+   * least one output row.
+   *
+   * Hidden rows are already excluded from the batch's count by the queue,
+   * so we don't need to filter again here.
+   */
+  const handleMessagesLoggedBatch = (data: {
+    sessionId: string;
+    count: number;
+    direction: 'input' | 'output' | 'mixed';
+    workspacePath?: string;
+  }) => {
+    if (!data?.sessionId || !data.count) return;
+    const effectiveDirection = data.direction === 'input' ? 'input' : 'output';
+    handleMessageLogged({
+      sessionId: data.sessionId,
+      direction: effectiveDirection,
+      workspacePath: data.workspacePath,
+    });
   };
 
   /**
@@ -499,7 +766,7 @@ export function initSessionStateListeners(): () => void {
     const prompt: PendingPrompt = {
       id: requestId,
       sessionId,
-      promptType: 'ask_user_question_request', // reuse type for voice forwarding
+      promptType: 'exit_plan_mode_request',
       promptId: requestId,
       data: { type: 'exit_plan_mode_request', requestId },
       createdAt: Date.now(),
@@ -568,16 +835,28 @@ export function initSessionStateListeners(): () => void {
    * Handle GitCommitProposal events globally.
    * Sets pending interactive prompt indicator for the sidebar.
    */
-  const handleGitCommitProposal = (data: { sessionId: string; proposalId: string; commitMessage?: string }) => {
+  const handleGitCommitProposal = (data: {
+    sessionId: string;
+    proposalId: string;
+    commitMessage?: string;
+    filesToStage?: Array<string | { path: string; status?: string }>;
+    workspacePath?: string;
+  }) => {
     const { sessionId, proposalId } = data;
     if (!sessionId) return;
     store.set(sessionHasPendingInteractivePromptAtom(sessionId), true);
     const prompt: PendingPrompt = {
       id: proposalId,
       sessionId,
-      promptType: 'ask_user_question_request', // reuse type for voice forwarding
+      promptType: 'git_commit_proposal_request',
       promptId: proposalId,
-      data: { type: 'git_commit_proposal_request', proposalId, commitMessage: data.commitMessage },
+      data: {
+        type: 'git_commit_proposal_request',
+        proposalId,
+        commitMessage: data.commitMessage,
+        filesToStage: data.filesToStage,
+        workspacePath: data.workspacePath,
+      },
       createdAt: Date.now(),
     };
     const current = store.get(sessionPendingPromptsAtom(sessionId));
@@ -594,6 +873,40 @@ export function initSessionStateListeners(): () => void {
     store.set(sessionHasPendingInteractivePromptAtom(sessionId), false);
     const current = store.get(sessionPendingPromptsAtom(sessionId));
     store.set(sessionPendingPromptsAtom(sessionId), current.filter(p => p.promptId !== proposalId));
+  };
+
+  /**
+   * Handle RequestUserInput events globally.
+   * Push prompt data into the atom so voice mode can read it (and so the
+   * sidebar pending indicator lights up). The widget itself reads from
+   * `toolCall.arguments` -- this atom is for cross-cutting consumers.
+   */
+  const handleRequestUserInput = (data: { sessionId: string; promptId: string; args: any }) => {
+    const { sessionId, promptId, args } = data;
+    if (!sessionId || !promptId) return;
+    store.set(sessionHasPendingInteractivePromptAtom(sessionId), true);
+    const prompt: PendingPrompt = {
+      id: promptId,
+      sessionId,
+      promptType: 'request_user_input_request',
+      promptId,
+      data: { type: 'request_user_input_request', promptId, args },
+      createdAt: Date.now(),
+    };
+    const current = store.get(sessionPendingPromptsAtom(sessionId));
+    store.set(sessionPendingPromptsAtom(sessionId), [...current, prompt]);
+  };
+
+  /**
+   * Handle RequestUserInput resolved events globally.
+   * Clears pending interactive prompt indicator.
+   */
+  const handleRequestUserInputResolved = (data: { sessionId: string; promptId: string }) => {
+    const { sessionId, promptId } = data;
+    if (!sessionId) return;
+    store.set(sessionHasPendingInteractivePromptAtom(sessionId), false);
+    const current = store.get(sessionPendingPromptsAtom(sessionId));
+    store.set(sessionPendingPromptsAtom(sessionId), current.filter(p => p.promptId !== promptId));
   };
 
   /**
@@ -689,23 +1002,80 @@ export function initSessionStateListeners(): () => void {
     }
   };
 
+  // Handle for the self-healing processing-state reconcile interval (below).
+  let processingReconcileInterval: ReturnType<typeof setInterval> | undefined;
+
   // First, subscribe to the session state manager (IPC call to register this window).
   // Workspace can change during app lifetime; this is updated via updateSessionStateListenerWorkspace().
-  subscribeToSessionStateWorkspace(store.get(sessionListWorkspaceAtom) || undefined);
+  activeWorkspacePathSnapshot = store.get(sessionListWorkspaceAtom) || null;
+  reconcileSessionStateSubscription();
 
-  // Fetch currently active sessions and restore their processing state
-  // This handles the case where the renderer refreshes while sessions are running
-  window.electronAPI.sessionState.getActiveSessionIds?.()
-    .then((result: { success: boolean; sessionIds: string[] }) => {
-      if (result.success && result.sessionIds.length > 0) {
-        for (const sessionId of result.sessionIds) {
-          store.set(sessionProcessingAtom(sessionId), true);
+  // Restore + reconcile processing spinners using getRunningSessionIds (status
+  // running/streaming), NOT bare activeSessions membership: the latter retains
+  // idle claude-code-cli sessions between turns and pinned their spinner forever
+  // (NIM-846). We also heal strays: clear the processing atom for any known
+  // session that is NOT running, so a dropped terminal event (or a stale spinner)
+  // cannot stay stuck. If the preload predates getRunningSessionIds, skip rather
+  // than fall back to membership; a running session's spinner is re-established by
+  // its next streaming event.
+  //
+  // Runs once on init, on a slow interval, AND - debounced - on every terminal
+  // session event (via scheduleProcessingReconcile), so a parent meta-agent header
+  // (which reflects child processing through sessionOrChildProcessingAtom) clears
+  // within ~1s when a child finishes instead of staying stuck until the user clicks
+  // the child.
+  const reconcileProcessingState = async () => {
+    const api = window.electronAPI.sessionState;
+    if (!api.getRunningSessionIds) return;
+    try {
+      const result = await api.getRunningSessionIds();
+      if (!result?.success) return;
+      const running = new Set(result.sessionIds);
+      for (const sessionId of running) {
+        store.set(sessionProcessingAtom(sessionId), true);
+      }
+      // Heal strays across the SAME superset the meta-agent header aggregates
+      // over (sessionOrChildProcessingAtom = self OR any child). The header reads
+      // children from sessionChildrenAtom too, and a meta-agent child can sit in
+      // sessionChildrenAtom while NOT being a sessionRegistryAtom key (child-added
+      // patches the former; archived / worktree-archived children are dropped from
+      // sessions:list). Iterating the registry alone left such a child's stuck
+      // processing atom unhealed, pinning the header until the user clicked the
+      // child. Union the registry keys with every parent's loaded children.
+      const candidates = new Set<string>(store.get(sessionRegistryAtom).keys());
+      for (const parentId of store.get(sessionRegistryAtom).keys()) {
+        const children = store.get(sessionChildrenAtom(parentId));
+        if (Array.isArray(children)) {
+          for (const childId of children) candidates.add(childId);
         }
       }
-    })
-    .catch((error: any) => {
-      console.error('[sessionStateListeners] Error fetching active sessions:', error);
-    });
+      let healed = 0;
+      for (const sessionId of candidates) {
+        if (!running.has(sessionId) && store.get(sessionProcessingAtom(sessionId))) {
+          store.set(sessionProcessingAtom(sessionId), false);
+          healed++;
+        }
+      }
+      if (healed > 0) {
+        console.debug(
+          `[sessionStateListeners] reconcile: healed ${healed} stuck processing session(s)`,
+        );
+      }
+    } catch (error) {
+      console.error('[sessionStateListeners] reconcileProcessingState failed:', error);
+    }
+  };
+  void reconcileProcessingState();
+  processingReconcileInterval = setInterval(() => void reconcileProcessingState(), 15000);
+
+  // Debounced trigger wired now that reconcileProcessingState exists; fired from
+  // the terminal-event branch of handleStateChange. Coalesces a burst of
+  // completions (several children finishing) into one re-sync.
+  let reconcileDebounceTimer: ReturnType<typeof setTimeout> | undefined;
+  scheduleProcessingReconcile = () => {
+    if (reconcileDebounceTimer) clearTimeout(reconcileDebounceTimer);
+    reconcileDebounceTimer = setTimeout(() => void reconcileProcessingState(), 600);
+  };
 
   // Then, listen for state change events
   window.electronAPI.sessionState.onStateChange(handleStateChange);
@@ -733,13 +1103,19 @@ export function initSessionStateListeners(): () => void {
   let cleanupToolPermissionResolved: (() => void) | undefined;
   let cleanupGitCommitProposal: (() => void) | undefined;
   let cleanupGitCommitProposalResolved: (() => void) | undefined;
+  let cleanupRequestUserInput: (() => void) | undefined;
+  let cleanupRequestUserInputResolved: (() => void) | undefined;
   let cleanupNotificationClicked: (() => void) | undefined;
   let cleanupSyncReadState: (() => void) | undefined;
   let cleanupSyncDraftInput: (() => void) | undefined;
   let cleanupTranscriptEvent: (() => void) | undefined;
+  let cleanupTranscriptSessionReparsed: (() => void) | undefined;
+  let cleanupMessagesLoggedBatch: (() => void) | undefined;
   if (window.electronAPI?.on) {
     cleanupTranscriptEvent = window.electronAPI.on('transcript:event', handleTranscriptEvent);
+    cleanupTranscriptSessionReparsed = window.electronAPI.on('transcript:session-reparsed', handleTranscriptSessionReparsed);
     cleanupMessageLogged = window.electronAPI.on('ai:message-logged', handleMessageLogged);
+    cleanupMessagesLoggedBatch = window.electronAPI.on('ai:messages-logged-batch', handleMessagesLoggedBatch);
     cleanupTitleUpdated = window.electronAPI.on('session:title-updated', handleTitleUpdated);
     cleanupAskUserQuestion = window.electronAPI.on('ai:askUserQuestion', handleAskUserQuestion);
     cleanupAskUserQuestionAnswered = window.electronAPI.on('ai:askUserQuestionAnswered', handleAskUserQuestionResolved);
@@ -750,6 +1126,8 @@ export function initSessionStateListeners(): () => void {
     cleanupToolPermissionResolved = window.electronAPI.on('ai:toolPermissionResolved', handleToolPermissionResolved);
     cleanupGitCommitProposal = window.electronAPI.on('ai:gitCommitProposal', handleGitCommitProposal);
     cleanupGitCommitProposalResolved = window.electronAPI.on('ai:gitCommitProposalResolved', handleGitCommitProposalResolved);
+    cleanupRequestUserInput = window.electronAPI.on('ai:requestUserInput', handleRequestUserInput);
+    cleanupRequestUserInputResolved = window.electronAPI.on('ai:requestUserInputResolved', handleRequestUserInputResolved);
     cleanupNotificationClicked = window.electronAPI.on('notification-clicked', handleNotificationClicked);
     cleanupSyncReadState = window.electronAPI.on('sessions:sync-read-state', handleSyncReadState);
     cleanupSyncDraftInput = window.electronAPI.on('sessions:sync-draft-input', handleSyncDraftInput);
@@ -776,10 +1154,21 @@ export function initSessionStateListeners(): () => void {
 
     blitzAnalysisTriggered.clear();
 
+    if (processingReconcileInterval) {
+      clearInterval(processingReconcileInterval);
+      processingReconcileInterval = undefined;
+    }
+    if (reconcileDebounceTimer) {
+      clearTimeout(reconcileDebounceTimer);
+      reconcileDebounceTimer = undefined;
+    }
+
     window.electronAPI.sessionState?.removeStateChangeListener?.(handleStateChange);
     window.electronAPI.sessionState?.unsubscribe?.();
-    subscribedWorkspacePath = undefined;
+    activeWorkspacePathSnapshot = null;
+    lastSubscriptionKey = '';
     cleanupMessageLogged?.();
+    cleanupMessagesLoggedBatch?.();
     cleanupTitleUpdated?.();
     cleanupAskUserQuestion?.();
     cleanupAskUserQuestionAnswered?.();
@@ -790,10 +1179,13 @@ export function initSessionStateListeners(): () => void {
     cleanupToolPermissionResolved?.();
     cleanupGitCommitProposal?.();
     cleanupGitCommitProposalResolved?.();
+    cleanupRequestUserInput?.();
+    cleanupRequestUserInputResolved?.();
     cleanupNotificationClicked?.();
     cleanupSyncReadState?.();
     cleanupSyncDraftInput?.();
     cleanupTranscriptEvent?.();
+    cleanupTranscriptSessionReparsed?.();
     transcriptAccumulator.clear();
   };
 }

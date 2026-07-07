@@ -1,11 +1,12 @@
-import React from 'react';
+import React, { useState } from 'react';
 import { useAtomValue } from 'jotai';
 import { MaterialSymbol } from '@nimbalyst/runtime';
 import type { TrackerItemType } from '@nimbalyst/runtime';
-import { trackerItemCountByTypeAtom } from '@nimbalyst/runtime/plugins/TrackerPlugin';
+import { trackerItemCountByTypeAtom, trackerDataLoadedAtom } from '@nimbalyst/runtime/plugins/TrackerPlugin';
 import type { TrackerDataModel } from '@nimbalyst/runtime/plugins/TrackerPlugin/models';
 import type { TrackerFilterChip } from '../../store/atoms/trackers';
 import type { ViewMode } from './TrackerMainView';
+import type { SavedView } from './trackerSavedViews';
 import { WorkspaceSummaryHeader } from '../WorkspaceSummaryHeader';
 import { AlphaBadge } from '../common/AlphaBadge';
 
@@ -19,6 +20,14 @@ interface TrackerSidebarProps {
   onSelectType: (type: string | 'all') => void;
   onToggleFilter: (filter: TrackerFilterChip) => void;
   onViewModeChange: (mode: ViewMode) => void;
+  /** Saved views for this workspace (NIM-788). */
+  savedViews: SavedView[];
+  /** Apply a saved view's definition. */
+  onApplyView: (view: SavedView) => void;
+  /** Save the current view state under a name. */
+  onSaveView: (name: string) => void;
+  /** Delete a saved view by id. */
+  onDeleteView: (viewId: string) => void;
 }
 
 const FILTER_CHIPS: { id: TrackerFilterChip; label: string; icon: string }[] = [
@@ -31,7 +40,13 @@ const FILTER_CHIPS: { id: TrackerFilterChip; label: string; icon: string }[] = [
 
 /** Small component so each sidebar row subscribes to its own atom */
 function SidebarTypeCount({ type }: { type: TrackerItemType }) {
+  const loaded = useAtomValue(trackerDataLoadedAtom);
   const count = useAtomValue(trackerItemCountByTypeAtom(type));
+  // NIM-631: before the tracker atoms finish hydrating, the count map is empty,
+  // so populated types would flash "0" during a sync reconnect + renderer
+  // reload. Suppress the badge until hydration completes rather than showing a
+  // misleading zero.
+  if (!loaded) return null;
   return <>{count}</>;
 }
 
@@ -45,7 +60,22 @@ export const TrackerSidebar: React.FC<TrackerSidebarProps> = ({
   onSelectType,
   onToggleFilter,
   onViewModeChange,
+  savedViews,
+  onApplyView,
+  onSaveView,
+  onDeleteView,
 }) => {
+  const [savingView, setSavingView] = useState(false);
+  const [newViewName, setNewViewName] = useState('');
+
+  const commitSaveView = () => {
+    const name = newViewName.trim();
+    if (!name) return;
+    onSaveView(name);
+    setNewViewName('');
+    setSavingView(false);
+  };
+
   return (
     <div className="tracker-sidebar w-full h-full flex flex-col bg-nim-secondary overflow-hidden" data-testid="tracker-sidebar">
       {workspacePath && (
@@ -57,14 +87,27 @@ export const TrackerSidebar: React.FC<TrackerSidebarProps> = ({
               <div className="flex items-center rounded border border-nim overflow-hidden">
                   <button
                     className={`flex items-center justify-center w-7 h-6 transition-colors ${
+                      viewMode === 'list'
+                        ? 'bg-nim-active text-nim'
+                        : 'bg-nim-secondary text-nim-muted hover:text-nim'
+                    }`}
+                    onClick={() => onViewModeChange('list')}
+                    title="List view"
+                    data-testid="tracker-view-mode-list"
+                  >
+                    <MaterialSymbol icon="view_list" size={16} />
+                  </button>
+                  <button
+                    className={`flex items-center justify-center w-7 h-6 border-l border-nim transition-colors ${
                       viewMode === 'table'
                         ? 'bg-nim-active text-nim'
                         : 'bg-nim-secondary text-nim-muted hover:text-nim'
                     }`}
                     onClick={() => onViewModeChange('table')}
                     title="Table view"
+                    data-testid="tracker-view-mode-table"
                   >
-                    <MaterialSymbol icon="table_rows" size={16} />
+                    <MaterialSymbol icon="table_chart" size={16} />
                   </button>
                   <button
                     className={`relative flex items-center justify-center w-7 h-6 border-l border-nim transition-colors ${
@@ -74,8 +117,22 @@ export const TrackerSidebar: React.FC<TrackerSidebarProps> = ({
                     }`}
                     onClick={() => onViewModeChange('kanban')}
                     title="Kanban view (alpha)"
+                    data-testid="tracker-view-mode-kanban"
                   >
                     <MaterialSymbol icon="view_kanban" size={16} />
+                    <AlphaBadge size="dot" className="absolute -top-1 -right-1 pointer-events-none" />
+                  </button>
+                  <button
+                    className={`relative flex items-center justify-center w-7 h-6 border-l border-nim transition-colors ${
+                      viewMode === 'tag-board'
+                        ? 'bg-nim-active text-nim'
+                        : 'bg-nim-secondary text-nim-muted hover:text-nim'
+                    }`}
+                    onClick={() => onViewModeChange('tag-board')}
+                    title="Tag board view (alpha)"
+                    data-testid="tracker-view-mode-tag-board"
+                  >
+                    <MaterialSymbol icon="sell" size={16} />
                     <AlphaBadge size="dot" className="absolute -top-1 -right-1 pointer-events-none" />
                   </button>
                 </div>
@@ -120,6 +177,85 @@ export const TrackerSidebar: React.FC<TrackerSidebarProps> = ({
             >
               Clear filters
             </button>
+          )}
+        </div>
+
+        {/* Saved Views Section (NIM-788) */}
+        <div className="px-2 pt-2 pb-1 border-t border-nim mt-1" data-testid="tracker-saved-views">
+          <div className="flex items-center justify-between px-1 mb-1.5">
+            <span className="text-[10px] font-semibold text-nim-faint uppercase tracking-wider">
+              Saved Views
+            </span>
+            <button
+              className="flex items-center gap-0.5 text-[10px] text-nim-faint hover:text-nim transition-colors"
+              onClick={() => setSavingView((v) => !v)}
+              title="Save current view"
+              data-testid="tracker-saved-view-add"
+            >
+              <MaterialSymbol icon="add" size={13} />
+            </button>
+          </div>
+
+          {savingView && (
+            <div className="flex items-center gap-1 mb-1.5 px-1">
+              <input
+                autoFocus
+                type="text"
+                value={newViewName}
+                onChange={(e) => setNewViewName(e.target.value)}
+                onKeyDown={(e) => {
+                  e.stopPropagation();
+                  if (e.key === 'Enter') commitSaveView();
+                  if (e.key === 'Escape') { setSavingView(false); setNewViewName(''); }
+                }}
+                placeholder="View name..."
+                className="flex-1 min-w-0 px-2 py-1 text-[11px] bg-nim border border-nim rounded text-nim placeholder:text-nim-faint focus:outline-none focus:border-[var(--nim-primary)]"
+                data-testid="tracker-saved-view-name-input"
+              />
+              <button
+                className="px-1.5 py-1 text-[11px] text-white bg-[var(--nim-primary)] rounded hover:opacity-90 disabled:opacity-40"
+                onClick={commitSaveView}
+                disabled={!newViewName.trim()}
+                data-testid="tracker-saved-view-save"
+              >
+                Save
+              </button>
+            </div>
+          )}
+
+          {savedViews.length === 0 ? (
+            !savingView && (
+              <div className="px-1 text-[10px] text-nim-faint italic">
+                Save the current filters and layout as a reusable view.
+              </div>
+            )
+          ) : (
+            <div className="flex flex-col gap-0.5">
+              {savedViews.map((view) => (
+                <div
+                  key={view.id}
+                  className="group flex items-center gap-1 rounded-md hover:bg-nim-tertiary"
+                  data-testid="tracker-saved-view-item"
+                >
+                  <button
+                    className="flex-1 flex items-center gap-2 px-2 py-1.5 text-left text-[12px] text-nim-muted hover:text-nim min-w-0"
+                    onClick={() => onApplyView(view)}
+                    title={`Apply view: ${view.name}`}
+                  >
+                    <MaterialSymbol icon="bookmark" size={13} className="shrink-0" />
+                    <span className="flex-1 truncate">{view.name}</span>
+                  </button>
+                  <button
+                    className="opacity-0 group-hover:opacity-100 px-1.5 text-nim-faint hover:text-[#ef4444] transition-opacity"
+                    onClick={() => onDeleteView(view.id)}
+                    title="Delete view"
+                    data-testid="tracker-saved-view-delete"
+                  >
+                    <MaterialSymbol icon="close" size={13} />
+                  </button>
+                </div>
+              ))}
+            </div>
           )}
         </div>
 

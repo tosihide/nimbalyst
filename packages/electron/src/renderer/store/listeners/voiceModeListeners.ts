@@ -24,17 +24,20 @@ import {
   voiceLastReportedFileAtom,
   voiceListenStateAtom,
   voiceErrorAtom,
+  voiceReconnectingAtom,
+  voiceModePreviewAudioAtom,
   getVoiceAudioCallback,
   getVoiceInterruptCallback,
   getVoiceSubmitPromptCallback,
   getVoiceAgentTaskCompleteCallback,
   getVoiceStoppedCallback,
   getVoiceResponseDoneCallback,
+  getVoiceAudioActiveQuery,
   type VoiceTranscriptEntry,
   type VoiceTokenUsage,
 } from '../atoms/voiceModeState';
 import { voiceModeSettingsAtom, type VoiceModeSettings } from '../atoms/appSettings';
-import { activeSessionIdAtom, sessionRegistryAtom, sessionHasPendingInteractivePromptAtom, sessionPendingPromptsAtom, respondToPromptAtom } from '../atoms/sessions';
+import { activeSessionIdAtom, sessionRegistryAtom, sessionHasPendingInteractivePromptAtom, sessionPendingPromptsAtom, respondToPromptAtom, refreshSessionListAtom, reloadSessionDataAtom } from '../atoms/sessions';
 import { windowModeAtom } from '../atoms/windowMode';
 
 /**
@@ -61,7 +64,7 @@ export function onLinkedSessionChanged(callback: ((newSessionId: string) => void
 let _listenWindowTimer: ReturnType<typeof setTimeout> | null = null;
 
 function getListenWindowMs(): number {
-  return store.get(voiceModeSettingsAtom).listenWindowMs ?? 10000;
+  return store.get(voiceModeSettingsAtom).listenWindowMs ?? 15000;
 }
 
 function clearListenWindowTimer(): void {
@@ -83,6 +86,48 @@ function startListenWindowTimer(): void {
       sleepVoiceListening();
     }
   }, ms);
+}
+
+// =========================================================================
+// Post-Turn Listen Window
+// =========================================================================
+// When the assistant finishes a turn (token-usage), we want to start the
+// 15s listen window from the moment the user *stops hearing* the assistant,
+// not from when the server finished generating audio chunks. Long responses
+// stream chunks fast (~3s) but play back slowly (~30s), so starting the
+// timer at server-done used to expire it mid-playback and gate the mic.
+
+let _pendingPostTurnTimer = false;
+let _postTurnFallbackTimer: ReturnType<typeof setTimeout> | null = null;
+
+/** Wake from sleep if needed, start the 15s listen timer, fire ready cue. */
+function startListenWindowForPostTurn(): void {
+  const wokeFromSleep = store.get(voiceListenStateAtom) === 'sleeping';
+  if (wokeFromSleep) {
+    wakeVoiceListening(false);
+  }
+  startListenWindowTimer();
+  const responseDoneCb = getVoiceResponseDoneCallback();
+  if (responseDoneCb) responseDoneCb(wokeFromSleep);
+}
+
+function clearPostTurnPending(): void {
+  _pendingPostTurnTimer = false;
+  if (_postTurnFallbackTimer) {
+    clearTimeout(_postTurnFallbackTimer);
+    _postTurnFallbackTimer = null;
+  }
+}
+
+/**
+ * Called by AudioPlayback (via VoiceModeButton) when the assistant's audio
+ * queue has fully drained -- i.e. the user has actually finished hearing the
+ * agent. If we deferred the post-turn listen window earlier, fire it now.
+ */
+export function notifyVoiceAudioPlaybackDrained(): void {
+  if (!_pendingPostTurnTimer) return;
+  clearPostTurnPending();
+  startListenWindowForPostTurn();
 }
 
 /**
@@ -128,6 +173,35 @@ export function sleepVoiceListening(): void {
 
 
 /**
+ * Refresh the open transcript for the active voice DB session.
+ *
+ * Voice messages (speech turns, [system] diagnostics, and voiceToolCall
+ * entries) are written straight to ai_agent_messages via
+ * voice-mode:appendMessage. Unlike provider streaming, that path emits NO
+ * `transcript:event`, so the TranscriptStreamAccumulator never sees them and
+ * the open transcript wouldn't reflect new entries until the session is
+ * reloaded for some other reason. That's why voice tool calls (memory
+ * lookups, ask_coding_agent, etc.) "didn't show up" live even though they
+ * were persisted correctly and project fine on reload.
+ *
+ * Reloading from the DB re-runs the same canonical projection (VoiceRawParser
+ * -> tool_call_started/completed), so tool widgets and speech appear live.
+ * Debounced (trailing edge) so a started+completed tool-call burst that lands
+ * a few ms apart coalesces into a single reload that picks up both rows.
+ */
+let voiceTranscriptRefreshTimer: ReturnType<typeof setTimeout> | null = null;
+function scheduleVoiceTranscriptRefresh(): void {
+  if (voiceTranscriptRefreshTimer) return;
+  voiceTranscriptRefreshTimer = setTimeout(() => {
+    voiceTranscriptRefreshTimer = null;
+    const sessionId = store.get(voiceDbSessionIdAtom);
+    const workspacePath = store.get(voiceWorkspacePathAtom);
+    if (!sessionId || !workspacePath) return;
+    void store.set(reloadSessionDataAtom, { sessionId, workspacePath });
+  }, 250);
+}
+
+/**
  * Write a single transcript entry to the database.
  * Fire-and-forget -- errors are logged but don't block the UI.
  */
@@ -141,9 +215,11 @@ function writeTranscriptEntry(entry: VoiceTranscriptEntry): void {
     content: entry.text,
     entryId: entry.id,
     timestamp: entry.timestamp,
-  }).catch(error => {
-    console.error('[voiceModeListeners] Failed to write transcript entry:', error);
-  });
+  })
+    .then(scheduleVoiceTranscriptRefresh)
+    .catch(error => {
+      console.error('[voiceModeListeners] Failed to write transcript entry:', error);
+    });
 }
 
 /**
@@ -161,9 +237,57 @@ function writeDiagnosticEntry(message: string): void {
     content: `[system] ${message}`,
     entryId: `diag-${Date.now()}`,
     timestamp: Date.now(),
-  }).catch(error => {
-    console.error('[voiceModeListeners] Failed to write diagnostic entry:', error);
-  });
+  })
+    .then(scheduleVoiceTranscriptRefresh)
+    .catch(error => {
+      console.error('[voiceModeListeners] Failed to write diagnostic entry:', error);
+    });
+}
+
+/**
+ * A function/tool call event forwarded from the voice agent (main process).
+ * Mirrors VoiceToolCallEvent in RealtimeAPIClient.ts.
+ */
+type VoiceToolCallEvent =
+  | {
+      phase: 'started';
+      callId: string;
+      name: string;
+      displayName: string;
+      args: Record<string, unknown>;
+    }
+  | {
+      phase: 'completed';
+      callId: string;
+      name: string;
+      displayName: string;
+      success: boolean;
+      summary?: string;
+    };
+
+/**
+ * Write a voice-agent tool call to the session transcript. Persisted as a JSON
+ * payload (direction 'output') that the VoiceRawParser turns into a real
+ * tool_call event so it renders with the standard tool widget. Without this,
+ * voice tool calls (memory lookups, ask_coding_agent, etc.) are invisible.
+ */
+function writeToolCallEntry(event: VoiceToolCallEvent): void {
+  const dbSessionId = store.get(voiceDbSessionIdAtom);
+  if (!dbSessionId) return;
+
+  const content = JSON.stringify({ kind: 'voiceToolCall', ...event });
+
+  window.electronAPI.invoke('voice-mode:appendMessage', {
+    sessionId: dbSessionId,
+    direction: 'output',
+    content,
+    entryId: `tool-${event.phase}-${event.callId}`,
+    timestamp: Date.now(),
+  })
+    .then(scheduleVoiceTranscriptRefresh)
+    .catch(error => {
+      console.error('[voiceModeListeners] Failed to write tool-call entry:', error);
+    });
 }
 
 /**
@@ -193,6 +317,7 @@ async function updateSessionMetadata(tokenUsage?: VoiceTokenUsage | null): Promi
  */
 function resetVoiceAtoms(): void {
   clearListenWindowTimer();
+  clearPostTurnPending();
   store.set(voiceListenStateAtom, 'off');
   store.set(voiceActiveSessionIdAtom, null);
   store.set(voiceTranscriptEntriesAtom, []);
@@ -203,6 +328,7 @@ function resetVoiceAtoms(): void {
   store.set(voiceDbSessionIdAtom, null);
   store.set(voiceLastReportedFileAtom, null);
   store.set(voiceErrorAtom, null);
+  store.set(voiceReconnectingAtom, false);
 }
 
 /**
@@ -224,11 +350,78 @@ function formatPromptForVoice(prompt: { promptType: string; promptId: string; da
   }
 
   if (prompt.promptType === 'git_commit_proposal_request') {
-    const message = prompt.data?.commitMessage || '';
-    return `The coding agent wants to commit changes. Commit message: "${message}". Say "approve" to commit or "reject" to cancel.`;
+    // Multi-line commit messages are too long for voice -- read the title only.
+    // Body paragraphs (after the first blank line) belong in the widget, not aloud.
+    const fullMessage: string = prompt.data?.commitMessage || '';
+    const titleLine = fullMessage.split('\n')[0]?.trim() || '';
+    const files = Array.isArray(prompt.data?.filesToStage) ? prompt.data.filesToStage : [];
+    const fileCount = files.length;
+    const fileSummary = fileCount === 0
+      ? ''
+      : ` Across ${fileCount} file${fileCount === 1 ? '' : 's'}.`;
+    return `Commit proposal:${fileSummary} Commit message: "${titleLine}". Say "approve" to commit or "reject" to cancel.`;
+  }
+
+  if (prompt.promptType === 'request_user_input_request') {
+    const args = prompt.data?.args || {};
+    const fields = Array.isArray(args.fields) ? args.fields : [];
+    const parts: string[] = [];
+    if (args.title) parts.push(args.title);
+    if (args.intro) parts.push(args.intro);
+    for (const f of fields) {
+      switch (f.type) {
+        case 'multiSelect': {
+          const items = (f.items || []).map((i: any) => i.title).join(', ');
+          parts.push(`Pick from: ${items}`);
+          break;
+        }
+        case 'singleSelect': {
+          const opts = (f.options || []).map((o: any) => o.label).join(', ');
+          parts.push(`Choose one: ${opts}`);
+          break;
+        }
+        case 'reorder': {
+          const items = (f.items || []).map((i: any) => i.title).join(', ');
+          parts.push(`Confirm or reorder: ${items}`);
+          break;
+        }
+        case 'editText':
+          parts.push(f.label || 'Edit text');
+          break;
+        case 'confirm':
+          parts.push(`Yes or no: ${f.label}`);
+          break;
+      }
+    }
+    return parts.join('. ') || 'The coding agent needs your input.';
   }
 
   return 'The coding agent needs your input.';
+}
+
+/**
+ * Compute whether the voice agent can handle this prompt or should defer to
+ * the screen. Computed in the renderer (NOT trusted from the agent) to avoid
+ * a confused agent forcing voice into reading out a 50-item drag-to-order.
+ *
+ * Rules:
+ *  - reorder fields > 6 items defer
+ *  - editText with initialText > 240 chars defer
+ *  - everything else: voice-friendly
+ */
+function computeVoiceFriendly(prompt: { promptType: string; data: any }): boolean {
+  if (prompt.promptType !== 'request_user_input_request') return true;
+  const args = prompt.data?.args || {};
+  const fields = Array.isArray(args.fields) ? args.fields : [];
+  for (const f of fields) {
+    if (f.type === 'reorder' && Array.isArray(f.items) && f.items.length > 6) {
+      return false;
+    }
+    if (f.type === 'editText' && typeof f.initialText === 'string' && f.initialText.length > 240) {
+      return false;
+    }
+  }
+  return true;
 }
 
 /**
@@ -250,6 +443,28 @@ export function initVoiceModeListeners(): () => void {
   cleanups.push(
     window.electronAPI.on('voice-mode:settings-changed', (settings: VoiceModeSettings) => {
       store.set(voiceModeSettingsAtom, settings);
+    })
+  );
+
+  // =========================================================================
+  // Preview Audio (response to voice-mode:preview-voice invoke)
+  // =========================================================================
+  // The Settings > Voice Mode panel triggers a preview via invoke; main
+  // streams the audio back via this event. We bump a request atom so the
+  // panel can play it without subscribing to IPC directly.
+  let previewAudioVersion = 0;
+  cleanups.push(
+    window.electronAPI.on('voice-mode:preview-audio', (payload: {
+      voiceId: string;
+      audioBase64: string;
+      format: string;
+    }) => {
+      if (!payload?.audioBase64) return;
+      previewAudioVersion += 1;
+      store.set(voiceModePreviewAudioAtom, {
+        version: previewAudioVersion,
+        payload,
+      });
     })
   );
 
@@ -294,6 +509,12 @@ export function initVoiceModeListeners(): () => void {
       // console.log('[voiceModeListeners] speech_started -> pausing listen window timer');
       clearListenWindowTimer();
 
+      // Discard any pending post-turn timer: the user is now driving the
+      // turn. If we left it pending, the AudioPlayback.stop() below would
+      // synthesize a drain via onended-after-stop and we'd start a 15s
+      // window mid-utterance.
+      clearPostTurnPending();
+
       // Stop audio playback (user is interrupting the assistant)
       const cb = getVoiceInterruptCallback();
       if (cb) cb();
@@ -334,6 +555,77 @@ export function initVoiceModeListeners(): () => void {
   );
 
   // =========================================================================
+  // Propose Commit (voice agent triggered the "Commit with AI" feature)
+  // =========================================================================
+  // Mirrors handleSmartCommit() in GitOperationsPanel.tsx exactly: pre-fetch
+  // the file list via git:get-commit-context, build the message that
+  // CommitRequestCard recognizes (so the "Requesting commit proposal"
+  // widget appears in the transcript), and dispatch via ai:sendMessage so
+  // it lands in the session as a regular user message. The coding agent
+  // then invokes developer_git_commit_proposal, and the resulting widget +
+  // git_commit_proposal_request interactive prompt flow back through the
+  // existing forwarding pipeline.
+  cleanups.push(
+    window.electronAPI.on('voice-mode:propose-commit', async (payload: {
+      sessionId: string;
+      workspacePath: string | null;
+    }) => {
+      if (!isVoiceActive()) return;
+      const { sessionId, workspacePath } = payload;
+      if (!sessionId || !workspacePath) {
+        console.warn('[voiceModeListeners] propose-commit missing sessionId or workspacePath');
+        return;
+      }
+
+      try {
+        const commitContext = await window.electronAPI.invoke(
+          'git:get-commit-context',
+          workspacePath,
+          sessionId,
+          undefined,
+        ) as {
+          success: boolean;
+          files: Array<{ path: string; status: 'added' | 'modified' | 'deleted' }>;
+          scenario: 'single' | 'workstream';
+          error?: string;
+        };
+
+        let message = 'Use the developer_git_commit_proposal tool to create a commit.';
+
+        if (commitContext.success && commitContext.files.length > 0) {
+          const fileList = commitContext.files
+            .map(f => `- ${f.path} (${f.status})`)
+            .join('\n');
+          message += `\n\nHere are the files edited in this session that have uncommitted changes:\n${fileList}`;
+          message += '\n\nThis list covers files edited directly. If you ALSO ran commands this session that change files as a side effect ' +
+            '(e.g. npm install rewriting package-lock.json, a build/codegen step, license regeneration), include those changed files too -- ' +
+            'check git status for them. If you ran no such commands, the list above is complete; do not go looking. ' +
+            'Either way, do NOT add unrelated uncommitted changes -- other concurrent sessions may have their own work in this repo.';
+          message += '\n\nThen call developer_git_commit_proposal with the file list.';
+          message += '\nDo NOT call get_session_edited_files or get_workstream_edited_files -- the edited-file data is already provided above.';
+        } else if (commitContext.success && commitContext.files.length === 0) {
+          message += '\n\nNo session-edited files have uncommitted changes. Check git status to see if there are any other uncommitted changes to commit.';
+        } else {
+          message += '\n\nFirst call get_session_edited_files to find all files edited, ' +
+            'then cross-reference with git status to include all session-edited files that have uncommitted changes.';
+        }
+
+        const docContext = {
+          filePath: undefined,
+          content: undefined,
+          fileType: undefined,
+          attachments: undefined,
+          mode: 'agent',
+          inputType: 'user' as const,
+        };
+        await window.electronAPI.invoke('ai:sendMessage', message, docContext, sessionId, workspacePath);
+      } catch (error) {
+        console.error('[voiceModeListeners] propose-commit failed:', error);
+      }
+    })
+  );
+
+  // =========================================================================
   // Error (quota exceeded, rate limits, etc.)
   // =========================================================================
   cleanups.push(
@@ -342,7 +634,31 @@ export function initVoiceModeListeners(): () => void {
       error: { type: string; message: string };
     }) => {
       if (!isVoiceActive()) return;
+      // Retries exhausted -- clear the transient reconnect state and surface the
+      // hard error.
+      store.set(voiceReconnectingAtom, false);
       store.set(voiceErrorAtom, payload.error);
+    })
+  );
+
+  // =========================================================================
+  // Reconnect (transient socket drop -> backoff reconnect)
+  // =========================================================================
+  cleanups.push(
+    window.electronAPI.on('voice-mode:reconnecting', (_payload: {
+      sessionId: string;
+      attempt: number;
+    }) => {
+      if (!isVoiceActive()) return;
+      store.set(voiceReconnectingAtom, true);
+    })
+  );
+  cleanups.push(
+    window.electronAPI.on('voice-mode:reconnected', (_payload: {
+      sessionId: string;
+    }) => {
+      if (!isVoiceActive()) return;
+      store.set(voiceReconnectingAtom, false);
     })
   );
 
@@ -453,6 +769,26 @@ export function initVoiceModeListeners(): () => void {
   );
 
   // =========================================================================
+  // Tool Calls -- persist voice-agent tool calls so they're visible in the
+  // session transcript (rendered via VoiceRawParser as real tool widgets).
+  // =========================================================================
+  cleanups.push(
+    window.electronAPI.on('voice-mode:tool-call', (payload: {
+      sessionId: string;
+      event: VoiceToolCallEvent;
+    }) => {
+      if (!isVoiceActive()) return;
+      // Flush any in-progress assistant entry first so transcript ordering is
+      // preserved (the tool call happened before the next spoken reply).
+      if (pendingAssistantEntry) {
+        writeTranscriptEntry(pendingAssistantEntry);
+        pendingAssistantEntry = null;
+      }
+      writeToolCallEntry(payload.event);
+    })
+  );
+
+  // =========================================================================
   // Token Usage -- also flush pending assistant entry
   // =========================================================================
   cleanups.push(
@@ -470,13 +806,30 @@ export function initVoiceModeListeners(): () => void {
         pendingAssistantEntry = null;
       }
 
-      // Assistant finished responding. Start the idle countdown from NOW.
-      // console.log('[voiceModeListeners] token-usage -> starting listen window timer');
-      startListenWindowTimer();
+      // Assistant finished a turn server-side. Decide when to start the 15s
+      // listen window: if audio is still playing in the user's speakers,
+      // wait for the playback queue to drain. Otherwise (function-call-only
+      // turn or text-only response), start it now.
+      const audioActiveQuery = getVoiceAudioActiveQuery();
+      const audioStillPlaying = audioActiveQuery ? audioActiveQuery() : false;
 
-      // Notify VoiceModeButton to unmute mic (assistant done speaking)
-      const responseDoneCb = getVoiceResponseDoneCallback();
-      if (responseDoneCb) responseDoneCb();
+      if (audioStillPlaying) {
+        // Defer until AudioPlayback fires onDrained (then notifyVoiceAudioPlaybackDrained).
+        _pendingPostTurnTimer = true;
+        // Fallback: if the drain notification never arrives (e.g. AudioPlayback
+        // is destroyed or the callback wiring breaks), start the timer after a
+        // generous max-playback duration so the mic doesn't stay open forever.
+        if (_postTurnFallbackTimer) clearTimeout(_postTurnFallbackTimer);
+        _postTurnFallbackTimer = setTimeout(() => {
+          if (!_pendingPostTurnTimer) return;
+          clearPostTurnPending();
+          startListenWindowForPostTurn();
+        }, 60000);
+      } else {
+        // No audio playing -- start the timer immediately.
+        clearPostTurnPending();
+        startListenWindowForPostTurn();
+      }
     })
   );
 
@@ -572,6 +925,88 @@ export function initVoiceModeListeners(): () => void {
           response = { ...response, answers: rebuiltAnswers };
           // console.log('[voiceModeListeners] Rebuilt voice answer with question key:', questions[0].question);
         }
+      }
+
+      // GitCommitProposal: the widget click flow invokes git:commit and then
+      // sends messages:respond-to-prompt with { action: 'committed' | 'cancelled' }.
+      // The voice agent's "approve"/"reject" answer arrives here as
+      // { approved: true|false } -- mirror the widget flow so the voice path
+      // produces the same end state.
+      if (payload.promptType === 'git_commit_proposal_request') {
+        const approved = response?.approved === true;
+        const pendingPrompts = store.get(sessionPendingPromptsAtom(payload.sessionId));
+        const prompt = pendingPrompts.find(p => p.promptId === payload.promptId);
+        const data = prompt?.data || {};
+        const filesToStage: Array<string | { path: string }> = Array.isArray(data.filesToStage)
+          ? data.filesToStage
+          : [];
+        const filePaths = filesToStage.map(f => (typeof f === 'string' ? f : f.path));
+        const commitMessage: string = data.commitMessage || '';
+        const commitWorkspacePath: string =
+          data.workspacePath || store.get(voiceWorkspacePathAtom) || '';
+
+        if (approved && commitWorkspacePath && filePaths.length > 0 && commitMessage) {
+          // Run the actual commit, then forward the result so the durable
+          // prompt is resolved with the same shape the widget produces.
+          window.electronAPI
+            .invoke('git:commit', commitWorkspacePath, commitMessage, filePaths)
+            .then((result: any) => {
+              window.electronAPI.invoke('messages:respond-to-prompt', {
+                sessionId: payload.sessionId,
+                promptId: payload.promptId,
+                promptType: 'git_commit_proposal_request',
+                response: {
+                  action: result?.success ? 'committed' : 'cancelled',
+                  commitHash: result?.commitHash,
+                  commitDate: result?.commitDate,
+                  error: result?.error,
+                  filesCommitted: result?.success ? filePaths : undefined,
+                  commitMessage: result?.success ? commitMessage : undefined,
+                },
+                respondedBy: 'desktop',
+              });
+            })
+            .catch((error: unknown) => {
+              window.electronAPI.invoke('messages:respond-to-prompt', {
+                sessionId: payload.sessionId,
+                promptId: payload.promptId,
+                promptType: 'git_commit_proposal_request',
+                response: {
+                  action: 'cancelled',
+                  error: error instanceof Error ? error.message : String(error),
+                },
+                respondedBy: 'desktop',
+              });
+            });
+        } else {
+          // Reject path -- or missing data, can't safely commit. Cancel cleanly.
+          window.electronAPI.invoke('messages:respond-to-prompt', {
+            sessionId: payload.sessionId,
+            promptId: payload.promptId,
+            promptType: 'git_commit_proposal_request',
+            response: { action: 'cancelled' },
+            respondedBy: 'desktop',
+          });
+        }
+        return;
+      }
+
+      // For RequestUserInput: the voice agent emits an answer keyed by
+      // field id. Persist via messages:respond-to-prompt directly so the
+      // response shape matches the durable contract (answers + cancelled).
+      if (payload.promptType === 'request_user_input_request') {
+        const answers = response?.answers && typeof response.answers === 'object'
+          ? response.answers
+          : {};
+        const cancelled = response?.cancelled === true;
+        window.electronAPI.invoke('messages:respond-to-prompt', {
+          sessionId: payload.sessionId,
+          promptId: payload.promptId,
+          promptType: 'request_user_input_request',
+          response: { answers, cancelled },
+          respondedBy: 'desktop',
+        });
+        return;
       }
 
       // Use the respondToPromptAtom to persist and resolve the prompt
@@ -711,17 +1146,20 @@ export function initVoiceModeListeners(): () => void {
       // Forward the prompt content to the voice agent so it can speak it
       lastForwardedPromptId = latestPrompt.promptId;
       const description = formatPromptForVoice(latestPrompt);
+      const voiceFriendly = computeVoiceFriendly(latestPrompt);
       // console.log('[voiceModeListeners] Sending interactive-prompt IPC:', {
       //   sessionId: voiceSessionId,
       //   promptId: latestPrompt.promptId,
       //   promptType: latestPrompt.promptType,
       //   descriptionLength: description.length,
+      //   voiceFriendly,
       // });
       window.electronAPI.send('voice-mode:interactive-prompt', {
         sessionId: voiceSessionId,
         promptId: latestPrompt.promptId,
         promptType: latestPrompt.promptType,
         description,
+        voiceFriendly,
       });
     });
   }
@@ -770,7 +1208,7 @@ export function initVoiceModeListeners(): () => void {
 }
 
 /** How long before a voice session is considered "expired" and a new one is created */
-const VOICE_SESSION_TIMEOUT_MS = 10 * 60 * 1000; // 10 minutes
+const VOICE_SESSION_TIMEOUT_MS = 30 * 60 * 1000; // 30 minutes
 
 /**
  * Set the active voice session ID and create or resume the DB session row.
@@ -828,6 +1266,11 @@ export async function setVoiceActiveSession(sessionId: string, workspacePath?: s
     id: dbSessionId,
     workspacePath: wp,
     linkedSessionId: sessionId,
+  }).then(() => {
+    // Refresh the session-history list so the new voice session appears
+    // immediately instead of only after a manual refresh. The DB row exists
+    // now; re-query the registry from the database.
+    void store.set(refreshSessionListAtom);
   }).catch(error => {
     console.error('[voiceModeListeners] Failed to create voice session in DB:', error);
   });

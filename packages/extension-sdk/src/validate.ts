@@ -3,17 +3,12 @@
  */
 import * as fs from 'fs';
 import * as path from 'path';
-
-export interface ValidationResult {
-  /** Whether the bundle passed validation */
-  valid: boolean;
-
-  /** Critical errors that will cause runtime failures */
-  errors: string[];
-
-  /** Warnings that may cause issues */
-  warnings: string[];
-}
+import {
+  validateAgentProviders,
+  validateBackendModules,
+} from './manifestValidation.js';
+import type { ValidationResult } from './validationTypes.js';
+export type { ValidationResult } from './validationTypes.js';
 
 /**
  * Validates an extension bundle for common issues.
@@ -137,6 +132,138 @@ export async function validateExtensionBundle(
           warnings.push(
             `manifest.json "styles" points to ${manifest.styles} but file does not exist`
           );
+        }
+      }
+
+      // Validate backendModules if present. These run outside the renderer
+      // under a host-managed permission system; malformed declarations would
+      // either fail to load at runtime or, worse, declare unknown permission
+      // ids the consent prompt can't render. Catch both at build time.
+      const backendModulesIssues = validateBackendModules(
+        manifest?.contributions?.backendModules
+      );
+      for (const issue of backendModulesIssues) {
+        errors.push(issue.message);
+      }
+
+      // Also check the declared entry files exist on disk.
+      if (Array.isArray(manifest?.contributions?.backendModules)) {
+        for (const module of manifest.contributions.backendModules as Array<Record<string, unknown>>) {
+          if (typeof module?.entry === 'string') {
+            const entryPath = path.join(path.dirname(manifestPath), module.entry);
+            if (!fs.existsSync(entryPath)) {
+              errors.push(
+                `backendModules[${module.id ?? '?'}].entry points to ${module.entry} but file does not exist`
+              );
+            }
+          }
+        }
+      }
+
+      // Validate aiAgentProviders contributions: id/name/backendModuleId
+      // shape, uniqueness, model fields, toolFileLinks keys, and provider
+      // count cap. Cross-references contributions.backendModules so a typo
+      // in backendModuleId fails the build instead of erroring at runtime.
+      const agentProviderIssues = validateAgentProviders(
+        manifest?.contributions?.aiAgentProviders,
+        manifest?.contributions?.backendModules
+      );
+      for (const issue of agentProviderIssues) {
+        if (issue.severity === 'warning') {
+          warnings.push(issue.message);
+        } else {
+          errors.push(issue.message);
+        }
+      }
+
+      // For each agent provider, verify that the backend module it points at
+      // actually exports a usable entry point in the built bundle. The
+      // privileged host will either call `activate(context)` (the generic
+      // BackendModule contract) or `createAgentProvider(context)` (the
+      // agent-provider factory) -- catching missing exports here keeps a
+      // broken contribution from reaching the consent prompt.
+      if (Array.isArray(manifest?.contributions?.aiAgentProviders)) {
+        // Build a quick lookup so the per-provider check below can find the
+        // corresponding backend-module entry path without re-scanning the
+        // array each time.
+        const moduleEntries = new Map<string, string>();
+        if (Array.isArray(manifest?.contributions?.backendModules)) {
+          for (const moduleRaw of manifest.contributions.backendModules as Array<Record<string, unknown>>) {
+            const id = moduleRaw?.id;
+            const entry = moduleRaw?.entry;
+            if (typeof id === 'string' && typeof entry === 'string') {
+              moduleEntries.set(id, entry);
+            }
+          }
+        }
+
+        for (const providerRaw of manifest.contributions.aiAgentProviders as Array<Record<string, unknown>>) {
+          const providerId =
+            typeof providerRaw?.id === 'string' ? providerRaw.id : '?';
+          const backendModuleId =
+            typeof providerRaw?.backendModuleId === 'string'
+              ? providerRaw.backendModuleId
+              : undefined;
+          if (!backendModuleId) {
+            // Already reported by validateAgentProviders above; don't
+            // duplicate the error here.
+            continue;
+          }
+          const entryRel = moduleEntries.get(backendModuleId);
+          if (!entryRel) {
+            // Cross-reference error already reported by
+            // validateAgentProviders; skip the bundle scan.
+            continue;
+          }
+          const entryAbs = path.join(path.dirname(manifestPath), entryRel);
+          if (!fs.existsSync(entryAbs)) {
+            // The missing-file error is already raised by the backendModules
+            // entry check above; don't pile on with a confusingly worded
+            // duplicate. Skip the export scan.
+            continue;
+          }
+          // We deliberately do a textual scan rather than executing the
+          // module. The backend module is meant to run inside a privileged
+          // worker; loading it inside the build script could trigger side
+          // effects (open ports, spawn processes, write disk) that have no
+          // business firing during `vite build`. A string check for the
+          // known export shapes is enough to catch typos and forgotten
+          // exports, which is the failure mode users actually hit.
+          let entrySource: string;
+          try {
+            entrySource = fs.readFileSync(entryAbs, 'utf8');
+          } catch (readErr) {
+            errors.push(
+              `aiAgentProviders[${providerId}].backendModuleId "${backendModuleId}" ` +
+                `points at entry ${entryRel} which exists but could not be read (${String(readErr)}). ` +
+                'The validator needs to scan the entry for an activate / createAgentProvider export.'
+            );
+            continue;
+          }
+          // Look for either a top-level `export function activate` /
+          // `export const activate` / `export { activate }`, or the same
+          // shapes for `createAgentProvider`. Bundlers normalize these in
+          // varied ways; the union of these patterns covers Vite, esbuild,
+          // and tsc output. We do NOT match `exports.activate =` because
+          // backend modules ship as ESM; CJS output would have been flagged
+          // by the `require(` check earlier in this function anyway.
+          const exportPatterns = [
+            /export\s+(?:async\s+)?function\s+activate\b/,
+            /export\s+(?:const|let|var)\s+activate\b/,
+            /export\s*\{[^}]*\bactivate\b[^}]*\}/,
+            /export\s+(?:async\s+)?function\s+createAgentProvider\b/,
+            /export\s+(?:const|let|var)\s+createAgentProvider\b/,
+            /export\s*\{[^}]*\bcreateAgentProvider\b[^}]*\}/,
+          ];
+          const hasExport = exportPatterns.some((p) => p.test(entrySource));
+          if (!hasExport) {
+            errors.push(
+              `aiAgentProviders[${providerId}].backendModuleId "${backendModuleId}" ` +
+                `resolves to ${entryRel}, but the entry file does not appear to export ` +
+                'an `activate` or `createAgentProvider` function. The privileged host calls one ' +
+                'of these to bring the provider online.'
+            );
+          }
         }
       }
     } catch (e) {

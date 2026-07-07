@@ -2,6 +2,7 @@ import { BrowserWindow } from 'electron';
 import { safeHandle } from '../utils/ipcRegistry';
 import { logger } from '../utils/logger';
 import { getWindowId, windowStates } from '../window/WindowManager';
+import { clearGitStatusCache } from '../ipc/GitStatusHandlers';
 import { optimizedWorkspaceWatcher } from './OptimizedWorkspaceWatcher';
 import { gitRefWatcher } from './GitRefWatcher';
 import * as workspaceEventBus from './WorkspaceEventBus';
@@ -27,6 +28,16 @@ function bucketFileCount(count: number): string {
     if (count <= 100) return '51-100';
     return '100+';
 }
+
+workspaceEventBus.setGitignoreChangeHandler((workspacePath: string) => {
+    clearGitStatusCache(workspacePath);
+
+    for (const window of BrowserWindow.getAllWindows()) {
+        if (!window.isDestroyed()) {
+            window.webContents.send('git:status-changed', { workspacePath });
+        }
+    }
+});
 
 // Set up IPC handlers for folder expand/collapse events
 export function registerWorkspaceWatcherHandlers() {
@@ -104,19 +115,27 @@ export function startWorkspaceWatcher(window: BrowserWindow, workspacePath: stri
 
 // Stop watching a workspace
 export function stopWorkspaceWatcher(windowId: number) {
-    // Stop project file sync for this workspace if it was the last window using it
+    // Stop project file sync for any workspace this window referenced
+    // (primary or rail-warm additional paths) when no other window still
+    // references it.
     const state = windowStates.get(windowId);
-    if (state?.workspacePath) {
-        // Check if any other windows use this workspace
-        let otherWindowUsesWorkspace = false;
-        for (const [otherId, otherState] of windowStates) {
-            if (otherId !== windowId && otherState.workspacePath === state.workspacePath) {
-                otherWindowUsesWorkspace = true;
-                break;
+    if (state) {
+        const referencedPaths = new Set<string>();
+        if (state.workspacePath) referencedPaths.add(state.workspacePath);
+        state.additionalWorkspacePaths?.forEach((p) => referencedPaths.add(p));
+
+        for (const path of referencedPaths) {
+            let otherWindowUsesWorkspace = false;
+            for (const [otherId, otherState] of windowStates) {
+                if (otherId === windowId) continue;
+                if (otherState.workspacePath === path || otherState.additionalWorkspacePaths?.includes(path)) {
+                    otherWindowUsesWorkspace = true;
+                    break;
+                }
             }
-        }
-        if (!otherWindowUsesWorkspace) {
-            stopProjectFileSync(state.workspacePath);
+            if (!otherWindowUsesWorkspace) {
+                stopProjectFileSync(path);
+            }
         }
     }
 
@@ -227,11 +246,9 @@ export async function startProjectFileSync(workspacePath: string): Promise<void>
     },
     onUnlink: (filePath) => {
       if (!filePath.endsWith('.md')) return;
-      // Need to look up syncId for this file -- but file is already deleted
-      // getSyncId reads from disk, so for deleted files we can't get it.
-      // The sync service tracks syncId -> filePath in its state map.
-      // For now, deletions are handled by the next sync sweep.
-      // TODO: Track filePath -> syncId mapping in ProjectFileSyncService for deletion
+      // Skip deletes the sync service itself just performed (remote delete echo)
+      if (service.isRecentlyWrittenFromRemote(filePath)) return;
+      service.handleFileDeletedByPath(filePath, workspacePath, projectId);
     },
   });
 
@@ -241,6 +258,28 @@ export async function startProjectFileSync(workspacePath: string): Promise<void>
   });
 
   // logger.main.info(`[ProjectFileSync] Started sync for ${path.basename(workspacePath)} (projectId: ${projectId.slice(0, 8)}...)`);
+}
+
+/**
+ * Push a newly created/saved markdown document to project sync immediately,
+ * bypassing the file watcher. Called when the app itself writes a document
+ * (e.g. the createDocument AI tool) so a new design doc syncs to mobile right
+ * away rather than waiting on a best-effort OS watcher event.
+ *
+ * No-op if the workspace isn't an active doc-sync subscriber, so the gating
+ * (alpha channel + per-project opt-in) established in startProjectFileSync
+ * still holds.
+ */
+export function pushNewDocumentToSync(filePath: string, workspacePath: string): void {
+  if (!filePath.endsWith('.md')) return;
+  if (!projectSyncSubscriptions.has(workspacePath)) return;
+
+  const projectId = hashProjectId(workspacePath);
+  getProjectFileSyncService()
+    .pushLocalFileNow(filePath, workspacePath, projectId)
+    .catch(err => {
+      logger.main.error('[ProjectFileSync] pushNewDocumentToSync failed:', err);
+    });
 }
 
 /**
@@ -254,4 +293,32 @@ function stopProjectFileSync(workspacePath: string): void {
   projectSyncSubscriptions.delete(workspacePath);
 
   getProjectFileSyncService().disconnectProject(hashProjectId(workspacePath));
+}
+
+/**
+ * Stop ALL project file sync subscriptions.
+ *
+ * Must be called whenever sync is torn down (SyncManager.shutdownSync), not
+ * just at window close: a sync reinitialize (any sync:set-config) creates a
+ * new provider with no room connections, and startProjectFileSync would
+ * otherwise early-return on the stale subscription entry and never reconnect
+ * the project — leaving every later save queued to a room that never opens.
+ */
+export function stopAllProjectFileSync(): void {
+  for (const workspacePath of [...projectSyncSubscriptions.keys()]) {
+    stopProjectFileSync(workspacePath);
+  }
+}
+
+/**
+ * Doc sync status for a workspace, for settings-UI feedback on the Docs toggle.
+ */
+export function getDocSyncStatusForWorkspace(workspacePath: string): {
+  subscribed: boolean;
+  connected: boolean;
+  fileCount: number;
+} {
+  const subscribed = projectSyncSubscriptions.has(workspacePath);
+  const stats = getProjectFileSyncService().getProjectStats(hashProjectId(workspacePath));
+  return { subscribed, ...stats };
 }

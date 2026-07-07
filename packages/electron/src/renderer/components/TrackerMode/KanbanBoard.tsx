@@ -3,8 +3,8 @@ import { useFloating, offset, flip, shift, FloatingPortal } from '@floating-ui/r
 import { MaterialSymbol } from '@nimbalyst/runtime';
 import type { TrackerRecord } from '@nimbalyst/runtime/core/TrackerRecord';
 import type { TrackerItemType } from '@nimbalyst/runtime/plugins/TrackerPlugin';
-import { globalRegistry, getRoleField } from '@nimbalyst/runtime/plugins/TrackerPlugin/models';
-import { getRecordTitle, getRecordStatus, getRecordPriority, getRecordSortOrder, getStatusOptions, getFieldByRole } from '@nimbalyst/runtime/plugins/TrackerPlugin/trackerRecordAccessors';
+import { globalRegistry } from '@nimbalyst/runtime/plugins/TrackerPlugin/models';
+import { getRecordTitle, getRecordStatus, getRecordPriority, getRecordSortOrder, getRecordExternalKey, getFieldByRole, buildKanbanStatusColumns, resolveRoleFieldName } from '@nimbalyst/runtime/plugins/TrackerPlugin/trackerRecordAccessors';
 import { generateKeyBetween } from '@nimbalyst/runtime/utils/fractionalIndex';
 import { UserAvatar } from '@nimbalyst/runtime/plugins/TrackerPlugin/components/UserAvatar';
 
@@ -75,6 +75,10 @@ interface KanbanBoardProps {
   onArchiveItems?: (itemIds: string[], archive: boolean) => void;
   /** Callback for bulk/single delete action */
   onDeleteItems?: (itemIds: string[]) => void;
+  /** Copy a shareable deep link for the given tracker item. Only shown when
+   *  exactly one item is selected. Callers omit this when the workspace
+   *  has no team configured. */
+  onCopyDeepLink?: (itemId: string) => void;
 }
 
 const STATUS_COLORS: Record<string, string> = {
@@ -103,52 +107,6 @@ const TYPE_COLORS: Record<string, string> = {
   feature: '#10b981',
 };
 
-/**
- * Get status columns for the kanban board.
- * Starts with model-defined statuses, then appends any extra statuses
- * found in the actual items so nothing silently disappears.
- */
-function getStatusColumns(filterType: TrackerItemType | 'all', items: TrackerRecord[]): { value: string; label: string }[] {
-  // Collect model-defined columns using the workflowStatus role
-  const modelColumns: { value: string; label: string }[] = [];
-  const seen = new Set<string>();
-
-  if (filterType !== 'all') {
-    const options = getStatusOptions(filterType);
-    for (const o of options) {
-      if (!seen.has(o.value)) {
-        seen.add(o.value);
-        modelColumns.push({ value: o.value, label: o.label });
-      }
-    }
-  }
-
-  // If no model columns found, use sensible defaults
-  if (modelColumns.length === 0) {
-    for (const col of [
-      { value: 'to-do', label: 'To Do' },
-      { value: 'in-progress', label: 'In Progress' },
-      { value: 'in-review', label: 'In Review' },
-      { value: 'done', label: 'Done' },
-    ]) {
-      seen.add(col.value);
-      modelColumns.push(col);
-    }
-  }
-
-  // Scan actual items for statuses not covered by the model.
-  for (const record of items) {
-    const status = (getRecordStatus(record) || 'to-do').toLowerCase();
-    if (!seen.has(status)) {
-      seen.add(status);
-      const label = status.split('-').map(w => w.charAt(0).toUpperCase() + w.slice(1)).join(' ');
-      modelColumns.push({ value: status, label });
-    }
-  }
-
-  return modelColumns;
-}
-
 export const KanbanBoard: React.FC<KanbanBoardProps> = ({
   filterType,
   searchQuery,
@@ -158,6 +116,7 @@ export const KanbanBoard: React.FC<KanbanBoardProps> = ({
   overrideItems,
   onArchiveItems,
   onDeleteItems,
+  onCopyDeepLink,
 }) => {
   // Items always come from the caller (TrackerMainView passes atom-sourced items).
   // KanbanBoard no longer loads its own data -- single source of truth via Jotai atoms.
@@ -224,7 +183,9 @@ export const KanbanBoard: React.FC<KanbanBoardProps> = ({
 
   /** Convenience wrapper for status-only updates */
   const updateItemStatus = useCallback(async (record: TrackerRecord, newStatus: string) => {
-    return updateItemFields(record, { status: newStatus });
+    // Kanban columns are driven by workflowStatus, so writes must target the resolved field.
+    const statusFieldName = resolveRoleFieldName(record.primaryType, 'workflowStatus');
+    return updateItemFields(record, { [statusFieldName]: newStatus });
   }, [updateItemFields]);
 
   const handleDragStart = useCallback((e: React.DragEvent, item: TrackerRecord) => {
@@ -345,32 +306,17 @@ export const KanbanBoard: React.FC<KanbanBoardProps> = ({
     closeContextMenu();
     const items = allItemsRef.current.filter(i => selectedIds.has(i.id));
     for (const item of items) {
-      try {
-        if (item.source === 'frontmatter' || item.source === 'import' || item.source === 'inline') {
-          await window.electronAPI.documentService.updateTrackerItemInFile({
-            itemId: item.id,
-            updates: { priority: newPriority },
-          });
-        } else if (!item.system.documentPath || item.source === 'native') {
-          const tracker = globalRegistry.get(item.primaryType);
-          const syncMode = tracker?.sync?.mode || 'local';
-          await window.electronAPI.documentService.updateTrackerItem({
-            itemId: item.id,
-            updates: { priority: newPriority },
-            syncMode,
-          });
-        }
-      } catch (err) {
-        console.error('[KanbanBoard] Failed to update priority:', err);
-      }
+      // Custom tracker types can map priority to a non-priority field.
+      const priorityFieldName = resolveRoleFieldName(item.primaryType, 'priority');
+      await updateItemFields(item, { [priorityFieldName]: newPriority });
     }
-  }, [selectedIds, closeContextMenu]);
+  }, [selectedIds, closeContextMenu, updateItemFields]);
 
   // Sort mode for kanban columns
   type KanbanSortMode = 'manual' | 'priority' | 'created' | 'updated';
   const [sortMode, setSortMode] = useState<KanbanSortMode>('manual');
 
-  const columns = useMemo(() => getStatusColumns(filterType, allItems), [filterType, allItems]);
+  const columns = useMemo(() => buildKanbanStatusColumns(filterType, allItems), [filterType, allItems]);
 
   const PRIORITY_ORDER: Record<string, number> = { critical: 0, high: 1, medium: 2, low: 3 };
 
@@ -470,7 +416,9 @@ export const KanbanBoard: React.FC<KanbanBoardProps> = ({
     if (currentStatus === targetStatus) {
       updateItemFields(item, { kanbanSortOrder: newSortOrder });
     } else {
-      updateItemFields(item, { status: targetStatus, kanbanSortOrder: newSortOrder });
+      // Moving between columns is a workflowStatus update.
+      const statusFieldName = resolveRoleFieldName(item.primaryType, 'workflowStatus');
+      updateItemFields(item, { [statusFieldName]: targetStatus, kanbanSortOrder: newSortOrder });
     }
   }, [updateItemFields]);
 
@@ -569,7 +517,9 @@ export const KanbanBoard: React.FC<KanbanBoardProps> = ({
       if (currentStatus === targetStatus) {
         updateItemFields(item, { kanbanSortOrder: newSortOrder });
       } else {
-        updateItemFields(item, { status: targetStatus, kanbanSortOrder: newSortOrder });
+        // Keep the document-level drop path aligned with the component drop path.
+        const statusFieldName = resolveRoleFieldName(item.primaryType, 'workflowStatus');
+        updateItemFields(item, { [statusFieldName]: targetStatus, kanbanSortOrder: newSortOrder });
       }
     };
 
@@ -674,11 +624,18 @@ export const KanbanBoard: React.FC<KanbanBoardProps> = ({
                       style={{ backgroundColor: PRIORITY_COLORS[getRecordPriority(item) || 'medium'] || '#6b7280' }}
                     />
                     <div className="flex-1 min-w-0">
-                      {item.issueKey && (
-                        <div className="text-[10px] font-mono font-medium uppercase tracking-[0.08em] text-nim-faint mb-0.5">
-                          {item.issueKey}
-                        </div>
-                      )}
+                      {(() => {
+                        // externalKey role (e.g. a PR number) rides next to the
+                        // local issue key so imported/external items stay
+                        // recognizable on the board.
+                        const externalKey = getRecordExternalKey(item);
+                        const keyLine = [item.issueKey, externalKey].filter(Boolean).join(' · ');
+                        return keyLine ? (
+                          <div className="text-[10px] font-mono font-medium uppercase tracking-[0.08em] text-nim-faint mb-0.5">
+                            {keyLine}
+                          </div>
+                        ) : null;
+                      })()}
                       <div className="text-sm text-nim leading-snug line-clamp-2">
                         {getRecordTitle(item)}
                       </div>
@@ -796,6 +753,20 @@ export const KanbanBoard: React.FC<KanbanBoardProps> = ({
           </KanbanContextSubmenu>
 
           <div className="border-b border-nim my-1" />
+
+          {onCopyDeepLink && selectedIds.size === 1 && (
+            <button
+              className="w-full flex items-center gap-2 px-3 py-1.5 text-left text-nim hover:bg-nim-tertiary cursor-pointer"
+              onClick={() => {
+                const [onlyId] = selectedIds;
+                closeContextMenu();
+                onCopyDeepLink(onlyId);
+              }}
+            >
+              <MaterialSymbol icon="link" size={16} />
+              Copy Link
+            </button>
+          )}
 
           {onArchiveItems && (
             <button

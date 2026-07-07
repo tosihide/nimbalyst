@@ -26,12 +26,13 @@ import * as path from 'path';
 import { execSync } from 'child_process';
 
 /**
- * Enable developer mode and worktrees feature flag.
+ * Enable developer mode, worktrees feature flag, and blitz alpha feature.
  */
 async function enableDeveloperWorktrees(electronApp: ElectronApplication, page: Page): Promise<void> {
   await page.evaluate(async () => {
     await window.electronAPI.invoke('developer-mode:set', true);
     await window.electronAPI.invoke('developer-features:set', { worktrees: true });
+    await window.electronAPI.invoke('alpha-features:set', { blitz: true });
   });
   await page.reload();
   await page.waitForLoadState('domcontentloaded');
@@ -70,6 +71,8 @@ test.describe('Worktree Session Creation', () => {
     await page.waitForLoadState('domcontentloaded');
     await dismissAPIKeyDialog(page);
     await waitForWorkspaceReady(page);
+
+    await enableDeveloperWorktrees(electronApp, page);
   });
 
   test.afterAll(async () => {
@@ -98,9 +101,6 @@ test.describe('Worktree Session Creation', () => {
 
     const agenticPanelWrapper = page.locator('[data-layout="agent-mode-wrapper"]');
     await expect(agenticPanelWrapper).toBeVisible({ timeout: 10000 });
-
-    const agenticPanel = page.locator('.agentic-panel--agent');
-    await expect(agenticPanel).toBeVisible({ timeout: 10000 });
 
     const sessionHistory = page.locator(PLAYWRIGHT_TEST_SELECTORS.sessionHistory);
     await expect(sessionHistory).toBeVisible({ timeout: 10000 });

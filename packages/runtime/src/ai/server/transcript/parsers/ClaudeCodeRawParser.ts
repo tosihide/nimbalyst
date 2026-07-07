@@ -22,6 +22,14 @@ import type {
 // Tool names that represent sub-agent spawns
 const SUBAGENT_TOOLS = new Set(['Task', 'Agent']);
 
+// Matches the sync layer's whole-message elision marker (see
+// makeWholeMessageMarker in syncContentTruncator.ts), e.g.
+// "[Full claude-code message elided from mobile sync: 29.2 KB raw. View on
+// desktop for the full content.]". Such a marker arrives only on mobile (the
+// sync truncator replaced an oversized message); it is a sync artifact, not
+// model output, and must not render as an assistant bubble.
+const WHOLE_MESSAGE_ELISION_MARKER = /^\[Full .+ message elided from mobile sync:.*\]$/;
+
 export class ClaudeCodeRawParser implements IRawMessageParser {
   /**
    * Track API message IDs that have had text content processed.
@@ -88,8 +96,17 @@ export class ClaudeCodeRawParser implements IRawMessageParser {
             reminderKind: this.extractReminderKind(msg.metadata),
             createdAt: msg.createdAt,
           });
+        } else if (msg.metadata?.promptOrigin === 'wakeup_resume') {
+          descriptors.push({
+            type: 'system_message',
+            text: parsed.prompt,
+            systemType: 'status',
+            reminderKind: 'wakeup_resume',
+            searchable: false,
+            createdAt: msg.createdAt,
+          });
         } else {
-          const mode = (msg.metadata?.mode as 'agent' | 'planning') ?? 'agent';
+          const mode = (msg.metadata?.mode as 'agent' | 'planning' | 'auto') ?? 'agent';
           descriptors.push({
             type: 'user_message',
             text: parsed.prompt,
@@ -226,7 +243,7 @@ export class ClaudeCodeRawParser implements IRawMessageParser {
                 createdAt: msg.createdAt,
               });
             } else if (block.type === 'tool_use') {
-              const toolDescriptors = this.parseToolUse(
+              const toolDescriptors = await this.parseToolUse(
                 msg,
                 block,
                 context,
@@ -253,6 +270,43 @@ export class ClaudeCodeRawParser implements IRawMessageParser {
             createdAt: msg.createdAt,
           });
         }
+      } else if (parsed.type === 'system' && parsed.subtype === 'permission_denied') {
+        // SDK auto-denied a tool call WITHOUT showing an interactive prompt.
+        // Sources: SDK deny rule, `dontAsk` mode, headless-agent auto-deny,
+        // or (rarely) the auto-mode classifier on something it is confident
+        // should be blocked. Note: the common auto-mode path for destructive
+        // tools is escalation to the normal permission prompt via
+        // can_use_tool, NOT this deny short-circuit -- those still surface as
+        // an interactive_prompt event, not here. We render this so the user
+        // sees why a tool was blocked instead of only an is_error tool_result.
+        // See @anthropic-ai/claude-agent-sdk
+        // SDKPermissionDeniedMessage.
+        const deniedToolName: string =
+          typeof parsed.tool_name === 'string' ? parsed.tool_name : 'unknown';
+        const deniedReason: string | undefined =
+          typeof parsed.decision_reason === 'string' ? parsed.decision_reason : undefined;
+        const deniedReasonType: string | undefined =
+          typeof parsed.decision_reason_type === 'string' ? parsed.decision_reason_type : undefined;
+        const deniedInput: Record<string, unknown> | undefined =
+          parsed.tool_input && typeof parsed.tool_input === 'object'
+            ? (parsed.tool_input as Record<string, unknown>)
+            : undefined;
+        const messageText: string =
+          typeof parsed.message === 'string'
+            ? parsed.message
+            : deniedReason
+              ? `${deniedToolName} was denied: ${deniedReason}`
+              : `${deniedToolName} was denied`;
+        descriptors.push({
+          type: 'system_message',
+          text: messageText,
+          systemType: 'permission_denied',
+          deniedToolName,
+          ...(deniedReason ? { deniedReason } : {}),
+          ...(deniedReasonType ? { deniedReasonType } : {}),
+          ...(deniedInput ? { deniedInput } : {}),
+          createdAt: msg.createdAt,
+        });
       } else if (parsed.type === 'error' && parsed.error) {
         const errorContent =
           typeof parsed.error === 'string' ? parsed.error : JSON.stringify(parsed.error);
@@ -269,14 +323,27 @@ export class ClaudeCodeRawParser implements IRawMessageParser {
         parsed.type === 'result'
         && typeof parsed.result === 'string'
         && parsed.result.trim().length > 0
-        && this.processedTextMessageIds.size === 0
-        && !this.suppressResultChunkText
+        && (
+          parsed.num_turns === 0
+          || (this.processedTextMessageIds.size === 0 && !this.suppressResultChunkText)
+        )
       ) {
         // Slash command turns (e.g. unknown /foo) can produce ONLY a result chunk
         // with the final text. For regular assistant turns the result chunk
         // duplicates text already emitted via `type: 'assistant'` messages, so
         // only backfill when no assistant text was seen IN THIS BATCH and no
         // prior batch produced assistant text (suppressResultChunkText).
+        //
+        // Why num_turns===0 short-circuits both gates: a turn with num_turns===0
+        // means the SDK ran ZERO assistant turns this invocation -- the result
+        // chunk is the entire output of the turn (e.g. "Unknown command: /foo")
+        // and cannot duplicate text from anywhere. The processedTextMessageIds
+        // check is too coarse here: in a full-session reparse it accumulates
+        // across earlier turns, so by the time we reach a later turn's result
+        // chunk it's already non-empty. Likewise, suppressResultChunkText is
+        // set globally for resume batches. Without the num_turns===0 carve-out,
+        // unknown-slash-command turns render as a completely blank turn,
+        // hiding the failure.
         descriptors.push({
           type: 'assistant_message',
           text: parsed.result,
@@ -285,6 +352,9 @@ export class ClaudeCodeRawParser implements IRawMessageParser {
       } else if (parsed.type === 'nimbalyst_tool_use') {
         const nimbalystDescriptors = await this.parseNimbalystToolUse(msg, parsed, context);
         descriptors.push(...nimbalystDescriptors);
+      } else if (parsed.type === 'git_commit_proposal_response' && parsed.proposalId) {
+        const responseDescriptors = await this.parseGitCommitProposalResponse(parsed, context);
+        descriptors.push(...responseDescriptors);
       } else if (parsed.type === 'nimbalyst_tool_result') {
         const result = this.parseToolResult({
           tool_use_id: parsed.tool_use_id || parsed.id,
@@ -310,9 +380,17 @@ export class ClaudeCodeRawParser implements IRawMessageParser {
         }
       }
     } catch {
-      // Not JSON -- treat as plain text assistant message
+      // Not JSON -- treat as plain text assistant message.
       const content = String(msg.content ?? '');
-      if (content.trim()) {
+      // ...unless it's the sync layer's whole-message elision marker. The sync
+      // truncator (syncContentTruncator.ts) replaces an oversized claude-code
+      // message with a bare "[Full claude-code message elided from mobile sync:
+      // N raw. View on desktop...]" string. That string is not JSON, so it lands
+      // here and -- before this guard -- rendered as a stray assistant bubble on
+      // mobile that desktop never shows. Desktop builds its transcript from the
+      // full local raw and shows nothing (or the tool widget) for these, so drop
+      // the marker to match.
+      if (content.trim() && !WHOLE_MESSAGE_ELISION_MARKER.test(content.trim())) {
         descriptors.push({
           type: 'assistant_message',
           text: content,
@@ -328,12 +406,12 @@ export class ClaudeCodeRawParser implements IRawMessageParser {
   // Tool handling helpers
   // ---------------------------------------------------------------------------
 
-  private parseToolUse(
+  private async parseToolUse(
     msg: RawMessage,
     block: any,
     context: ParseContext,
     parentToolUseId?: string,
-  ): CanonicalEventDescriptor[] {
+  ): Promise<CanonicalEventDescriptor[]> {
     const descriptors: CanonicalEventDescriptor[] = [];
     const toolName = block.name ?? 'unknown';
     const toolId: string | undefined = block.id;
@@ -385,6 +463,16 @@ export class ClaudeCodeRawParser implements IRawMessageParser {
 
     // Deduplicate: SDK sends streaming + accumulated chunks with the same tool_use
     if (toolId && context.hasToolCall(toolId)) return [];
+
+    // Cross-batch dedup: a prior batch (or a synthetic nimbalyst_tool_use row
+    // written by an MCP handler such as developer_git_commit_proposal) may
+    // already have produced a canonical event for this provider tool-call id.
+    // Without this check the SDK's later assistant chunk for the same tool_use
+    // would create a duplicate. Parity with `parseNimbalystToolUse`.
+    if (toolId) {
+      const existing = await context.findByProviderToolCallId(toolId);
+      if (existing) return [];
+    }
 
     // Resolve parent subagent for nested tool calls
     const resolvedParent = parentToolUseId ?? block.parent_tool_use_id;
@@ -477,6 +565,52 @@ export class ClaudeCodeRawParser implements IRawMessageParser {
       arguments: args,
       providerToolCallId: parsed.id ?? null,
       createdAt: msg.createdAt,
+    }];
+  }
+
+  // Persisted by SessionHandlers when the user resolves the commit proposal
+  // widget. Without this branch the canonical tool_call event for
+  // developer_git_commit_proposal never receives a completion descriptor, so
+  // the widget keeps rendering "pending" after a successful commit. A later
+  // error response (e.g. duplicate click after the file is already committed)
+  // must not clobber the prior "committed" outcome.
+  private async parseGitCommitProposalResponse(
+    parsed: any,
+    context: ParseContext,
+  ): Promise<CanonicalEventDescriptor[]> {
+    const proposalId: string = parsed.proposalId;
+    const isCommitted = parsed.action === 'committed';
+
+    if (!isCommitted) {
+      const existing = await context.findByProviderToolCallId(proposalId);
+      const existingResult = (existing?.payload as any)?.result;
+      if (typeof existingResult === 'string') {
+        try {
+          const parsedExisting = JSON.parse(existingResult);
+          if (parsedExisting && parsedExisting.action === 'committed') {
+            return [];
+          }
+        } catch {
+          // existing result not JSON -- fall through and overwrite
+        }
+      }
+    }
+
+    const resultPayload = {
+      action: parsed.action,
+      ...(parsed.commitHash ? { commitHash: parsed.commitHash } : {}),
+      ...(parsed.commitDate ? { commitDate: parsed.commitDate } : {}),
+      ...(parsed.commitMessage ? { commitMessage: parsed.commitMessage } : {}),
+      ...(parsed.filesCommitted ? { filesCommitted: parsed.filesCommitted } : {}),
+      ...(parsed.error ? { error: parsed.error } : {}),
+    };
+
+    return [{
+      type: 'tool_call_completed',
+      providerToolCallId: proposalId,
+      status: isCommitted ? 'completed' : 'error',
+      result: JSON.stringify(resultPayload),
+      isError: !isCommitted,
     }];
   }
 

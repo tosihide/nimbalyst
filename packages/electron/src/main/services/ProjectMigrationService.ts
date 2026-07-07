@@ -15,8 +15,9 @@ import { existsSync } from 'fs';
 import os from 'os';
 import { logger } from '../utils/logger';
 import { findWindowByWorkspace } from '../window/WindowManager';
-import { PGLiteDatabaseWorker, database } from '../database/PGLiteDatabaseWorker';
-import { DatabaseBackupService } from './database/DatabaseBackupService';
+import type { AppDatabase } from '../database/PGLiteDatabaseWorker';
+import { database } from '../database/PGLiteDatabaseWorker';
+import { encodeWorkspaceDir } from './ClaudeCodeSessionScanner';
 
 // Import store utilities - we'll need to access the underlying stores directly
 import {
@@ -32,14 +33,6 @@ function workspaceKey(workspacePath: string): string {
   const normalized = path.normalize(workspacePath).replace(/\/+$/, '');
   const base64 = Buffer.from(normalized).toString('base64url');
   return `ws:${base64}`;
-}
-
-/**
- * Escape an absolute path for Claude Code's directory naming convention.
- * /Users/foo/bar -> -Users-foo-bar
- */
-function escapePathForClaude(absolutePath: string): string {
-  return absolutePath.replace(/\//g, '-');
 }
 
 /**
@@ -75,9 +68,9 @@ export interface MoveResult {
  * If any step fails, rollback is performed to restore the original state.
  */
 export class ProjectMigrationService {
-  private dbWorker: PGLiteDatabaseWorker;
+  private dbWorker: AppDatabase;
 
-  constructor(dbWorker?: PGLiteDatabaseWorker) {
+  constructor(dbWorker?: AppDatabase) {
     this.dbWorker = dbWorker || database;
   }
 
@@ -158,10 +151,7 @@ export class ProjectMigrationService {
     try {
       // Step 1: Create database backup
       logger.main.info('[ProjectMigration] Creating database backup...');
-      const dbPath = path.join(app.getPath('userData'), 'pglite-db');
-      const backupService = new DatabaseBackupService(dbPath, this.dbWorker);
-      await backupService.initialize();
-      const backupResult = await backupService.createBackup();
+      const backupResult = await this.dbWorker.createBackup();
       if (!backupResult.success) {
         return { success: false, error: `Failed to create backup: ${backupResult.error}` };
       }
@@ -175,8 +165,8 @@ export class ProjectMigrationService {
 
       // Step 3: Rename Claude Code session directory
       const claudeProjectsDir = path.join(os.homedir(), '.claude', 'projects');
-      oldClaudePath = path.join(claudeProjectsDir, escapePathForClaude(oldPath));
-      newClaudePath = path.join(claudeProjectsDir, escapePathForClaude(newPath));
+      oldClaudePath = path.join(claudeProjectsDir, encodeWorkspaceDir(oldPath));
+      newClaudePath = path.join(claudeProjectsDir, encodeWorkspaceDir(newPath));
 
       if (existsSync(oldClaudePath)) {
         logger.main.info('[ProjectMigration] Renaming Claude session directory...');
@@ -277,10 +267,7 @@ export class ProjectMigrationService {
     try {
       // Step 1: Create database backup
       logger.main.info('[ProjectMigration] Creating database backup...');
-      const dbPath = path.join(app.getPath('userData'), 'pglite-db');
-      const backupService = new DatabaseBackupService(dbPath, this.dbWorker);
-      await backupService.initialize();
-      const backupResult = await backupService.createBackup();
+      const backupResult = await this.dbWorker.createBackup();
       if (!backupResult.success) {
         return { success: false, error: `Failed to create backup: ${backupResult.error}` };
       }
@@ -294,8 +281,8 @@ export class ProjectMigrationService {
 
       // Step 3: Rename Claude Code session directory
       const claudeProjectsDir = path.join(os.homedir(), '.claude', 'projects');
-      oldClaudePath = path.join(claudeProjectsDir, escapePathForClaude(oldPath));
-      newClaudePath = path.join(claudeProjectsDir, escapePathForClaude(newPath));
+      oldClaudePath = path.join(claudeProjectsDir, encodeWorkspaceDir(oldPath));
+      newClaudePath = path.join(claudeProjectsDir, encodeWorkspaceDir(newPath));
 
       if (existsSync(oldClaudePath)) {
         logger.main.info('[ProjectMigration] Renaming Claude session directory...');
@@ -384,30 +371,43 @@ export class ProjectMigrationService {
       [newPath, oldPath]
     );
 
-    // Update file paths within the workspace that are stored as absolute paths
-    // This updates ai_sessions.file_path for files that were within the workspace
-    await this.dbWorker.query(
-      `UPDATE ai_sessions
-       SET file_path = $1 || SUBSTRING(file_path FROM LENGTH($2) + 1)
-       WHERE workspace_id = $1 AND file_path LIKE $2 || '%'`,
-      [newPath, oldPath]
+    // Rewrite absolute file_path prefixes for rows now in the new workspace.
+    // Done in JS rather than SQL string surgery: the prior
+    // `$1 || SUBSTRING(file_path FROM LENGTH($2) + 1)` form is PostgreSQL-only
+    // and the PG->SQLite dialect translator mangles both the `SUBSTRING(... FROM
+    // ...)` syntax and the text `||` (which it rewrites to json_patch). A
+    // SELECT + per-row UPDATE works identically on PGLite and SQLite. (NIM-807)
+    await this.rewriteFilePathPrefix('ai_sessions', oldPath, newPath);
+    await this.rewriteFilePathPrefix('session_files', oldPath, newPath);
+    await this.rewriteFilePathPrefix('document_history', oldPath, newPath);
+  }
+
+  /**
+   * Rewrite absolute `file_path` values in a table so a leading `oldPath`
+   * prefix becomes `newPath`. Assumes `workspace_id` has already been migrated
+   * to `newPath`. Backend-agnostic: no PG-specific SQL.
+   */
+  private async rewriteFilePathPrefix(
+    table: 'ai_sessions' | 'session_files' | 'document_history',
+    oldPath: string,
+    newPath: string
+  ): Promise<void> {
+    const result = await this.dbWorker.query<{ id: string | number; file_path: string | null }>(
+      `SELECT id, file_path FROM ${table} WHERE workspace_id = $1`,
+      [newPath]
     );
 
-    // Update session_files.file_path
-    await this.dbWorker.query(
-      `UPDATE session_files
-       SET file_path = $1 || SUBSTRING(file_path FROM LENGTH($2) + 1)
-       WHERE workspace_id = $1 AND file_path LIKE $2 || '%'`,
-      [newPath, oldPath]
-    );
-
-    // Update document_history.file_path
-    await this.dbWorker.query(
-      `UPDATE document_history
-       SET file_path = $1 || SUBSTRING(file_path FROM LENGTH($2) + 1)
-       WHERE workspace_id = $1 AND file_path LIKE $2 || '%'`,
-      [newPath, oldPath]
-    );
+    for (const row of result.rows) {
+      const filePath = row.file_path;
+      if (typeof filePath !== 'string' || !filePath.startsWith(oldPath)) {
+        continue;
+      }
+      const updated = newPath + filePath.substring(oldPath.length);
+      await this.dbWorker.query(
+        `UPDATE ${table} SET file_path = $1 WHERE id = $2`,
+        [updated, row.id]
+      );
+    }
   }
 
   /**

@@ -15,9 +15,10 @@ import {
   buildShareUrl,
 } from '../../store';
 import { errorNotificationService } from '../../services/ErrorNotificationService';
-import { getRelativeTimeString } from '../../utils/dateFormatting';
 import { dialogRef, DIALOG_IDS } from '../../dialogs';
 import type { ShareDialogData } from '../../dialogs';
+import { SessionContextMenu } from './SessionContextMenu';
+import { SessionRelativeTime } from './SessionRelativeTime';
 
 /**
  * Unified component for rendering expandable session groups in the session history.
@@ -257,6 +258,11 @@ export const WorkstreamGroup: React.FC<WorkstreamGroupProps> = ({
   const [worktreeRenameValue, setWorktreeRenameValue] = useState('');
   const worktreeRenameInputRef = useRef<HTMLInputElement>(null);
 
+  // Workstream parent rename state
+  const [isRenamingWorkstream, setIsRenamingWorkstream] = useState(false);
+  const [workstreamRenameValue, setWorkstreamRenameValue] = useState('');
+  const workstreamRenameInputRef = useRef<HTMLInputElement>(null);
+
   // Sort sessions: pinned first, then by sortBy field (respecting parent sort preference)
   const sortedSessions = React.useMemo(() => {
     return [...sessions].sort((a, b) => {
@@ -343,8 +349,11 @@ export const WorkstreamGroup: React.FC<WorkstreamGroupProps> = ({
     if (type === 'worktree' && worktree) {
       setWorktreeRenameValue(worktree.displayName || worktree.name || '');
       setIsRenamingWorktree(true);
+    } else if (type === 'workstream') {
+      setWorkstreamRenameValue(title);
+      setIsRenamingWorkstream(true);
     }
-  }, [type, worktree]);
+  }, [type, worktree, title]);
 
   const handleWorktreeRenameSubmit = useCallback(() => {
     const trimmedValue = worktreeRenameValue.trim();
@@ -373,6 +382,33 @@ export const WorkstreamGroup: React.FC<WorkstreamGroupProps> = ({
       worktreeRenameInputRef.current.select();
     }
   }, [isRenamingWorktree]);
+
+  const handleWorkstreamRenameSubmit = useCallback(() => {
+    const trimmedValue = workstreamRenameValue.trim();
+    if (trimmedValue && trimmedValue !== title && onSessionRename) {
+      onSessionRename(id, trimmedValue);
+    }
+    setIsRenamingWorkstream(false);
+  }, [workstreamRenameValue, title, id, onSessionRename]);
+
+  const handleWorkstreamRenameKeyDown = useCallback((e: React.KeyboardEvent) => {
+    e.stopPropagation();
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      handleWorkstreamRenameSubmit();
+    } else if (e.key === 'Escape') {
+      e.preventDefault();
+      setIsRenamingWorkstream(false);
+    }
+  }, [handleWorkstreamRenameSubmit]);
+
+  // Focus and select input when entering workstream rename mode
+  useEffect(() => {
+    if (isRenamingWorkstream && workstreamRenameInputRef.current) {
+      workstreamRenameInputRef.current.focus();
+      workstreamRenameInputRef.current.select();
+    }
+  }, [isRenamingWorkstream]);
 
   const handleAddSuperLoop = useCallback((e: React.MouseEvent) => {
     e.stopPropagation();
@@ -599,6 +635,17 @@ export const WorkstreamGroup: React.FC<WorkstreamGroupProps> = ({
                   onBlur={handleWorktreeRenameSubmit}
                   onClick={(e) => e.stopPropagation()}
                 />
+              ) : isRenamingWorkstream && type === 'workstream' ? (
+                <input
+                  ref={workstreamRenameInputRef}
+                  type="text"
+                  className="workstream-group-rename-input flex-1 min-w-0 px-1 py-0 text-[0.8125rem] font-medium border border-[var(--nim-primary)] rounded bg-[var(--nim-bg)] text-[var(--nim-text)] outline-none"
+                  value={workstreamRenameValue}
+                  onChange={(e) => setWorkstreamRenameValue(e.target.value)}
+                  onKeyDown={handleWorkstreamRenameKeyDown}
+                  onBlur={handleWorkstreamRenameSubmit}
+                  onClick={(e) => e.stopPropagation()}
+                />
               ) : (
                 <span className="workstream-group-name font-medium text-[var(--nim-text)] whitespace-nowrap overflow-hidden text-ellipsis">{displayTitle}</span>
               )}
@@ -793,6 +840,15 @@ export const WorkstreamGroup: React.FC<WorkstreamGroupProps> = ({
           )}
 
           {/* Workstream menu items */}
+          {type === 'workstream' && onSessionRename && (
+            <button
+              className="workstream-group-context-menu-item flex items-center gap-2 w-full py-2 px-3 bg-transparent border-none cursor-pointer text-[0.8125rem] text-[var(--nim-text)] text-left rounded transition-colors duration-150 hover:bg-[var(--nim-bg-hover)]"
+              onClick={handleRenameClick}
+            >
+              <MaterialSymbol icon="edit" size={14} />
+              Rename
+            </button>
+          )}
           {type === 'workstream' && onWorkstreamPinToggle && (
             <button
               className="workstream-group-context-menu-item flex items-center gap-2 w-full py-2 px-3 bg-transparent border-none cursor-pointer text-[0.8125rem] text-[var(--nim-text)] text-left rounded transition-colors duration-150 hover:bg-[var(--nim-bg-hover)]"
@@ -999,12 +1055,8 @@ const WorkstreamSessionItem: React.FC<WorkstreamSessionItemProps> = ({
   const [contextMenuPosition, setContextMenuPosition] = useState({ x: 0, y: 0 });
   const [isRenaming, setIsRenaming] = useState(false);
   const [renameValue, setRenameValue] = useState('');
-  const contextMenuRef = useRef<HTMLDivElement>(null);
   const renameInputRef = useRef<HTMLInputElement>(null);
   const shareInfo = useAtomValue(sessionShareAtom(session.id));
-  const shareKeys = useAtomValue(shareKeysAtom);
-
-  const removeShare = useSetAtom(removeSessionShareAtom);
 
   const displayTitle = session.title || 'Untitled Session';
 
@@ -1015,47 +1067,34 @@ const WorkstreamSessionItem: React.FC<WorkstreamSessionItemProps> = ({
     setShowContextMenu(true);
   }, []);
 
-  const handleDelete = (e: React.MouseEvent) => {
-    e.stopPropagation();
+  const handleDelete = () => {
     setShowContextMenu(false);
     onDelete?.();
   };
 
-  const handleArchive = (e: React.MouseEvent) => {
-    e.stopPropagation();
+  const handleArchive = () => {
     setShowContextMenu(false);
     onArchive?.();
   };
 
-  const handleUnarchive = (e: React.MouseEvent) => {
-    e.stopPropagation();
+  const handleUnarchive = () => {
     setShowContextMenu(false);
     onUnarchive?.();
   };
 
-  const handlePinToggle = (e: React.MouseEvent) => {
-    e.stopPropagation();
+  const handlePinToggle = (isPinned: boolean) => {
     setShowContextMenu(false);
-    onPinToggle?.(!session.isPinned);
+    onPinToggle?.(isPinned);
   };
 
-  const handleBranch = (e: React.MouseEvent) => {
-    e.stopPropagation();
+  const handleBranch = () => {
     setShowContextMenu(false);
     onBranch?.();
   };
 
-  const handleRemoveFromWorkstream = (e: React.MouseEvent) => {
-    e.stopPropagation();
+  const handleRemoveFromWorkstream = () => {
     setShowContextMenu(false);
     onRemoveFromWorkstream?.();
-  };
-
-  const handleRenameClick = (e: React.MouseEvent) => {
-    e.stopPropagation();
-    setShowContextMenu(false);
-    setRenameValue(displayTitle);
-    setIsRenaming(true);
   };
 
   const handleRenameSubmit = () => {
@@ -1077,59 +1116,6 @@ const WorkstreamSessionItem: React.FC<WorkstreamSessionItemProps> = ({
     }
   };
 
-  const handleCopySessionId = (e: React.MouseEvent) => {
-    e.stopPropagation();
-    setShowContextMenu(false);
-    copyToClipboard(session.id);
-  };
-
-  const handleExportHtml = (e: React.MouseEvent) => {
-    e.stopPropagation();
-    setShowContextMenu(false);
-    (window as any).electronAPI?.exportSessionToHtml({ sessionId: session.id });
-  };
-
-  const handleCopyTranscript = (e: React.MouseEvent) => {
-    e.stopPropagation();
-    setShowContextMenu(false);
-    (window as any).electronAPI?.exportSessionToClipboard({ sessionId: session.id });
-  };
-
-  const handleShareLink = (e: React.MouseEvent) => {
-    e.stopPropagation();
-    setShowContextMenu(false);
-    dialogRef.current?.open<ShareDialogData>(DIALOG_IDS.SHARE, {
-      contentType: 'session',
-      sessionId: session.id,
-      title: displayTitle,
-    });
-  };
-
-  const handleCopyShareLink = (e: React.MouseEvent) => {
-    e.stopPropagation();
-    setShowContextMenu(false);
-    if (!shareInfo) return;
-    const url = buildShareUrl(shareInfo.shareId, shareKeys.get(session.id));
-    copyToClipboard(url);
-    errorNotificationService.showInfo('Share link copied', 'The share link has been copied to your clipboard.', { duration: 3000 });
-  };
-
-  const handleUnshare = async (e: React.MouseEvent) => {
-    e.stopPropagation();
-    setShowContextMenu(false);
-    if (!shareInfo) return;
-    try {
-      const result = await (window as any).electronAPI?.deleteShare({ shareId: shareInfo.shareId, sessionId: session.id });
-      if (result?.success) {
-        removeShare(session.id);
-        errorNotificationService.showInfo('Session unshared', 'The share link has been removed.', { duration: 3000 });
-      } else if (result?.error) {
-        errorNotificationService.showError('Unshare failed', result.error);
-      }
-    } catch (error) {
-      errorNotificationService.showError('Unshare failed', error instanceof Error ? error.message : 'An unexpected error occurred');
-    }
-  };
 
   useEffect(() => {
     if (isRenaming && renameInputRef.current) {
@@ -1146,7 +1132,6 @@ const WorkstreamSessionItem: React.FC<WorkstreamSessionItemProps> = ({
       } ${session.isArchived ? 'opacity-60 hover:opacity-80' : ''} focus:outline-2 focus:outline-[var(--nim-border-focus)] focus:outline-offset-[-2px]`}
       onClick={onClick}
       onContextMenu={handleContextMenu}
-      onMouseLeave={() => setShowContextMenu(false)}
       role="button"
       tabIndex={0}
       onKeyDown={(e) => {
@@ -1190,7 +1175,7 @@ const WorkstreamSessionItem: React.FC<WorkstreamSessionItemProps> = ({
             isActive ? 'font-medium' : ''
           }`}>{displayTitle}</span>
           <span className="workstream-session-item-timestamp shrink-0 text-[0.6875rem] text-[var(--nim-text-faint)] ml-2">
-            {getRelativeTimeString(session.updatedAt || session.createdAt)}
+            <SessionRelativeTime sessionId={session.id} fallbackTimestamp={session.updatedAt || session.createdAt} />
           </span>
         </>
       )}
@@ -1200,117 +1185,25 @@ const WorkstreamSessionItem: React.FC<WorkstreamSessionItemProps> = ({
 
       {/* Context Menu */}
       {showContextMenu && (
-        <div
-          ref={contextMenuRef}
-          className="workstream-group-context-menu fixed z-[1000] min-w-[140px] bg-[var(--nim-bg)] border border-[var(--nim-border)] rounded-md shadow-[0_4px_12px_rgba(0,0,0,0.15)] p-1"
-          style={{
-            left: contextMenuPosition.x,
-            top: contextMenuPosition.y
-          }}
-          onClick={(e) => e.stopPropagation()}
-        >
-          {onPinToggle && (
-            <button
-              className="workstream-group-context-menu-item flex items-center gap-2 w-full py-2 px-3 bg-transparent border-none cursor-pointer text-[0.8125rem] text-[var(--nim-text)] text-left rounded transition-colors duration-150 hover:bg-[var(--nim-bg-hover)]"
-              onClick={handlePinToggle}
-            >
-              <MaterialSymbol icon="push_pin" size={14} />
-              {session.isPinned ? 'Unpin' : 'Pin'}
-            </button>
-          )}
-          {onRename && (
-            <button
-              className="workstream-group-context-menu-item flex items-center gap-2 w-full py-2 px-3 bg-transparent border-none cursor-pointer text-[0.8125rem] text-[var(--nim-text)] text-left rounded transition-colors duration-150 hover:bg-[var(--nim-bg-hover)]"
-              onClick={handleRenameClick}
-            >
-              <MaterialSymbol icon="edit" size={14} />
-              Rename
-            </button>
-          )}
-          {onBranch && (
-            <button
-              className="workstream-group-context-menu-item flex items-center gap-2 w-full py-2 px-3 bg-transparent border-none cursor-pointer text-[0.8125rem] text-[var(--nim-text)] text-left rounded transition-colors duration-150 hover:bg-[var(--nim-bg-hover)]"
-              onClick={handleBranch}
-            >
-              <MaterialSymbol icon="fork_right" size={14} />
-              Branch conversation
-            </button>
-          )}
-          {onRemoveFromWorkstream && (
-            <button
-              className="workstream-group-context-menu-item flex items-center gap-2 w-full py-2 px-3 bg-transparent border-none cursor-pointer text-[0.8125rem] text-[var(--nim-text)] text-left rounded transition-colors duration-150 hover:bg-[var(--nim-bg-hover)]"
-              onClick={handleRemoveFromWorkstream}
-            >
-              <MaterialSymbol icon="drive_file_move_rtl" size={14} />
-              Remove from workstream
-            </button>
-          )}
-          <button
-            className="workstream-group-context-menu-item flex items-center gap-2 w-full py-2 px-3 bg-transparent border-none cursor-pointer text-[0.8125rem] text-[var(--nim-text)] text-left rounded transition-colors duration-150 hover:bg-[var(--nim-bg-hover)]"
-            onClick={handleCopySessionId}
-          >
-            <MaterialSymbol icon="content_copy" size={14} />
-            Copy Session ID
-          </button>
-          {shareInfo ? (
-            <>
-              <button
-                className="workstream-group-context-menu-item flex items-center gap-2 w-full py-2 px-3 bg-transparent border-none cursor-pointer text-[0.8125rem] text-[var(--nim-text)] text-left rounded transition-colors duration-150 hover:bg-[var(--nim-bg-hover)]"
-                onClick={handleCopyShareLink}
-              >
-                <MaterialSymbol icon="content_copy" size={14} />
-                Copy share link
-              </button>
-              <button
-                className="workstream-group-context-menu-item flex items-center gap-2 w-full py-2 px-3 bg-transparent border-none cursor-pointer text-[0.8125rem] text-[var(--nim-text)] text-left rounded transition-colors duration-150 hover:bg-[var(--nim-bg-hover)]"
-                onClick={handleUnshare}
-              >
-                <MaterialSymbol icon="link_off" size={14} />
-                Unshare
-              </button>
-            </>
-          ) : (
-            <button
-              className="workstream-group-context-menu-item flex items-center gap-2 w-full py-2 px-3 bg-transparent border-none cursor-pointer text-[0.8125rem] text-[var(--nim-text)] text-left rounded transition-colors duration-150 hover:bg-[var(--nim-bg-hover)]"
-              onClick={handleShareLink}
-            >
-              <MaterialSymbol icon="link" size={14} />
-              Share link
-            </button>
-          )}
-          <button
-            className="workstream-group-context-menu-item flex items-center gap-2 w-full py-2 px-3 bg-transparent border-none cursor-pointer text-[0.8125rem] text-[var(--nim-text)] text-left rounded transition-colors duration-150 hover:bg-[var(--nim-bg-hover)]"
-            onClick={handleExportHtml}
-          >
-            <MaterialSymbol icon="download" size={14} />
-            Export as HTML
-          </button>
-          <button
-            className="workstream-group-context-menu-item flex items-center gap-2 w-full py-2 px-3 bg-transparent border-none cursor-pointer text-[0.8125rem] text-[var(--nim-text)] text-left rounded transition-colors duration-150 hover:bg-[var(--nim-bg-hover)]"
-            onClick={handleCopyTranscript}
-          >
-            <MaterialSymbol icon="assignment" size={14} />
-            Copy transcript
-          </button>
-          {(onArchive || onUnarchive) && (
-            <button
-              className="workstream-group-context-menu-item flex items-center gap-2 w-full py-2 px-3 bg-transparent border-none cursor-pointer text-[0.8125rem] text-[var(--nim-text)] text-left rounded transition-colors duration-150 hover:bg-[var(--nim-bg-hover)]"
-              onClick={session.isArchived ? handleUnarchive : handleArchive}
-            >
-              <MaterialSymbol icon={session.isArchived ? "unarchive" : "archive"} size={14} />
-              {session.isArchived ? 'Unarchive' : 'Archive'}
-            </button>
-          )}
-          {onDelete && (
-            <button
-              className="workstream-group-context-menu-item destructive flex items-center gap-2 w-full py-2 px-3 bg-transparent border-none cursor-pointer text-[0.8125rem] text-[var(--nim-error)] text-left rounded transition-colors duration-150 hover:bg-[rgba(239,68,68,0.1)]"
-              onClick={handleDelete}
-            >
-              <MaterialSymbol icon="delete" size={14} />
-              Delete
-            </button>
-          )}
-        </div>
+        <SessionContextMenu
+          sessionId={session.id}
+          title={displayTitle}
+          position={contextMenuPosition}
+          onClose={() => setShowContextMenu(false)}
+          isArchived={session.isArchived}
+          isPinned={session.isPinned}
+          isWorkstream={(session.childCount ?? 0) > 0}
+          isWorktreeSession={!!session.worktreeId}
+          parentSessionId={session.parentSessionId}
+          phase={session.phase}
+          onRename={onRename ? () => { setRenameValue(displayTitle); setIsRenaming(true); } : undefined}
+          onPinToggle={onPinToggle ? handlePinToggle : undefined}
+          onBranch={onBranch ? handleBranch : undefined}
+          onRemoveFromWorkstream={onRemoveFromWorkstream ? handleRemoveFromWorkstream : undefined}
+          onArchive={onArchive ? handleArchive : undefined}
+          onUnarchive={onUnarchive ? handleUnarchive : undefined}
+          onDelete={onDelete ? handleDelete : undefined}
+        />
       )}
     </div>
   );

@@ -11,8 +11,13 @@ import type {
 } from '../../../core/DocumentService';
 import type { TrackerRecord } from '../../../core/TrackerRecord';
 import { trackerItemsByTypeAtom, trackerDataLoadedAtom } from '../trackerDataAtoms';
-import { getRecordTitle, getRecordStatus, getRecordPriority, getFieldByRole, resolveRoleFieldName } from '../trackerRecordAccessors';
-import { globalRegistry, parseDate } from '../models';
+import {
+  EXTENSION_OWNED_KEYS,
+  LEGACY_KEY_TO_TYPE,
+  buildFullDocumentTrackerId,
+} from '../documentHeader/frontmatterUtils';
+import { getRecordTitle, getRecordStatus, getRecordPriority, getFieldByRole, resolveRoleFieldName, getItemShareState } from '../trackerRecordAccessors';
+import { globalRegistry, parseDate, normalizeRelationshipValue } from '../models';
 import {usePostHog} from "posthog-js/react";
 import {
   resolveColumnsForType,
@@ -28,6 +33,7 @@ import {
 } from './trackerColumns';
 import { UserAvatar } from './UserAvatar';
 import { DisplayOptionsPanel } from './DisplayOptionsPanel';
+import { useTrackerRows } from './useTrackerRows';
 
 export type SortColumn = 'title' | 'type' | 'status' | 'priority' | 'progress' | 'module' | 'lastIndexed' | (string & {});
 export type SortDirection = 'asc' | 'desc';
@@ -51,6 +57,10 @@ interface TrackerTableProps {
   onArchiveItems?: (itemIds: string[], archive: boolean) => void;
   /** Callback for bulk/single delete action */
   onDeleteItems?: (itemIds: string[]) => void;
+  /** Copy a shareable deep link for the given tracker item. Only shown when
+   *  exactly one item is selected. Callers omit this when the workspace
+   *  has no team configured. */
+  onCopyDeepLink?: (itemId: string) => void;
   /** External search query from parent toolbar (replaces internal search input) */
   searchQuery?: string;
   /** Column configuration (visible columns, order, widths) */
@@ -321,9 +331,27 @@ function formatObjectForStringField(value: Record<string, any>): string {
  * Resolve the tracker frontmatter data for a given document and tracker type.
  * Returns merged data with top-level fields as canonical and embedded fields as fallback.
  * Returns null if the document doesn't match this tracker type.
+ *
+ * Mirrors `detectTrackerFromFrontmatter` in `frontmatterUtils.ts`: extension-owned
+ * keys (e.g. `automationStatus` for the automations extension) are checked before
+ * `trackerStatus`, and legacy per-type keys (`planStatus`, `decisionStatus`, etc.)
+ * remain supported as a fallback. Without keeping this logic aligned, the Tracker
+ * view silently drops documents that the rest of the system still classifies as
+ * full-document tracker items. See nimbalyst#67 and nimbalyst#481.
  */
 export function resolveTrackerFrontmatter(frontmatter: Record<string, any> | undefined, trackerType: string): Record<string, any> | null {
   if (!frontmatter) return null;
+
+  // Extension-owned key takes priority -- the extension owns the nested block,
+  // so its presence is enough to classify the doc as that tracker type.
+  for (const [extKey, extType] of Object.entries(EXTENSION_OWNED_KEYS)) {
+    if (extType !== trackerType) continue;
+    if (frontmatter[extKey] && typeof frontmatter[extKey] === 'object') {
+      const extData = frontmatter[extKey] as Record<string, any>;
+      const { [extKey]: _ext, trackerStatus: _ts, ...topLevel } = frontmatter;
+      return { ...topLevel, ...extData };
+    }
+  }
 
   // Check trackerStatus with nested type field (canonical format)
   if (frontmatter.trackerStatus && typeof frontmatter.trackerStatus === 'object') {
@@ -332,6 +360,17 @@ export function resolveTrackerFrontmatter(frontmatter: Record<string, any> | und
       // Top-level fields are canonical, trackerStatus holds only `type`
       const { trackerStatus: _, ...topLevel } = frontmatter;
       return { ...trackerData, ...topLevel };
+    }
+  }
+
+  // Legacy fallback: older plan/decision/etc. docs still store their fields
+  // inside per-type nested keys instead of canonical top-level trackerStatus.
+  for (const [legacyKey, legacyType] of Object.entries(LEGACY_KEY_TO_TYPE)) {
+    if (legacyType !== trackerType) continue;
+    if (frontmatter[legacyKey] && typeof frontmatter[legacyKey] === 'object') {
+      const legacyData = frontmatter[legacyKey] as Record<string, any>;
+      const { [legacyKey]: _, trackerStatus: _ts, ...topLevel } = frontmatter;
+      return { ...legacyData, ...topLevel };
     }
   }
 
@@ -393,7 +432,7 @@ export function convertFullDocumentToTrackerItems(metadata: any[], trackerType: 
       }
 
       return {
-        id: trackerStatus.planId || trackerStatus.decisionId || trackerStatus.id || `fm:${trackerType}:${doc.path}`,
+        id: trackerStatus.planId || trackerStatus.decisionId || trackerStatus.id || buildFullDocumentTrackerId(trackerType, doc.path),
         primaryType: trackerType,
         typeTags: [trackerType],
         source: 'frontmatter' as const,
@@ -408,7 +447,6 @@ export function convertFullDocumentToTrackerItems(metadata: any[], trackerType: 
           lastIndexed: (actualDate || new Date(0)).toISOString(),
         },
         fields,
-        fieldUpdatedAt: {},
       } satisfies TrackerRecord;
     });
 }
@@ -416,8 +454,11 @@ export function convertFullDocumentToTrackerItems(metadata: any[], trackerType: 
 /**
  * Render a cell value based on column definition.
  * Extracted to keep the row rendering clean.
+ *
+ * Exported so the new `TrackerTableGrid` view can render the same cell
+ * content without duplicating the field-by-field switch.
  */
-function renderCell(
+export function renderCell(
   col: TrackerColumnDef,
   item: TrackerRecord,
   value: any,
@@ -467,14 +508,15 @@ function renderCell(
         );
       }
       return (
-        <div className="min-w-0">
-          {item.issueKey && (
-            <div className="text-[10px] font-mono font-medium uppercase tracking-[0.08em] text-[var(--nim-text-faint)]">
-              {item.issueKey}
-            </div>
-          )}
-          <div className="title-text font-medium text-[var(--nim-text)]">{title}</div>
-        </div>
+        <div className="title-text text-[13px] font-medium text-[var(--nim-text)] truncate min-w-0">{title}</div>
+      );
+
+    case 'key':
+      if (!item.issueKey) return null;
+      return (
+        <span className="text-[11px] font-mono font-medium uppercase tracking-[0.04em] text-[var(--nim-text-faint)] truncate">
+          {item.issueKey}
+        </span>
       );
 
     case 'status': {
@@ -563,6 +605,25 @@ function renderCell(
       }
       return <span className="text-[var(--nim-text-faint)] text-xs">{formatRelativeDate(value as Date)}</span>;
 
+    case 'shared': {
+      // Read-only share indicator. `n/a` (sync mode `local`) renders nothing.
+      const shareState = getItemShareState(item);
+      if (shareState === 'n/a') return null;
+      const shared = shareState === 'shared';
+      const shareColor = shared ? '#22c55e' : '#6b7280';
+      return (
+        <span
+          className="shared-badge inline-flex items-center gap-1 py-0.5 px-2 rounded-[10px] text-[11px] font-medium border"
+          style={{ backgroundColor: `${shareColor}20`, color: shareColor, borderColor: shareColor }}
+          data-testid="tracker-shared-badge"
+          title={shared ? 'Shared with the team' : 'Local to this device'}
+        >
+          <span className="material-symbols-outlined text-[13px]">{shared ? 'group' : 'person'}</span>
+          {shared ? 'Shared' : 'Local'}
+        </span>
+      );
+    }
+
     default: {
       // Generic field rendering -- dispatch by col.render type
       if (value == null) return null;
@@ -617,6 +678,50 @@ function renderCell(
           );
         }
 
+        case 'relationship': {
+          const links = normalizeRelationshipValue(value);
+          if (links.length === 0) return null;
+          return (
+            <div className="flex flex-wrap gap-0.5">
+              {links.map((l) => (
+                <span
+                  key={l.itemId}
+                  className="relationship-pill inline-block px-1.5 py-0.5 text-[10px] rounded-full bg-[var(--nim-bg-tertiary)] text-[var(--nim-text-muted)]"
+                  title={l.title || l.itemId}
+                >
+                  {l.issueKey || l.title || l.itemId}
+                </span>
+              ))}
+            </div>
+          );
+        }
+
+        case 'url': {
+          // Accept legacy plain-string values as well as { url, label } objects.
+          const urlStr = typeof value === 'string'
+            ? value
+            : (value && typeof value === 'object' && typeof (value as any).url === 'string')
+              ? (value as any).url
+              : '';
+          if (!urlStr) return null;
+          const labelStr = (value && typeof value === 'object' && typeof (value as any).label === 'string')
+            ? (value as any).label
+            : '';
+          return (
+            <a
+              href={urlStr}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="text-[var(--nim-primary)] hover:underline text-xs inline-flex items-center gap-1 max-w-full overflow-hidden text-ellipsis whitespace-nowrap"
+              title={urlStr}
+              onClick={(e) => e.stopPropagation()}
+            >
+              <span className="material-symbols-outlined text-[11px] shrink-0">link</span>
+              <span className="overflow-hidden text-ellipsis">{labelStr || urlStr}</span>
+            </a>
+          );
+        }
+
         default:
           if (Array.isArray(value)) return <span className="text-[var(--nim-text-muted)] text-xs">{value.join(', ')}</span>;
           return <span className="text-[var(--nim-text-muted)] text-xs">{String(value)}</span>;
@@ -638,6 +743,7 @@ export function TrackerTable({
   overrideItems,
   onArchiveItems,
   onDeleteItems,
+  onCopyDeepLink,
   searchQuery: externalSearchQuery,
   columnConfig: externalColumnConfig,
   onColumnConfigChange,
@@ -720,83 +826,6 @@ export function TrackerTable({
     document.addEventListener('mousedown', handler);
     return () => document.removeEventListener('mousedown', handler);
   }, [showFilterMenu]);
-
-  // Inline editing state
-  const [editingCell, setEditingCell] = useState<{ itemId: string; field: 'status' | 'priority' | 'title' } | null>(null);
-  const [editingTitle, setEditingTitle] = useState('');
-  const titleInputRef = useRef<HTMLInputElement>(null);
-
-  /** Whether an item's fields can be edited inline */
-  const isItemEditable = useCallback((item: TrackerRecord): boolean => {
-    // Native (by source or no module), frontmatter, import, and inline items are all editable
-    return item.source === 'native' || !item.system.documentPath || item.source === 'frontmatter' || item.source === 'import' || item.source === 'inline';
-  }, []);
-
-  // Multi-select state
-  const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
-  const lastClickedIndexRef = useRef<number>(-1);
-  const tableRef = useRef<HTMLDivElement>(null);
-
-  // Keyboard focus state (which row has keyboard focus, independent of selection)
-  const [focusedIndex, setFocusedIndex] = useState<number>(-1);
-
-  // Context menu state
-  const [contextAnchor, setContextAnchor] = useState<DOMRect | null>(null);
-
-  // Floating context menu
-  const { refs: contextRefs, floatingStyles: contextFloatingStyles } = useFloating({
-    placement: 'right-start',
-    middleware: [offset(2), flip({ padding: 8 }), shift({ padding: 8 })],
-  });
-  useEffect(() => {
-    if (contextAnchor) {
-      contextRefs.setReference({ getBoundingClientRect: () => contextAnchor });
-    }
-  }, [contextAnchor, contextRefs]);
-
-  // Clear selection when items change significantly
-  useEffect(() => {
-    setSelectedIds(new Set());
-    lastClickedIndexRef.current = -1;
-  }, [activeTypeFilter]);
-
-  // Track sorted items in a ref so event handlers can access them
-  const sortedItemsRef = useRef<TrackerRecord[]>([]);
-
-  // Focus title input when editing starts
-  useEffect(() => {
-    if (editingCell?.field === 'title' && titleInputRef.current) {
-      titleInputRef.current.focus();
-      titleInputRef.current.select();
-    }
-  }, [editingCell]);
-
-  const handleFieldUpdate = useCallback(async (item: TrackerRecord, field: string, value: string) => {
-    const electronAPI = (window as any).electronAPI;
-    if (!electronAPI?.documentService) return;
-
-    try {
-      if ((item.source === 'frontmatter' || item.source === 'import' || item.source === 'inline') && item.system.documentPath) {
-        if (electronAPI.documentService.updateTrackerItemInFile) {
-          await electronAPI.documentService.updateTrackerItemInFile({
-            itemId: item.id,
-            updates: { [field]: value },
-          });
-        }
-      } else if (!item.system.documentPath || item.source === 'native') {
-        const tracker = globalRegistry.get(item.primaryType);
-        const syncMode = tracker?.sync?.mode || 'local';
-        await electronAPI.documentService.updateTrackerItem({
-          itemId: item.id,
-          updates: { [field]: value },
-          syncMode,
-        });
-      }
-    } catch (err) {
-      console.error('[TrackerTable] Failed to update item:', err);
-    }
-    setEditingCell(null);
-  }, []);
 
   // Reset filters when tracker type changes (different types have different fields/statuses)
   useEffect(() => {
@@ -897,255 +926,40 @@ export function TrackerTable({
 
   // console.log('[TrackerTable] Render - items:', items.length, 'filtered:', filteredItems.length, 'typeFilter:', typeFilter);
   const sortedItems = sortItems(filteredItems, currentSortBy, currentSortDirection);
-  sortedItemsRef.current = sortedItems;
 
-  /** Handle checkbox click with shift-range and cmd/ctrl-toggle support */
-  /** Toggle select all / deselect all */
-  const handleSelectAll = useCallback(() => {
-    setSelectedIds(prev => {
-      if (prev.size === sortedItemsRef.current.length && prev.size > 0) {
-        return new Set();
-      }
-      return new Set(sortedItemsRef.current.map(i => i.id).filter(Boolean));
-    });
-  }, []);
+  // Row interaction model -- shared with TrackerTableGrid via useTrackerRows.
+  const rows = useTrackerRows({
+    items: sortedItems,
+    activeTypeFilter,
+    onItemSelect,
+    onDeleteItems,
+    onArchiveItems,
+    onSwitchToFilesMode,
+  });
 
-  /** Context menu handler */
-  const handleContextMenu = useCallback((e: React.MouseEvent, item: TrackerRecord, index: number) => {
-    e.preventDefault();
-    e.stopPropagation();
-
-    // If right-clicking an unselected item, select just that item
-    if (!selectedIds.has(item.id)) {
-      setSelectedIds(new Set([item.id]));
-      lastClickedIndexRef.current = index;
-    }
-    setFocusedIndex(index);
-    setContextAnchor(DOMRect.fromRect({ x: e.clientX, y: e.clientY, width: 0, height: 0 }));
-  }, [selectedIds]);
-
-  /** Close context menu */
-  const closeContextMenu = useCallback(() => setContextAnchor(null), []);
-
-  // Close context menu on outside click
-  useEffect(() => {
-    if (!contextAnchor) return;
-    const handler = () => setContextAnchor(null);
-    document.addEventListener('click', handler);
-    document.addEventListener('contextmenu', handler);
-    return () => {
-      document.removeEventListener('click', handler);
-      document.removeEventListener('contextmenu', handler);
-    };
-  }, [contextAnchor]);
-
-  /** Bulk status update for selected items */
-  const handleBulkStatusUpdate = useCallback(async (newStatus: string) => {
-    closeContextMenu();
-    const itemsToUpdate = sortedItemsRef.current.filter(i => selectedIds.has(i.id));
-    for (const item of itemsToUpdate) {
-      if (isItemEditable(item)) {
-        await handleFieldUpdate(item, 'status', newStatus);
-      }
-    }
-  }, [selectedIds, closeContextMenu, isItemEditable, handleFieldUpdate]);
-
-  /** Bulk priority update for selected items */
-  const handleBulkPriorityUpdate = useCallback(async (newPriority: string) => {
-    closeContextMenu();
-    const itemsToUpdate = sortedItemsRef.current.filter(i => selectedIds.has(i.id));
-    for (const item of itemsToUpdate) {
-      if (isItemEditable(item)) {
-        await handleFieldUpdate(item, 'priority', newPriority);
-      }
-    }
-  }, [selectedIds, closeContextMenu, isItemEditable, handleFieldUpdate]);
-
-  /** Keyboard navigation */
-  useEffect(() => {
-    const table = tableRef.current;
-    if (!table) return;
-
-    const handleKeyDown = (e: KeyboardEvent) => {
-      const items = sortedItemsRef.current;
-      if (items.length === 0) return;
-
-      switch (e.key) {
-        case 'ArrowDown': {
-          e.preventDefault();
-          setFocusedIndex(prev => {
-            const next = Math.min(prev + 1, items.length - 1);
-            if (e.shiftKey) {
-              setSelectedIds(s => { const n = new Set(s); n.add(items[next].id); return n; });
-            }
-            return next;
-          });
-          break;
-        }
-        case 'ArrowUp': {
-          e.preventDefault();
-          setFocusedIndex(prev => {
-            const next = Math.max(prev - 1, 0);
-            if (e.shiftKey) {
-              setSelectedIds(s => { const n = new Set(s); n.add(items[next].id); return n; });
-            }
-            return next;
-          });
-          break;
-        }
-        case ' ': {
-          e.preventDefault();
-          if (focusedIndex >= 0 && focusedIndex < items.length) {
-            const item = items[focusedIndex];
-            setSelectedIds(prev => {
-              const next = new Set(prev);
-              if (next.has(item.id)) next.delete(item.id);
-              else next.add(item.id);
-              return next;
-            });
-          }
-          break;
-        }
-        case 'Enter': {
-          e.preventDefault();
-          if (focusedIndex >= 0 && focusedIndex < items.length) {
-            const item = items[focusedIndex];
-            if (onItemSelect && item.id) {
-              onItemSelect(item.id);
-            }
-          }
-          break;
-        }
-        case 'Delete':
-        case 'Backspace': {
-          if (e.metaKey || e.ctrlKey) {
-            e.preventDefault();
-            if (selectedIds.size > 0 && onDeleteItems) {
-              const ids = Array.from(selectedIds);
-              if (window.confirm(`Delete ${ids.length} item${ids.length > 1 ? 's' : ''}? This cannot be undone.`)) {
-                onDeleteItems(ids);
-                setSelectedIds(new Set());
-              }
-            }
-          }
-          break;
-        }
-        case 'a': {
-          if (e.metaKey || e.ctrlKey) {
-            e.preventDefault();
-            handleSelectAll();
-          }
-          break;
-        }
-        case 'Escape': {
-          setSelectedIds(new Set());
-          setFocusedIndex(-1);
-          closeContextMenu();
-          break;
-        }
-      }
-    };
-
-    table.addEventListener('keydown', handleKeyDown);
-    return () => table.removeEventListener('keydown', handleKeyDown);
-  }, [focusedIndex, selectedIds, onItemSelect, onDeleteItems, handleSelectAll, closeContextMenu]);
-
-  // Scroll focused row into view
-  useEffect(() => {
-    if (focusedIndex < 0) return;
-    const rows = tableRef.current?.querySelectorAll('[data-testid="tracker-table-row"]');
-    const row = rows?.[focusedIndex];
-    if (row) row.scrollIntoView({ block: 'nearest' });
-  }, [focusedIndex]);
-
-  const handleRowClick = (item: TrackerRecord, index: number, e: React.MouseEvent) => {
-    // Multi-select: Cmd/Ctrl+click toggles, Shift+click extends range
-    if (e.metaKey || e.ctrlKey) {
-      e.preventDefault();
-      setSelectedIds(prev => {
-        const next = new Set(prev);
-        if (next.has(item.id)) next.delete(item.id);
-        else next.add(item.id);
-        return next;
-      });
-      lastClickedIndexRef.current = index;
-      return;
-    }
-    if (e.shiftKey && lastClickedIndexRef.current >= 0) {
-      e.preventDefault();
-      const from = Math.min(lastClickedIndexRef.current, index);
-      const to = Math.max(lastClickedIndexRef.current, index);
-      setSelectedIds(prev => {
-        const next = new Set(prev);
-        for (let i = from; i <= to; i++) {
-          if (sortedItemsRef.current[i]?.id) next.add(sortedItemsRef.current[i].id);
-        }
-        return next;
-      });
-      return;
-    }
-
-    // Plain click: clear selection
-    setSelectedIds(new Set());
-    lastClickedIndexRef.current = index;
-
-    // Track analytics
-    if (posthog) {
-      posthog.capture('tracker_item_clicked', {
-        trackerType: item.primaryType,
-        itemStatus: item.fields.status,
-        isInline: item.system.lineNumber !== undefined && item.system.lineNumber !== 0,
-      });
-    }
-
-    // If onItemSelect is provided (Tracker Mode), open detail panel instead
-    if (onItemSelect && item.id) {
-      onItemSelect(item.id);
-      return;
-    }
-
-    // Editable items (native, frontmatter, import) - start editing title inline
-    if (isItemEditable(item)) {
-      setEditingTitle((item.fields.title as string) ?? '');
-      setEditingCell({ itemId: item.id, field: 'title' });
-      return;
-    }
-
-    // Switch to files mode first if we're in agent mode
-    if (onSwitchToFilesMode) {
-      onSwitchToFilesMode();
-    }
-
-    openItemInEditor(item);
-  };
-
-  const openItemInEditor = (item: TrackerRecord) => {
-    if (onSwitchToFilesMode) {
-      onSwitchToFilesMode();
-    }
-
-    const documentService = (window as any).documentService;
-    if (documentService && documentService.openDocument) {
-      documentService.getDocumentByPath(item.system.documentPath).then((doc: any) => {
-        if (doc) {
-          const fullPath = item.system.workspace && doc.path
-            ? `${item.system.workspace}/${doc.path}`.replace(/\/+/g, '/')
-            : doc.path;
-
-          documentService.openDocument(doc.id).then(() => {
-            if (item.system.lineNumber !== undefined && item.system.lineNumber !== 0) {
-              const editorRegistry = (window as any).__editorRegistry;
-              if (editorRegistry && item.id) {
-                setTimeout(() => {
-                  editorRegistry.scrollToTrackerItem(fullPath, item.id);
-                }, 500);
-              }
-            }
-          });
-        }
-      });
-    }
-  };
+  // Local aliases so the existing JSX below stays readable.
+  const {
+    selectedIds,
+    setSelectedIds,
+    focusedIndex,
+    containerRef: tableRef,
+    editingCell,
+    setEditingCell,
+    editingTitle,
+    setEditingTitle,
+    titleInputRef,
+    handleFieldUpdate,
+    isItemEditable,
+    handleRowClick,
+    openItemInEditor,
+    contextAnchor,
+    contextRefs,
+    contextFloatingStyles,
+    handleContextMenu,
+    closeContextMenu,
+    handleBulkStatusUpdate,
+    handleBulkPriorityUpdate,
+  } = rows;
 
   const handleColumnClick = (column: SortColumn) => {
     const newDirection = currentSortBy === column && currentSortDirection === 'desc' ? 'asc' : 'desc';
@@ -1604,6 +1418,21 @@ export function TrackerTable({
 
           <div className="border-b border-[var(--nim-border)] my-1" />
 
+          {/* Copy Link (single-selection only) */}
+          {onCopyDeepLink && selectedIds.size === 1 && (
+            <button
+              className="w-full flex items-center gap-2 px-3 py-1.5 text-left text-[var(--nim-text)] hover:bg-[var(--nim-bg-hover)] cursor-pointer"
+              onClick={() => {
+                const [onlyId] = selectedIds;
+                closeContextMenu();
+                onCopyDeepLink(onlyId);
+              }}
+            >
+              <span className="material-symbols-outlined text-sm">link</span>
+              Copy Link
+            </button>
+          )}
+
           {/* Archive */}
           {onArchiveItems && (
             <button
@@ -1643,8 +1472,9 @@ export function TrackerTable({
   );
 }
 
-/** Context menu submenu with hover-expand */
-const ContextSubmenu: React.FC<{
+/** Context menu submenu with hover-expand. Exported for reuse in the new
+ *  TrackerTableGrid context menu. */
+export const ContextSubmenu: React.FC<{
   label: string;
   icon: string;
   children: React.ReactNode;

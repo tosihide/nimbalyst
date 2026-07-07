@@ -94,8 +94,8 @@ test('should show file tree with test file', async () => {
 });
 
 test('should open file when clicked in sidebar', async () => {
-  await page.locator('.file-tree-name', { hasText: 'test.md' }).first().waitFor({ timeout: TEST_TIMEOUTS.FILE_TREE_LOAD });
-  await page.locator('.file-tree-name', { hasText: 'test.md' }).click();
+  await page.locator('.file-tree-name', { hasText: /^test\.md$/ }).waitFor({ timeout: TEST_TIMEOUTS.FILE_TREE_LOAD });
+  await page.locator('.file-tree-name', { hasText: /^test\.md$/ }).click();
 
   await expect(page.locator(ACTIVE_FILE_TAB_SELECTOR)).toContainText('test.md', { timeout: TEST_TIMEOUTS.TAB_SWITCH });
 

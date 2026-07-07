@@ -6,8 +6,8 @@
  * No layer outside the schema may assume field names.
  */
 
-import type { TrackerIdentity, TrackerActivity, TrackerItem, TrackerItemSource } from './DocumentService';
-import type { TrackerComment } from '../sync/trackerSyncTypes';
+import type { TrackerIdentity, TrackerActivity, TrackerItem, TrackerItemSource, TrackerOrigin } from './DocumentService';
+import type { TrackerCommentEntry as TrackerComment } from '../sync/trackerProtocol';
 
 // ---------------------------------------------------------------------------
 // Canonical Record
@@ -18,6 +18,19 @@ export interface LinkedCommit {
   message: string;
   sessionId?: string;
   timestamp: string;
+}
+
+/**
+ * Explicit link from a tracker item to a pull request, written by the PR
+ * view's "Link tracker item" action (or agent tooling). Complements the
+ * zero-config path where any url-type field matching a PR URL counts as a
+ * reference (see plugins/TrackerPlugin/prReferences.ts).
+ */
+export interface LinkedPullRequest {
+  /** GitHub remote as "owner/repo" (lowercase). */
+  remote: string;
+  number: number;
+  url?: string;
 }
 
 export interface TrackerRecordSystem {
@@ -33,9 +46,12 @@ export interface TrackerRecordSystem {
   linkedSessions?: string[];
   linkedCommitSha?: string;
   linkedCommits?: LinkedCommit[];
+  linkedPullRequests?: LinkedPullRequest[];
   documentId?: string;
   activity?: TrackerActivity[];
   comments?: TrackerComment[];
+  /** Structured origin (how the item entered Nimbalyst; pointer to upstream for imports). */
+  origin?: TrackerOrigin;
 }
 
 export interface TrackerRecord {
@@ -51,7 +67,6 @@ export interface TrackerRecord {
   content?: unknown;
   system: TrackerRecordSystem;
   fields: Record<string, unknown>;
-  fieldUpdatedAt: Record<string, number>;
 }
 
 // ---------------------------------------------------------------------------
@@ -65,9 +80,11 @@ const SYSTEM_KEYS = new Set([
   'linkedSessions',
   'linkedCommitSha',
   'linkedCommits',
+  'linkedPullRequests',
   'documentId',
   'activity',
   'comments',
+  'origin',
   // also pulled from row-level columns, not from data JSONB
   'assigneeId',
   'reporterId',
@@ -89,8 +106,6 @@ const NON_FIELD_KEYS = new Set([
   'assigneeId', 'reporterId',
   // old catch-all that's being replaced
   'customFields',
-  // internal metadata keys (persisted in JSONB but not user-visible fields)
-  '_fieldUpdatedAt', 'fieldUpdatedAt',
 ]);
 
 // ---------------------------------------------------------------------------
@@ -122,15 +137,6 @@ export function trackerItemToRecord(item: TrackerItem): TrackerRecord {
     }
   }
 
-  // Use persisted per-field timestamps when available (from PGLite round-trip),
-  // falling back to "now" for fields without a persisted timestamp.
-  const persistedTimestamps: Record<string, number> = item.fieldUpdatedAt || {};
-  const now = Date.now();
-  const fieldUpdatedAt: Record<string, number> = {};
-  for (const key of Object.keys(fields)) {
-    fieldUpdatedAt[key] = persistedTimestamps[key] ?? now;
-  }
-
   const record: TrackerRecord = {
     id: item.id,
     primaryType: item.type,
@@ -160,9 +166,9 @@ export function trackerItemToRecord(item: TrackerItem): TrackerRecord {
       linkedCommitSha: item.linkedCommitSha,
       linkedCommits: item.linkedCommits,
       documentId: item.documentId,
+      origin: item.origin,
     },
     fields,
-    fieldUpdatedAt,
   };
 
   // Pull any SYSTEM_KEYS found in customFields into system generically.
@@ -229,6 +235,7 @@ export function trackerRecordToItem(record: TrackerRecord): TrackerItem {
     content: record.content,
     archived: record.archived,
     archivedAt: undefined, // not stored on TrackerRecord -- derive from activity if needed
+    origin: record.system.origin,
     source: record.source as TrackerItemSource,
     sourceRef: record.sourceRef,
     authorIdentity: record.system.authorIdentity,
@@ -240,7 +247,6 @@ export function trackerRecordToItem(record: TrackerRecord): TrackerItem {
     documentId: record.system.documentId,
     syncStatus: record.syncStatus as TrackerItem['syncStatus'],
     customFields: Object.keys(customFields).length > 0 ? customFields : undefined,
-    fieldUpdatedAt: record.fieldUpdatedAt,
   };
 }
 
@@ -257,27 +263,51 @@ export function trackerRecordToItem(record: TrackerRecord): TrackerItem {
  */
 export function dbRowToRecord(row: any): TrackerRecord {
   const data = typeof row.data === 'string' ? JSON.parse(row.data) : row.data || {};
+  const nestedCustomFields =
+    data.customFields && typeof data.customFields === 'object' && !Array.isArray(data.customFields)
+      ? data.customFields as Record<string, unknown>
+      : undefined;
 
-  const typeTags: string[] = row.type_tags?.length > 0
-    ? row.type_tags
+  // type_tags is TEXT[] in PGLite (returns string[]) but TEXT in SQLite (returns a
+  // JSON-encoded string). Parse the SQLite shape back into an array, otherwise a raw
+  // string flows downstream and breaks array operations on typeTags.
+  const rawTypeTags = row.type_tags;
+  const parsedTypeTags: string[] | undefined = Array.isArray(rawTypeTags)
+    ? rawTypeTags
+    : typeof rawTypeTags === 'string'
+      ? (() => {
+          try {
+            const parsed = JSON.parse(rawTypeTags);
+            return Array.isArray(parsed) ? (parsed as string[]) : undefined;
+          } catch {
+            return undefined;
+          }
+        })()
+      : undefined;
+  const typeTags: string[] = parsedTypeTags && parsedTypeTags.length > 0
+    ? parsedTypeTags
     : [row.type];
 
   // Separate system keys from user fields
   const fields: Record<string, unknown> = {};
-  const now = Date.now();
-
-  // Read persisted per-field LWW timestamps if available (backward-compatible:
-  // old rows without _fieldUpdatedAt fall back to "now" for each field)
-  const persistedTimestamps: Record<string, number> = data._fieldUpdatedAt || {};
-  const fieldUpdatedAt: Record<string, number> = { ...persistedTimestamps };
 
   for (const [key, value] of Object.entries(data)) {
     if (NON_FIELD_KEYS.has(key) || SYSTEM_KEYS.has(key)) continue;
     if (value !== undefined) {
       fields[key] = value;
-      if (!fieldUpdatedAt[key]) fieldUpdatedAt[key] = now;
     }
   }
+  if (nestedCustomFields) {
+    for (const [key, value] of Object.entries(nestedCustomFields)) {
+      if (NON_FIELD_KEYS.has(key) || SYSTEM_KEYS.has(key)) continue;
+      if (value !== undefined) {
+        fields[key] = value;
+      }
+    }
+  }
+
+  const systemValue = (key: string): unknown =>
+    data[key] !== undefined ? data[key] : nestedCustomFields?.[key];
 
   return {
     id: row.id,
@@ -297,18 +327,19 @@ export function dbRowToRecord(row: any): TrackerRecord {
       createdAt: data.created || (row.created ? new Date(row.created).toISOString() : new Date().toISOString()),
       updatedAt: data.updated || (row.updated ? new Date(row.updated).toISOString() : new Date().toISOString()),
       lastIndexed: row.last_indexed ? new Date(row.last_indexed).toISOString() : undefined,
-      authorIdentity: data.authorIdentity || undefined,
-      lastModifiedBy: data.lastModifiedBy || undefined,
-      createdByAgent: data.createdByAgent || false,
-      linkedSessions: data.linkedSessions || undefined,
-      linkedCommitSha: data.linkedCommitSha || undefined,
-      linkedCommits: data.linkedCommits || undefined,
-      documentId: data.documentId || undefined,
-      activity: data.activity || undefined,
-      comments: data.comments || undefined,
+      authorIdentity: systemValue('authorIdentity') as TrackerIdentity | null | undefined,
+      lastModifiedBy: systemValue('lastModifiedBy') as TrackerIdentity | null | undefined,
+      createdByAgent: (systemValue('createdByAgent') as boolean | undefined) || false,
+      linkedSessions: systemValue('linkedSessions') as string[] | undefined,
+      linkedCommitSha: systemValue('linkedCommitSha') as string | undefined,
+      linkedCommits: systemValue('linkedCommits') as LinkedCommit[] | undefined,
+      linkedPullRequests: systemValue('linkedPullRequests') as LinkedPullRequest[] | undefined,
+      documentId: systemValue('documentId') as string | undefined,
+      activity: systemValue('activity') as TrackerActivity[] | undefined,
+      comments: systemValue('comments') as TrackerComment[] | undefined,
+      origin: systemValue('origin') as TrackerOrigin | undefined,
     },
     fields,
-    fieldUpdatedAt,
   };
 }
 
@@ -342,16 +373,13 @@ export function recordToDbParams(record: TrackerRecord): {
   if (record.system.linkedSessions?.length) data.linkedSessions = record.system.linkedSessions;
   if (record.system.linkedCommitSha) data.linkedCommitSha = record.system.linkedCommitSha;
   if (record.system.linkedCommits?.length) data.linkedCommits = record.system.linkedCommits;
+  if (record.system.linkedPullRequests?.length) data.linkedPullRequests = record.system.linkedPullRequests;
   if (record.system.documentId) data.documentId = record.system.documentId;
   if (record.system.activity?.length) data.activity = record.system.activity;
   if (record.system.comments?.length) data.comments = record.system.comments;
+  if (record.system.origin) data.origin = record.system.origin;
   if (record.system.createdAt) data.created = record.system.createdAt;
   if (record.system.updatedAt) data.updated = record.system.updatedAt;
-
-  // Persist per-field LWW timestamps for sync conflict resolution
-  if (record.fieldUpdatedAt && Object.keys(record.fieldUpdatedAt).length > 0) {
-    data._fieldUpdatedAt = record.fieldUpdatedAt;
-  }
 
   return {
     id: record.id,

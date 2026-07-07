@@ -12,12 +12,13 @@ import path from 'node:path';
 import { Tray, Menu, app, nativeImage, nativeTheme, systemPreferences, BrowserWindow } from 'electron';
 import { getSessionStateManager } from '@nimbalyst/runtime/ai/server/SessionStateManager';
 import type { SessionStateEvent } from '@nimbalyst/runtime/ai/server/types/SessionState';
+import { AISessionsRepository } from '@nimbalyst/runtime/storage/repositories/AISessionsRepository';
 import { findWindowByWorkspace } from '../window/WindowManager';
 import { getPackageRoot } from '../utils/appPaths';
 import { isShowTrayIcon, setShowTrayIcon, getSessionSyncConfig, setSessionSyncConfig } from '../utils/store';
 import { logger } from '../utils/logger';
 import { isPreventingSleep, getSleepPreventionMode } from '../services/PowerSaveService';
-import { updateSleepPrevention, resolvePreventSleepMode } from '../services/SyncManager';
+import { updateSleepPrevention, resolvePreventSleepMode, getSyncProvider } from '../services/SyncManager';
 
 // ─── Types ──────────────────────────────────────────────────────────────────
 
@@ -39,6 +40,14 @@ interface TraySessionInfo {
 
 interface DatabaseWorker {
   query<T = any>(sql: string, params?: any[]): Promise<{ rows: T[] }>;
+}
+
+interface TrayUnreadClearPayload {
+  sessions: Array<{
+    sessionId: string;
+    workspacePath: string;
+    lastReadAt: number;
+  }>;
 }
 
 // ─── Constants ──────────────────────────────────────────────────────────────
@@ -87,12 +96,6 @@ export class TrayManager {
       return;
     }
 
-    // macOS only for initial implementation
-    if (process.platform !== 'darwin') {
-      logger.main.info('[TrayManager] Skipping initialization on non-macOS platform');
-      return;
-    }
-
     const manager = getSessionStateManager();
     if (!manager) {
       throw new Error('[TrayManager] SessionStateManager is not initialized -- cannot create tray without session data source');
@@ -104,18 +107,26 @@ export class TrayManager {
     });
 
     // Re-render icon when system appearance changes (needed for non-template icons with blue dots).
-    // nativeTheme 'updated' fires when the app's themeSource changes or when the system
-    // appearance changes AND themeSource is 'system'. Since the app may force dark mode,
-    // also listen to systemPreferences for actual macOS appearance changes.
+    // `nativeTheme.on('updated', ...)` is cross-platform and remains the primary signal on
+    // every OS. `systemPreferences.subscribeNotification` is macOS-only (it wraps
+    // NSDistributedNotificationCenter and throws on Linux/Windows), so guard it. Without the
+    // guard, this method threw at startup on non-darwin and the tray never initialised.
+    // See nimbalyst#39.
     const onThemeUpdated = () => this.updateIcon();
     nativeTheme.on('updated', onThemeUpdated);
-    const appearanceSubId = systemPreferences.subscribeNotification(
-      'AppleInterfaceThemeChangedNotification',
-      onThemeUpdated,
-    );
+
+    let appearanceSubId: number | null = null;
+    if (process.platform === 'darwin') {
+      appearanceSubId = systemPreferences.subscribeNotification(
+        'AppleInterfaceThemeChangedNotification',
+        onThemeUpdated,
+      );
+    }
     this.themeListener = () => {
       nativeTheme.removeListener('updated', onThemeUpdated);
-      systemPreferences.unsubscribeNotification(appearanceSubId);
+      if (appearanceSubId !== null) {
+        systemPreferences.unsubscribeNotification(appearanceSubId);
+      }
     };
 
     // Seed the cache with sessions that are already unread in the database.
@@ -441,6 +452,12 @@ export class TrayManager {
           click: () => this.handleSessionClick(session.sessionId, session.workspacePath),
         });
       }
+      menuItems.push({
+        label: 'Clear All Unread',
+        click: () => {
+          void this.clearAllUnreadSessions();
+        },
+      });
       menuItems.push({ type: 'separator' });
     }
 
@@ -516,15 +533,20 @@ export class TrayManager {
     const icon = this.getIconForState(state);
     this.tray.setImage(icon);
 
-    // Update title text on macOS (shown next to the icon)
-    const runningCount = this.getRunningCount();
-    const attentionCount = this.getAttentionCount();
-    if (attentionCount > 0) {
-      this.tray.setTitle(` ${attentionCount}`);
-    } else if (runningCount > 0) {
-      this.tray.setTitle(` ${runningCount}`);
-    } else {
-      this.tray.setTitle('');
+    // Update title text on macOS (shown next to the icon). `setTitle` is a
+    // macOS-only Tray method; calling it on Linux/Windows is documented as a
+    // no-op but the API is officially `darwin` only. Guard it to keep the
+    // intent explicit and avoid future Electron versions throwing here.
+    if (process.platform === 'darwin') {
+      const runningCount = this.getRunningCount();
+      const attentionCount = this.getAttentionCount();
+      if (attentionCount > 0) {
+        this.tray.setTitle(` ${attentionCount}`);
+      } else if (runningCount > 0) {
+        this.tray.setTitle(` ${runningCount}`);
+      } else {
+        this.tray.setTitle('');
+      }
     }
   }
 
@@ -698,38 +720,94 @@ export class TrayManager {
     }
 
     // Clear unread flag when user clicks (in-memory + database)
+    void this.markSessionsRead([{ sessionId, workspacePath }]);
+  }
+
+  /**
+   * Clear every unread session from the tray in one action.
+   */
+  private async clearAllUnreadSessions(): Promise<void> {
+    const unreadSessions = Array.from(this.sessionCache.values())
+      .filter((session) => session.hasUnread && session.workspacePath)
+      .map((session) => ({
+        sessionId: session.sessionId,
+        workspacePath: session.workspacePath,
+      }));
+
+    if (unreadSessions.length === 0) return;
+
+    await this.markSessionsRead(unreadSessions);
+  }
+
+  /**
+   * Apply read-state updates consistently for tray actions:
+   * - clear in-memory unread state
+   * - persist hasUnread/lastReadAt
+   * - fan out a renderer notification so open windows update immediately
+   */
+  private async markSessionsRead(
+    sessions: Array<{ sessionId: string; workspacePath: string }>
+  ): Promise<void> {
+    if (sessions.length === 0) return;
+
+    const lastReadAt = Date.now();
+    const rendererPayload: TrayUnreadClearPayload = {
+      sessions: sessions.map((session) => ({
+        ...session,
+        lastReadAt,
+      })),
+    };
+
+    for (const session of sessions) {
+      this.applyReadStateToCache(session.sessionId);
+    }
+    this.scheduleMenuRebuild();
+    this.broadcastUnreadCleared(rendererPayload);
+
+    await Promise.all(
+      sessions.map((session) => this.persistReadState(session.sessionId, lastReadAt))
+    );
+  }
+
+  private applyReadStateToCache(sessionId: string): void {
     const session = this.sessionCache.get(sessionId);
-    if (session) {
-      session.hasUnread = false;
-      this.scheduleMenuRebuild();
-      this.clearUnreadInDatabase(sessionId);
+    if (!session) return;
+
+    session.hasUnread = false;
+    if ((session.status === 'completed' || session.status === 'idle') && !session.hasPendingPrompt) {
+      this.sessionCache.delete(sessionId);
+      this.clearLingerTimer(sessionId);
+    }
+  }
+
+  private broadcastUnreadCleared(payload: TrayUnreadClearPayload): void {
+    for (const window of BrowserWindow.getAllWindows()) {
+      if (window.isDestroyed()) continue;
+      window.webContents.send('tray:clear-unread', payload);
     }
   }
 
   /**
-   * Persist hasUnread = false to the database so it survives restarts.
+   * Persist hasUnread = false and lastReadAt so tray clears match renderer semantics.
    */
-  private async clearUnreadInDatabase(sessionId: string): Promise<void> {
-    if (!this.database) return;
+  private async persistReadState(sessionId: string, lastReadAt: number): Promise<void> {
+    const syncProvider = getSyncProvider();
 
     try {
-      // Clear both the nested and legacy flat paths
-      await this.database.query(
-        `UPDATE ai_sessions
-         SET metadata = jsonb_set(
-           jsonb_set(
-             COALESCE(metadata, '{}'::jsonb),
-             '{metadata,hasUnread}',
-             'false'::jsonb
-           ),
-           '{hasUnread}',
-           'false'::jsonb
-         )
-         WHERE id = $1`,
-        [sessionId]
-      );
+      await AISessionsRepository.updateMetadata(sessionId, {
+        metadata: {
+          hasUnread: false,
+          lastReadAt,
+        },
+      });
+      if (syncProvider) {
+        syncProvider.pushChange(sessionId, {
+          type: 'metadata_updated',
+          metadata: { lastReadAt },
+        });
+      }
     } catch (error) {
-      logger.main.error('[TrayManager] Failed to clear unread in database:', error);
+      logger.main.error('[TrayManager] Failed to persist read state from tray action:', error);
     }
   }
 
@@ -804,7 +882,7 @@ export class TrayManager {
         workspacePath: row.workspace_id || '',
         status: 'running',
         isStreaming: false,
-        hasPendingPrompt: !!metadata.pendingAskUserQuestion,
+        hasPendingPrompt: !!metadata.hasPendingPrompt,
         hasUnread: !!metadata.hasUnread,
       };
     } catch (error) {

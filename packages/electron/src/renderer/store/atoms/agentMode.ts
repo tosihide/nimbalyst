@@ -21,6 +21,7 @@ import { atomFamily } from '../debug/atomFamilyRegistry';
 import { store } from '@nimbalyst/runtime/store';
 import { selectedWorkstreamAtom, type WorkstreamType } from './sessions';
 import { sessionStoreAtom } from './sessions';
+import { activeWorkspacePathAtom } from './openProjects';
 import type { TeammateInfo } from '../../components/AgentMode/TeammatePanel';
 
 // ============================================================
@@ -48,6 +49,7 @@ export interface AgentModeLayout {
   sessionHistoryLayout: SessionHistoryLayout;
   filesEditedWidth: number;
   todoPanelCollapsed: boolean;
+  taskListPanelCollapsed: boolean;
   teammatePanelCollapsed: boolean;
   agentPanelCollapsed: boolean;
   trackerPanelCollapsed: boolean;
@@ -70,6 +72,7 @@ const DEFAULT_LAYOUT: AgentModeLayout = {
   sessionHistoryLayout: DEFAULT_SESSION_HISTORY_LAYOUT,
   filesEditedWidth: 256,
   todoPanelCollapsed: false,
+  taskListPanelCollapsed: false,
   teammatePanelCollapsed: false,
   agentPanelCollapsed: false,
   trackerPanelCollapsed: false,
@@ -94,6 +97,7 @@ function mergeWithDefaults(persisted: Partial<AgentModeLayout> | undefined): Age
     sessionHistoryLayout,
     filesEditedWidth: persisted?.filesEditedWidth ?? DEFAULT_LAYOUT.filesEditedWidth,
     todoPanelCollapsed: persisted?.todoPanelCollapsed ?? DEFAULT_LAYOUT.todoPanelCollapsed,
+    taskListPanelCollapsed: persisted?.taskListPanelCollapsed ?? DEFAULT_LAYOUT.taskListPanelCollapsed,
     teammatePanelCollapsed: persisted?.teammatePanelCollapsed ?? DEFAULT_LAYOUT.teammatePanelCollapsed,
     agentPanelCollapsed: persisted?.agentPanelCollapsed ?? DEFAULT_LAYOUT.agentPanelCollapsed,
     trackerPanelCollapsed: persisted?.trackerPanelCollapsed ?? DEFAULT_LAYOUT.trackerPanelCollapsed,
@@ -101,14 +105,37 @@ function mergeWithDefaults(persisted: Partial<AgentModeLayout> | undefined): Age
 }
 
 /**
- * Main atom for agent mode layout state.
- * Contains all layout-related state in a single object.
+ * Per-workspace agent mode layout. Keep-warm switching needs each open
+ * project to retain its own layout while inactive, so the layout state is
+ * keyed by workspace path.
  */
-export const agentModeLayoutAtom = atom<AgentModeLayout>(DEFAULT_LAYOUT);
+export const agentModeLayoutAtomFamily = atomFamily((_workspacePath: string) =>
+  atom<AgentModeLayout>(DEFAULT_LAYOUT)
+);
 
-// Track workspace path for persistence
-// IMPORTANT: Use module-level variable, not atom, so it persists across HMR
-let currentWorkspacePath: string | null = null;
+/** Drop the cached layout slot for a workspace (called on rail close). */
+export function pruneAgentModeWorkspaceState(workspacePath: string): void {
+  agentModeLayoutAtomFamily.remove(workspacePath);
+}
+
+/**
+ * Read+write proxy that resolves to the active workspace's layout slot.
+ * Existing callers that import `agentModeLayoutAtom` keep working — the
+ * proxy reads/writes the family entry for whatever path is in
+ * `activeWorkspacePathAtom`.
+ */
+export const agentModeLayoutAtom = atom<AgentModeLayout, [AgentModeLayout], void>(
+  (get) => {
+    const path = get(activeWorkspacePathAtom);
+    if (!path) return DEFAULT_LAYOUT;
+    return get(agentModeLayoutAtomFamily(path));
+  },
+  (get, set, value: AgentModeLayout) => {
+    const path = get(activeWorkspacePathAtom);
+    if (!path) return;
+    set(agentModeLayoutAtomFamily(path), value);
+  }
+);
 
 // ============================================================
 // Derived Atoms (read-only slices)
@@ -147,6 +174,11 @@ export const viewModeAtom = atom(
 /** Whether the todo panel is collapsed */
 export const todoPanelCollapsedAtom = atom(
   (get) => get(agentModeLayoutAtom).todoPanelCollapsed
+);
+
+/** Whether the task-list panel is collapsed */
+export const taskListPanelCollapsedAtom = atom(
+  (get) => get(agentModeLayoutAtom).taskListPanelCollapsed
 );
 
 /** Whether the teammate panel is collapsed */
@@ -197,6 +229,28 @@ export const sessionTasksAtom = atomFamily((sessionId: string) =>
   })
 );
 
+/** One item in the SDK-native task list (TaskCreate/TaskUpdate). Distinct from
+ *  TaskInfo (sub-agent telemetry) — this is the shared, dependency-aware queue. */
+export interface TaskListItem {
+  id: string;
+  subject: string;
+  description?: string;
+  activeForm?: string;
+  status: 'pending' | 'in_progress' | 'completed';
+  owner?: string;
+  blocks?: string[];
+  blockedBy?: string[];
+}
+
+/** Per-session derived atom for the SDK-native task list from session metadata */
+export const sessionTaskListAtom = atomFamily((sessionId: string) =>
+  atom((get) => {
+    const session = get(sessionStoreAtom(sessionId));
+    const raw = session?.metadata?.currentTaskList;
+    return Array.isArray(raw) ? raw as TaskListItem[] : [];
+  })
+);
+
 /** Write-only atom to request scrolling to a teammate's spawn point in the transcript.
  *  Set by TeammatePanel on click, consumed by RichTranscriptView.  */
 export const scrollToTeammateAtom = atom<{ sessionId: string; agentId: string } | null>(null);
@@ -213,23 +267,27 @@ export const requestOpenSessionAtom = atom<string | null>(null);
 // Debounced Persistence
 // ============================================================
 
-let persistTimer: ReturnType<typeof setTimeout> | null = null;
+// Per-workspace persist timers so a write to project A is not cancelled when
+// the user switches to project B before the debounce fires.
+const persistTimers = new Map<string, ReturnType<typeof setTimeout>>();
 
 function schedulePersist(workspacePath: string, layout: AgentModeLayout): void {
-  if (persistTimer) {
-    clearTimeout(persistTimer);
+  const existing = persistTimers.get(workspacePath);
+  if (existing) {
+    clearTimeout(existing);
   }
 
-  persistTimer = setTimeout(async () => {
+  const timer = setTimeout(async () => {
+    persistTimers.delete(workspacePath);
     try {
-      // Persist directly - runtime shape matches persisted shape
       const state = { agenticCodingWindowState: layout };
-      // console.log('[agentMode] Persisting layout:', JSON.stringify(state, null, 2));
       await window.electronAPI.invoke('workspace:update-state', workspacePath, state);
     } catch (err) {
       console.error('[agentMode] Failed to persist layout:', err);
     }
   }, 500);
+
+  persistTimers.set(workspacePath, timer);
 }
 
 // ============================================================
@@ -242,6 +300,7 @@ function schedulePersist(workspacePath: string, layout: AgentModeLayout): void {
 export const setSessionHistoryLayoutAtom = atom(
   null,
   (get, set, updates: Partial<SessionHistoryLayout>) => {
+    const workspacePath = get(activeWorkspacePathAtom);
     const current = get(agentModeLayoutAtom);
     const newLayout: AgentModeLayout = {
       ...current,
@@ -250,11 +309,11 @@ export const setSessionHistoryLayoutAtom = atom(
 
     set(agentModeLayoutAtom, newLayout);
 
-    if (!currentWorkspacePath) {
-      console.warn('[agentMode] Cannot persist layout - initAgentModeLayout not called yet');
+    if (!workspacePath) {
+      console.warn('[agentMode] Cannot persist layout - no active workspace');
       return;
     }
-    schedulePersist(currentWorkspacePath, newLayout);
+    schedulePersist(workspacePath, newLayout);
   }
 );
 
@@ -265,16 +324,17 @@ export const setSessionHistoryLayoutAtom = atom(
 export const setAgentModeLayoutAtom = atom(
   null,
   (get, set, updates: { filesEditedWidth?: number }) => {
+    const workspacePath = get(activeWorkspacePathAtom);
     const current = get(agentModeLayoutAtom);
     const newLayout = { ...current, ...updates };
 
     set(agentModeLayoutAtom, newLayout);
 
-    if (!currentWorkspacePath) {
-      console.warn('[agentMode] Cannot persist layout - initAgentModeLayout not called yet');
+    if (!workspacePath) {
+      console.warn('[agentMode] Cannot persist layout - no active workspace');
       return;
     }
-    schedulePersist(currentWorkspacePath, newLayout);
+    schedulePersist(workspacePath, newLayout);
   }
 );
 
@@ -350,16 +410,37 @@ export const setViewModeAtom = atom(
 export const toggleTodoPanelCollapsedAtom = atom(
   null,
   (get, set) => {
+    const workspacePath = get(activeWorkspacePathAtom);
     const current = get(agentModeLayoutAtom);
     const newLayout = { ...current, todoPanelCollapsed: !current.todoPanelCollapsed };
 
     set(agentModeLayoutAtom, newLayout);
 
-    if (!currentWorkspacePath) {
-      console.warn('[agentMode] Cannot persist layout - initAgentModeLayout not called yet');
+    if (!workspacePath) {
+      console.warn('[agentMode] Cannot persist layout - no active workspace');
       return;
     }
-    schedulePersist(currentWorkspacePath, newLayout);
+    schedulePersist(workspacePath, newLayout);
+  }
+);
+
+/**
+ * Toggle task-list panel collapsed state.
+ */
+export const toggleTaskListPanelCollapsedAtom = atom(
+  null,
+  (get, set) => {
+    const workspacePath = get(activeWorkspacePathAtom);
+    const current = get(agentModeLayoutAtom);
+    const newLayout = { ...current, taskListPanelCollapsed: !current.taskListPanelCollapsed };
+
+    set(agentModeLayoutAtom, newLayout);
+
+    if (!workspacePath) {
+      console.warn('[agentMode] Cannot persist layout - no active workspace');
+      return;
+    }
+    schedulePersist(workspacePath, newLayout);
   }
 );
 
@@ -369,16 +450,17 @@ export const toggleTodoPanelCollapsedAtom = atom(
 export const toggleTeammatePanelCollapsedAtom = atom(
   null,
   (get, set) => {
+    const workspacePath = get(activeWorkspacePathAtom);
     const current = get(agentModeLayoutAtom);
     const newLayout = { ...current, teammatePanelCollapsed: !current.teammatePanelCollapsed };
 
     set(agentModeLayoutAtom, newLayout);
 
-    if (!currentWorkspacePath) {
-      console.warn('[agentMode] Cannot persist layout - initAgentModeLayout not called yet');
+    if (!workspacePath) {
+      console.warn('[agentMode] Cannot persist layout - no active workspace');
       return;
     }
-    schedulePersist(currentWorkspacePath, newLayout);
+    schedulePersist(workspacePath, newLayout);
   }
 );
 
@@ -388,16 +470,17 @@ export const toggleTeammatePanelCollapsedAtom = atom(
 export const toggleAgentPanelCollapsedAtom = atom(
   null,
   (get, set) => {
+    const workspacePath = get(activeWorkspacePathAtom);
     const current = get(agentModeLayoutAtom);
     const newLayout = { ...current, agentPanelCollapsed: !current.agentPanelCollapsed };
 
     set(agentModeLayoutAtom, newLayout);
 
-    if (!currentWorkspacePath) {
-      console.warn('[agentMode] Cannot persist layout - initAgentModeLayout not called yet');
+    if (!workspacePath) {
+      console.warn('[agentMode] Cannot persist layout - no active workspace');
       return;
     }
-    schedulePersist(currentWorkspacePath, newLayout);
+    schedulePersist(workspacePath, newLayout);
   }
 );
 
@@ -407,16 +490,17 @@ export const toggleAgentPanelCollapsedAtom = atom(
 export const toggleTrackerPanelCollapsedAtom = atom(
   null,
   (get, set) => {
+    const workspacePath = get(activeWorkspacePathAtom);
     const current = get(agentModeLayoutAtom);
     const newLayout = { ...current, trackerPanelCollapsed: !current.trackerPanelCollapsed };
 
     set(agentModeLayoutAtom, newLayout);
 
-    if (!currentWorkspacePath) {
-      console.warn('[agentMode] Cannot persist layout - initAgentModeLayout not called yet');
+    if (!workspacePath) {
+      console.warn('[agentMode] Cannot persist layout - no active workspace');
       return;
     }
-    schedulePersist(currentWorkspacePath, newLayout);
+    schedulePersist(workspacePath, newLayout);
   }
 );
 
@@ -452,10 +536,20 @@ export const toggleSessionHistoryCollapsedAtom = atom(
  * Initialize agent mode layout from workspace state.
  * Call this when workspace path is known (typically in useEffect).
  * Restores layout settings and selected workstream.
+ *
+ * @param workspacePath The workspace whose layout should be loaded.
+ * @param options.setActive When true (default), this workspace becomes the
+ *   active path for the window. Pass `false` to warm-load a project for the
+ *   project rail without stealing focus from the currently visible project.
  */
-export async function initAgentModeLayout(workspacePath: string): Promise<void> {
-  // console.log('[agentMode] initAgentModeLayout called with workspacePath:', workspacePath);
-  currentWorkspacePath = workspacePath;
+export async function initAgentModeLayout(
+  workspacePath: string,
+  options: { setActive?: boolean } = {}
+): Promise<void> {
+  const { setActive = true } = options;
+  if (setActive) {
+    store.set(activeWorkspacePathAtom, workspacePath);
+  }
 
   try {
     const workspaceState = await window.electronAPI.invoke(
@@ -464,14 +558,10 @@ export async function initAgentModeLayout(workspacePath: string): Promise<void> 
     );
     const agenticState = workspaceState?.agenticCodingWindowState;
     const persisted = agenticState as Partial<AgentModeLayout> | undefined;
-    // console.log('[agentMode] Full workspace state:', JSON.stringify(persisted, null, 2));
 
-    // Merge persisted state with defaults - same shape, just fill in missing fields
     const restoredLayout = mergeWithDefaults(persisted);
-    // console.log('[agentMode] Restored layout:', restoredLayout);
-    store.set(agentModeLayoutAtom, restoredLayout);
+    store.set(agentModeLayoutAtomFamily(workspacePath), restoredLayout);
 
-    // Restore selected workstream if saved (stored alongside layout)
     if (agenticState?.selectedWorkstream) {
       const selection = agenticState.selectedWorkstream as { type: WorkstreamType; id: string };
       store.set(selectedWorkstreamAtom(workspacePath), selection);

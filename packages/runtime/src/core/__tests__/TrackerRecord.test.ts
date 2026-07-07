@@ -102,15 +102,6 @@ describe('trackerItemToRecord', () => {
     expect(record.syncStatus).toBe('synced');
     expect(record.content).toEqual({ type: 'doc', content: [] });
   });
-
-  it('generates fieldUpdatedAt for every field key', () => {
-    const item = makeTrackerItem();
-    const record = trackerItemToRecord(item);
-
-    for (const key of Object.keys(record.fields)) {
-      expect(record.fieldUpdatedAt[key]).toBeTypeOf('number');
-    }
-  });
 });
 
 describe('trackerRecordToItem round-trip', () => {
@@ -259,6 +250,31 @@ describe('dbRowToRecord', () => {
     const record = dbRowToRecord(row);
     expect(record.typeTags).toEqual(['idea']);
   });
+
+  it('parses the SQLite JSON-string shape for type_tags', () => {
+    const row = {
+      id: 'x',
+      type: 'bug',
+      type_tags: '["bug","task"]',
+      data: { title: 'From SQLite' },
+      workspace: '/ws',
+      document_path: '',
+      line_number: null,
+      created: new Date(),
+      updated: new Date(),
+      last_indexed: new Date(),
+      issue_number: null,
+      issue_key: null,
+      content: null,
+      archived: false,
+      source: 'native',
+      source_ref: null,
+      sync_status: 'local',
+    };
+
+    const record = dbRowToRecord(row);
+    expect(record.typeTags).toEqual(['bug', 'task']);
+  });
 });
 
 describe('recordToDbParams', () => {
@@ -288,7 +304,6 @@ describe('recordToDbParams', () => {
         status: 'open',
         customField: 'value',
       },
-      fieldUpdatedAt: { title: 1, status: 1, customField: 1 },
     };
 
     const params = recordToDbParams(record);
@@ -327,7 +342,6 @@ describe('recordToDbParams', () => {
         updatedAt: '2026-01-01',
       },
       fields: { title: 'Minimal' },
-      fieldUpdatedAt: { title: 1 },
     };
 
     const params = recordToDbParams(record);
@@ -355,7 +369,6 @@ describe('recordToDbParams', () => {
         ],
       },
       fields: { title: 'Bug with comments' },
-      fieldUpdatedAt: { title: 1 },
     };
 
     const params = recordToDbParams(record);
@@ -387,3 +400,4 @@ describe('trackerItemToRecord comments/activity via customFields', () => {
     expect(record.system.activity![0].action).toBe('created');
   });
 });
+

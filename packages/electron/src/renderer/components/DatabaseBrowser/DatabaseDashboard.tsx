@@ -9,7 +9,8 @@ interface TableStat {
 
 interface BackupInfo {
   timestamp: string;
-  size: number;
+  size?: number;
+  sizeBytes?: number;
   verified: boolean;
 }
 
@@ -19,6 +20,18 @@ interface BackupStatus {
   oldestBackup: BackupInfo | null;
   lastBackupAttempt: string | null;
   lastSuccessfulBackup: string | null;
+}
+
+interface WalStats {
+  fileCount: number;
+  totalBytes: number;
+  totalSize: string;
+  minWalSize: string;
+  maxWalSize: string;
+  checkpointTimeout: string;
+  // Backend-specific blurb -- explains how WAL is trimmed for the active engine
+  // (PGLite has no background checkpointer; SQLite auto-checkpoints by page).
+  description?: string;
 }
 
 interface DashboardStats {
@@ -31,18 +44,44 @@ interface DashboardStats {
     database_size: string;
   };
   backupStatus: BackupStatus | null;
+  walStats: WalStats | null;
 }
 
 interface Props {
   onTableSelect: (tableName: string) => void;
 }
 
-function formatBytes(bytes: number): string {
+function formatBytes(bytes: number | null | undefined): string {
+  if (typeof bytes !== 'number' || !Number.isFinite(bytes) || bytes < 0) {
+    return 'Unknown';
+  }
   if (bytes === 0) return '0 B';
   const k = 1024;
   const sizes = ['B', 'KB', 'MB', 'GB'];
   const i = Math.floor(Math.log(bytes) / Math.log(k));
   return parseFloat((bytes / Math.pow(k, i)).toFixed(1)) + ' ' + sizes[i];
+}
+
+function getBackupSizeBytes(backup: BackupInfo): number | null {
+  if (typeof backup.size === 'number' && Number.isFinite(backup.size)) {
+    return backup.size;
+  }
+  if (typeof backup.sizeBytes === 'number' && Number.isFinite(backup.sizeBytes)) {
+    return backup.sizeBytes;
+  }
+  return null;
+}
+
+// Parse a Postgres-style size string ("80MB", "1GB", "5kB") into bytes.
+// Used to render the WAL progress bar against min/max bounds.
+function parsePostgresSize(s: string | undefined): number {
+  if (!s) return 0;
+  const match = s.trim().match(/^(\d+(?:\.\d+)?)\s*(B|kB|MB|GB|TB)?$/i);
+  if (!match) return 0;
+  const value = parseFloat(match[1]);
+  const unit = (match[2] || 'B').toLowerCase();
+  const multipliers: Record<string, number> = { b: 1, kb: 1024, mb: 1024 ** 2, gb: 1024 ** 3, tb: 1024 ** 4 };
+  return value * (multipliers[unit] ?? 1);
 }
 
 function formatRelativeTime(timestamp: string): string {
@@ -69,6 +108,99 @@ function formatRelativeTime(timestamp: string): string {
   if (diffMins < 60) return `${diffMins} minute${diffMins === 1 ? '' : 's'} ago`;
   if (diffHours < 24) return `${diffHours} hour${diffHours === 1 ? '' : 's'} ago`;
   return `${diffDays} day${diffDays === 1 ? '' : 's'} ago`;
+}
+
+interface ReclaimResult {
+  scanned: number;
+  rewritten: number;
+  bytesSaved: number;
+  vacuumed: boolean;
+  vacuumError?: string;
+  durationMs: number;
+}
+
+/**
+ * One-time maintenance: rewrite bloated claude-code raw rows (the SDK's
+ * tool_use_result original-file/patch sidecar + thinking signatures that nothing
+ * reads) and optionally VACUUM to return the space to disk.
+ */
+function RawLogMaintenanceCard() {
+  const [candidateRows, setCandidateRows] = useState<number | null>(null);
+  const [vacuum, setVacuum] = useState(true);
+  const [running, setRunning] = useState(false);
+  const [result, setResult] = useState<ReclaimResult | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  const preview = async () => {
+    setError(null);
+    setResult(null);
+    const res = await window.electronAPI.invoke('database:reclaimRawLog:preview');
+    if (res.success) setCandidateRows(res.candidateRows);
+    else setError(res.error || 'Preview failed');
+  };
+
+  const run = async () => {
+    setRunning(true);
+    setError(null);
+    try {
+      const res = await window.electronAPI.invoke('database:reclaimRawLog:run', { vacuum });
+      if (res.success) setResult(res.result);
+      else setError(res.error || 'Reclaim failed');
+    } catch (err) {
+      setError(String(err));
+    } finally {
+      setRunning(false);
+    }
+  };
+
+  return (
+    <div className="p-4 rounded-lg border border-[var(--nim-border)] bg-nim-secondary database-raw-log-maintenance">
+      <div className="text-sm font-semibold mb-1">Reclaim Claude Code raw-log space</div>
+      <div className="text-xs text-[var(--nim-text-muted)] mb-3">
+        Rewrites old Claude Code messages to drop the SDK&apos;s redundant original-file copies,
+        patches, and thinking signatures that nothing renders. Optionally VACUUMs to shrink the
+        database file (locks the DB for several minutes). Back up first.
+      </div>
+
+      {candidateRows !== null && (
+        <div className="text-xs text-[var(--nim-text-muted)] mb-2">
+          {candidateRows.toLocaleString()} rows still carry trimmable data.
+        </div>
+      )}
+
+      <label className="flex items-center gap-2 text-xs mb-3 cursor-pointer">
+        <input type="checkbox" checked={vacuum} onChange={(e) => setVacuum(e.target.checked)} />
+        VACUUM after rewrite (reclaims disk; locks DB several minutes)
+      </label>
+
+      <div className="flex items-center gap-2">
+        <button
+          onClick={preview}
+          disabled={running}
+          className="py-1 px-3 rounded text-sm border border-[var(--nim-border)] bg-[var(--nim-bg-tertiary)] text-[var(--nim-text)] hover:bg-[var(--nim-bg-hover)] disabled:opacity-50"
+        >
+          Preview
+        </button>
+        <button
+          onClick={run}
+          disabled={running}
+          className="py-1 px-3 rounded text-sm border border-[var(--nim-border)] bg-[var(--nim-bg-tertiary)] text-[var(--nim-text)] hover:bg-[var(--nim-bg-hover)] disabled:opacity-50"
+        >
+          {running ? 'Running...' : 'Reclaim space'}
+        </button>
+      </div>
+
+      {error && <div className="text-xs text-[var(--nim-error)] mt-2">{error}</div>}
+      {result && (
+        <div className="text-xs text-[var(--nim-text-muted)] mt-2">
+          Rewrote {result.rewritten.toLocaleString()} of {result.scanned.toLocaleString()} rows,
+          saved {formatBytes(result.bytesSaved)} of content
+          {result.vacuumed ? ', VACUUM complete' : result.vacuumError ? `, VACUUM failed: ${result.vacuumError}` : ''}
+          {' '}({(result.durationMs / 1000).toFixed(1)}s).
+        </div>
+      )}
+    </div>
+  );
 }
 
 export function DatabaseDashboard({ onTableSelect }: Props) {
@@ -175,7 +307,7 @@ export function DatabaseDashboard({ onTableSelect }: Props) {
               {stats.backupStatus.currentBackup && (
                 <div className="flex items-center justify-between text-sm">
                   <span className="text-[var(--nim-text-muted)]">Current Backup Size</span>
-                  <span>{formatBytes(stats.backupStatus.currentBackup.size)}</span>
+                  <span>{formatBytes(getBackupSizeBytes(stats.backupStatus.currentBackup))}</span>
                 </div>
               )}
               {backupCount === 0 && (
@@ -186,6 +318,50 @@ export function DatabaseDashboard({ onTableSelect }: Props) {
             </div>
           </div>
         )}
+
+        {/* WAL (Write-Ahead Log) */}
+        {stats.walStats && (() => {
+          const minBytes = parsePostgresSize(stats.walStats.minWalSize);
+          const maxBytes = parsePostgresSize(stats.walStats.maxWalSize);
+          const cur = stats.walStats.totalBytes;
+          // Bar shows position between min and max. min is the floor that Postgres
+          // always retains; growth beyond max triggers an inline checkpoint.
+          const range = Math.max(maxBytes - minBytes, 1);
+          const pct = Math.min(100, Math.max(0, ((cur - minBytes) / range) * 100));
+          const overFloor = cur > minBytes * 1.05;
+          return (
+            <div className="database-dashboard-wal p-4 rounded-lg border border-[var(--nim-border)] bg-nim-secondary">
+              <h3 className="text-sm font-semibold mb-3">Write-Ahead Log</h3>
+              <div className="space-y-2 text-sm">
+                <div className="flex items-center justify-between">
+                  <span className="text-[var(--nim-text-muted)]">Current size</span>
+                  <span data-testid="wal-current-size">
+                    {stats.walStats.totalSize} ({stats.walStats.fileCount} {stats.walStats.fileCount === 1 ? 'segment' : 'segments'})
+                  </span>
+                </div>
+                <div className="h-1.5 bg-[var(--nim-bg-tertiary)] rounded-full overflow-hidden">
+                  <div
+                    className={`h-full rounded-full transition-all ${overFloor ? 'bg-[var(--nim-warning)]' : 'bg-[var(--nim-primary)]'}`}
+                    style={{ width: `${Math.max(pct, 1)}%` }}
+                  />
+                </div>
+                <div className="flex items-center justify-between text-xs text-[var(--nim-text-faint)]">
+                  <span>min {stats.walStats.minWalSize}</span>
+                  <span>max {stats.walStats.maxWalSize}</span>
+                </div>
+                <div className="flex items-center justify-between pt-2">
+                  <span className="text-[var(--nim-text-muted)]">Checkpoint timeout</span>
+                  <span>{stats.walStats.checkpointTimeout}</span>
+                </div>
+                {stats.walStats.description && (
+                  <div className="text-xs text-[var(--nim-text-faint)] pt-1">
+                    {stats.walStats.description}
+                  </div>
+                )}
+              </div>
+            </div>
+          );
+        })()}
 
         {/* Table Statistics */}
         <div className="rounded-lg border border-[var(--nim-border)] bg-nim-secondary overflow-hidden">
@@ -242,6 +418,9 @@ export function DatabaseDashboard({ onTableSelect }: Props) {
             </div>
           </div>
         </div>
+
+        {/* Maintenance */}
+        <RawLogMaintenanceCard />
       </div>
     </div>
   );

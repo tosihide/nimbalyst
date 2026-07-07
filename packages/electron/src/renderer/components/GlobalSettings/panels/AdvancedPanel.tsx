@@ -18,8 +18,6 @@ import {
   areAllDeveloperFeaturesEnabled,
   enableAllDeveloperFeatures,
   disableAllDeveloperFeatures,
-  debugFlagsAtom,
-  setDebugFlagsAtom,
   type ReleaseChannel,
   type ExternalEditorType,
   type PreferredTerminalShell,
@@ -28,6 +26,12 @@ import {
   trackerAutomationAtom,
   setTrackerAutomationAtom,
 } from '../../../store/atoms/trackerAutomationAtoms';
+import {
+  multiProjectModeAtom,
+  openProjectsAtom,
+  activeWorkspacePathAtom,
+  restorePreviousProjectsAtom,
+} from '../../../store/atoms/openProjects';
 
 /** Reusable compact dropdown row */
 function DropdownRow({
@@ -94,10 +98,6 @@ export function AdvancedPanel() {
   const [developerSettings] = useAtom(developerFeatureSettingsAtom);
   const [, updateDeveloperSettings] = useAtom(setDeveloperFeatureSettingsAtom);
   const { developerMode, developerFeatures } = developerSettings;
-
-  // Debug flags (verbose logging toggles, off by default)
-  const debugFlags = useAtomValue(debugFlagsAtom);
-  const updateDebugFlags = useSetAtom(setDebugFlagsAtom);
 
   // Tracker automation settings
   const trackerAutomation = useAtomValue(trackerAutomationAtom);
@@ -351,34 +351,6 @@ export function AdvancedPanel() {
         </div>
       )}
 
-      {/* ── Debug Logging ── */}
-      <div className="provider-panel-section py-4 mb-4 border-b border-[var(--nim-border)] last:border-b-0 last:mb-0 last:pb-0">
-        <h4 className="provider-panel-section-title text-base font-semibold mb-3 text-[var(--nim-text)]">Debug Logging</h4>
-        <p className="text-sm leading-relaxed text-[var(--nim-text-muted)] mb-4">
-          Verbose tracing for internal subsystems. Off by default. Toggle on when reproducing a bug, then check the renderer console (Cmd+Opt+I).
-        </p>
-
-        <div className="setting-item py-2" data-testid="debug-flag-diff-trace">
-          <label className="setting-label">
-            <input
-              type="checkbox"
-              checked={debugFlags.diffTrace ?? false}
-              onChange={(e) => {
-                void updateDebugFlags({ diffTrace: e.target.checked });
-              }}
-              className="setting-checkbox"
-            />
-            <div className="setting-text">
-              <span className="setting-name">Diff Trace</span>
-              <span className="setting-description">
-                Logs every step of the AI-edit / diff pipeline (DocumentModel, DiskBackedStore, TabEditor, DiffPlugin, file-change listeners).
-                Filter the console for <code>[diff-trace]</code>.
-              </span>
-            </div>
-          </label>
-        </div>
-      </div>
-
       {/* ── Release Channel ── */}
       <div className="provider-panel-section py-4 mb-4 border-b border-[var(--nim-border)] last:border-b-0 last:mb-0 last:pb-0">
         <h4 className="provider-panel-section-title text-base font-semibold mb-3 text-[var(--nim-text)]">Release Channel</h4>
@@ -423,6 +395,10 @@ export function AdvancedPanel() {
       {/* ── General ── */}
       <div className="provider-panel-section py-4 mb-4 border-b border-[var(--nim-border)] last:border-b-0 last:mb-0 last:pb-0">
         <h4 className="provider-panel-section-title text-base font-semibold mb-2 text-[var(--nim-text)]">General</h4>
+
+        <MultiProjectModeToggle />
+
+        <RestorePreviousProjectsToggle />
 
         <SettingsToggle
           checked={analyticsEnabled}
@@ -644,5 +620,78 @@ export function AdvancedPanel() {
       </div>
 
     </div>
+  );
+}
+
+/**
+ * Toggle for the multi-project rail. When the user disables it with
+ * inactive warm projects in the rail, those projects' main-process
+ * services are released and the rail collapses to just the active
+ * project so state stays consistent.
+ */
+function MultiProjectModeToggle() {
+  const [enabled, setEnabled] = useAtom(multiProjectModeAtom);
+  const [openProjects, setOpenProjects] = useAtom(openProjectsAtom);
+  const activePath = useAtomValue(activeWorkspacePathAtom);
+
+  const handleChange = async (next: boolean) => {
+    if (!next && openProjects.length > 1) {
+      const proceed = window.confirm(
+        `${openProjects.length} projects are open in the rail. Disable multi-project mode? The other projects will be closed (their unsaved work stays on disk).`
+      );
+      if (!proceed) return;
+
+      // Release services for every non-active path before collapsing the
+      // rail. The main process refcounts services across windows, so this
+      // only frees them when no other window references the path.
+      const inactivePaths = openProjects
+        .filter((p) => p.path !== activePath)
+        .map((p) => p.path);
+      await Promise.all(
+        inactivePaths.map((path) =>
+          window.electronAPI?.invoke?.('workspace:unregister-additional', { workspacePath: path })
+            .catch((err: unknown) => {
+              console.error('[AdvancedPanel] unregister-additional failed for', path, err);
+            })
+        )
+      );
+
+      const remaining = openProjects.filter((p) => p.path === activePath);
+      setOpenProjects(remaining);
+    }
+    setEnabled(next);
+  };
+
+  return (
+    <SettingsToggle
+      checked={enabled}
+      onChange={handleChange}
+      name="Multi-project Mode"
+      description="Open multiple projects in a single window via a project rail. When off, each project opens in its own window."
+    />
+  );
+}
+
+/**
+ * Toggle for re-opening last session's rail projects on launch. Default
+ * off so a normal launch from the project picker opens just the picked
+ * project; warm rail projects must be added explicitly via the rail's
+ * `+` button.
+ */
+function RestorePreviousProjectsToggle() {
+  const [enabled, setEnabled] = useAtom(restorePreviousProjectsAtom);
+  const isMultiProject = useAtomValue(multiProjectModeAtom);
+
+  return (
+    <SettingsToggle
+      checked={enabled}
+      onChange={setEnabled}
+      name="Restore last session's projects on launch"
+      description={
+        isMultiProject
+          ? 'When on, the project rail rehydrates with every project that was open at last close. When off, only the project you pick from the launch screen opens.'
+          : 'Only takes effect when Multi-project Mode is enabled.'
+      }
+    />
   );
 }

@@ -69,6 +69,23 @@ function createMockTranscriptStore(): ITranscriptEventStore & { getAll(): Transc
       );
     },
 
+    async findActiveToolCallByRawProviderId(rawProviderToolCallId, sessionId) {
+      const synthPrefix = `nimtc|${encodeURIComponent(rawProviderToolCallId)}|`;
+      for (let i = events.length - 1; i >= 0; i--) {
+        const event = events[i];
+        if (event.sessionId !== sessionId) continue;
+        if (event.eventType !== 'tool_call') continue;
+        const ptcid = event.providerToolCallId ?? '';
+        const matches = ptcid === rawProviderToolCallId || ptcid.startsWith(synthPrefix);
+        if (!matches) continue;
+        const status = (event.payload as Record<string, unknown> | undefined)?.status;
+        if (status === 'running' || status === 'pending' || status == null) {
+          return event;
+        }
+      }
+      return null;
+    },
+
     async getEventById(id) {
       return events.find((e) => e.id === id) ?? null;
     },
@@ -667,6 +684,78 @@ describe('TranscriptTransformer', () => {
       expect((eventsAfterBatch2[0].payload as any).result).toBe('File contents here');
     });
 
+    // Regression: the live incremental processing path keeps a watermark
+    // across processNewMessages calls. Session cb82f2eb / 68a60f57: the
+    // nimbalyst_tool_use is processed in one batch, the
+    // git_commit_proposal_response (source=nimbalyst) arrives later in a
+    // subsequent batch. The widget reads toolCall.result, so the second batch
+    // must update the existing tool_call event to status=completed.
+    it('attaches a git_commit_proposal_response from a resume batch to a tool_use from a previous batch', async () => {
+      const proposalId = 'toolu_proposal_incremental';
+
+      const batch1Messages = [
+        makeRawMessage({
+          id: 1,
+          sessionId: SESSION_ID,
+          direction: 'output',
+          content: JSON.stringify({
+            type: 'nimbalyst_tool_use',
+            id: proposalId,
+            name: 'developer_git_commit_proposal',
+            input: {
+              filesToStage: [{ path: 'src/foo.ts', status: 'modified' }],
+              commitMessage: 'fix: thing',
+            },
+          }),
+        }),
+      ];
+      const rawStore1 = createMockRawStore(batch1Messages);
+      const transformer1 = new TranscriptTransformer(rawStore1, transcriptStore, metadataStore);
+
+      await transformer1.processNewMessages(SESSION_ID, PROVIDER);
+
+      const eventsAfterBatch1 = await transcriptStore.getSessionEvents(SESSION_ID);
+      expect(eventsAfterBatch1).toHaveLength(1);
+      expect(eventsAfterBatch1[0].eventType).toBe('tool_call');
+      expect((eventsAfterBatch1[0].payload as any).status).toBe('running');
+
+      // Resume batch: the user clicked Commit, the IPC handler wrote a
+      // git_commit_proposal_response row with source='nimbalyst'.
+      const batch2Messages = [
+        ...batch1Messages,
+        makeRawMessage({
+          id: 2,
+          sessionId: SESSION_ID,
+          source: 'nimbalyst',
+          direction: 'output',
+          content: JSON.stringify({
+            type: 'git_commit_proposal_response',
+            proposalId,
+            action: 'committed',
+            commitHash: 'abc1234',
+            commitDate: '2026-06-01T18:08:59-04:00',
+            filesCommitted: ['src/foo.ts'],
+            commitMessage: 'fix: thing',
+            respondedAt: 1780347621666,
+            respondedBy: 'desktop',
+          }),
+        }),
+      ];
+      const rawStore2 = createMockRawStore(batch2Messages);
+      const transformer2 = new TranscriptTransformer(rawStore2, transcriptStore, metadataStore);
+
+      await transformer2.processNewMessages(SESSION_ID, PROVIDER);
+
+      const eventsAfterBatch2 = await transcriptStore.getSessionEvents(SESSION_ID);
+      expect(eventsAfterBatch2).toHaveLength(1);
+      const payload = eventsAfterBatch2[0].payload as any;
+      expect(payload.status).toBe('completed');
+      expect(typeof payload.result).toBe('string');
+      const parsedResult = JSON.parse(payload.result);
+      expect(parsedResult.action).toBe('committed');
+      expect(parsedResult.commitHash).toBe('abc1234');
+    });
+
     it('transforms system messages', async () => {
       const rawStore = createMockRawStore([
         makeRawMessage({
@@ -1209,7 +1298,7 @@ describe('TranscriptTransformer', () => {
   describe('Codex reasoning and todo_list transformation', () => {
     const CODEX_PROVIDER = 'openai-codex';
 
-    it('transforms Codex reasoning events as assistant messages', async () => {
+    it('transforms Codex reasoning events into assistant thinking messages', async () => {
       const rawStore = createMockRawStore([
         makeRawMessage({
           id: 1,
@@ -1233,10 +1322,12 @@ describe('TranscriptTransformer', () => {
       const events = await transcriptStore.getSessionEvents(SESSION_ID);
       const assistantEvents = events.filter((e) => e.eventType === 'assistant_message');
       expect(assistantEvents.length).toBeGreaterThanOrEqual(1);
-      const reasoningEvent = assistantEvents.find(
-        (e) => e.searchableText?.includes('Let me think about this problem.'),
-      );
+      const reasoningEvent = assistantEvents.find((e) => {
+        const payload = e.payload as Record<string, unknown>;
+        return payload.thinking === 'Let me think about this problem.';
+      });
       expect(reasoningEvent).toBeDefined();
+      expect(reasoningEvent?.searchableText).toBe('');
     });
 
     it('transforms Codex todo_list items as markdown assistant messages', async () => {
@@ -1470,6 +1561,107 @@ describe('TranscriptTransformer', () => {
       expect(toolA[0].id).not.toBe(toolB[0].id);
       expect(toolA[0].sessionId).toBe(SESSION_A);
       expect(toolB[0].sessionId).toBe(SESSION_B);
+    });
+
+    it('creates separate tool_call events when Codex reuses item_0 for the same MCP tool in later turns', async () => {
+      const rawStore = createMockRawStore([
+        makeRawMessage({
+          id: 1,
+          sessionId: SESSION_ID,
+          source: 'openai-codex',
+          direction: 'output',
+          content: JSON.stringify({
+            type: 'item.started',
+            item: {
+              id: 'item_0',
+              type: 'mcp_tool_call',
+              server: 'nimbalyst-mcp',
+              tool: 'developer_git_commit_proposal',
+              arguments: { commitMessage: 'first commit', filesToStage: ['a.ts'] },
+              status: 'in_progress',
+            },
+          }),
+        }),
+        makeRawMessage({
+          id: 2,
+          sessionId: SESSION_ID,
+          source: 'openai-codex',
+          direction: 'output',
+          content: JSON.stringify({
+            type: 'item.completed',
+            item: {
+              id: 'item_0',
+              type: 'mcp_tool_call',
+              server: 'nimbalyst-mcp',
+              tool: 'developer_git_commit_proposal',
+              result: {
+                content: [{ type: 'text', text: 'Auto-committed 1 file(s).\nCommit hash: first123' }],
+              },
+              error: null,
+              status: 'completed',
+            },
+          }),
+        }),
+        makeRawMessage({
+          id: 3,
+          sessionId: SESSION_ID,
+          source: 'openai-codex',
+          direction: 'output',
+          content: JSON.stringify({
+            type: 'item.started',
+            item: {
+              id: 'item_0',
+              type: 'mcp_tool_call',
+              server: 'nimbalyst-mcp',
+              tool: 'developer_git_commit_proposal',
+              arguments: { commitMessage: 'second commit', filesToStage: ['b.ts'] },
+              status: 'in_progress',
+            },
+          }),
+        }),
+        makeRawMessage({
+          id: 4,
+          sessionId: SESSION_ID,
+          source: 'openai-codex',
+          direction: 'output',
+          content: JSON.stringify({
+            type: 'item.completed',
+            item: {
+              id: 'item_0',
+              type: 'mcp_tool_call',
+              server: 'nimbalyst-mcp',
+              tool: 'developer_git_commit_proposal',
+              result: {
+                content: [{ type: 'text', text: 'Auto-committed 1 file(s).\nCommit hash: second456' }],
+              },
+              error: null,
+              status: 'completed',
+            },
+          }),
+        }),
+      ]);
+      const transformer = new TranscriptTransformer(rawStore, transcriptStore, metadataStore);
+
+      await transformer.ensureTransformed(SESSION_ID, CODEX_PROVIDER);
+
+      const events = await transcriptStore.getSessionEvents(SESSION_ID);
+      const toolEvents = events.filter((e) => e.eventType === 'tool_call');
+
+      expect(toolEvents).toHaveLength(2);
+      // CodexRawParser now mints a synthetic edit-group ID for each tool call
+      // so reuses of the same raw item id (e.g. `item_0` across turns) get
+      // distinct, durable canonical IDs. Both must wrap `item_0` in the
+      // `nimtc|<rawId>|<ts>|<idx>` form.
+      const firstId = toolEvents[0].providerToolCallId ?? '';
+      const secondId = toolEvents[1].providerToolCallId ?? '';
+      expect(firstId.startsWith('nimtc|item_0|')).toBe(true);
+      expect(secondId.startsWith('nimtc|item_0|')).toBe(true);
+      expect(firstId).not.toBe(secondId);
+      expect(toolEvents[0].id).not.toBe(toolEvents[1].id);
+      expect((toolEvents[0].payload as any).arguments.commitMessage).toBe('first commit');
+      expect((toolEvents[1].payload as any).arguments.commitMessage).toBe('second commit');
+      expect((toolEvents[0].payload as any).result).toContain('first123');
+      expect((toolEvents[1].payload as any).result).toContain('second456');
     });
 
     it('preserves non-MCP Codex tool results as-is', async () => {

@@ -30,7 +30,7 @@ import {
   $approveDiffs,
   $rejectDiffs
 } from '@nimbalyst/runtime';
-import { $getRoot, $getSelection, $isRangeSelection, SKIP_SCROLL_INTO_VIEW_TAG, COMMAND_PRIORITY_LOW } from 'lexical';
+import { $getRoot, $getSelection, $isRangeSelection, SKIP_SCROLL_INTO_VIEW_TAG, SKIP_DOM_SELECTION_TAG, COMMAND_PRIORITY_LOW } from 'lexical';
 import { DocumentHeaderContainer } from '@nimbalyst/runtime/plugins/TrackerPlugin/documentHeader';
 // Side-effect import: registers GenericFrontmatterHeader with DocumentHeaderRegistry
 import '@nimbalyst/runtime/plugins/FrontmatterPlugin';
@@ -57,6 +57,27 @@ import { diffTrace } from '@nimbalyst/runtime/utils/debugFlags';
 /** Normalize a file path for comparison: backslashes to forward slashes, strip trailing slashes. */
 function normalizePathForCompare(p: string): string {
   return p.replace(/\\/g, '/').replace(/\/+$/, '');
+}
+
+/**
+ * Build the update tags for a programmatic external/agent content replacement.
+ *
+ * When the Lexical editor does NOT currently hold DOM focus (e.g. the user is
+ * typing in the AI chat box while an agent edits the open file), add
+ * SKIP_DOM_SELECTION_TAG so Lexical's reconciler does not move browser focus and
+ * selection into the contentEditable, which would hijack the user's keystrokes.
+ * When the editor IS focused (user is actively editing it), keep the prior
+ * behavior so selection stays in sync.
+ */
+function externalContentUpdateTags(editor: { getRootElement?: () => HTMLElement | null }): string[] {
+  const tags: string[] = [SKIP_SCROLL_INTO_VIEW_TAG];
+  const root = editor.getRootElement?.();
+  const editorHasFocus =
+    !!root && typeof document !== 'undefined' && root.contains(document.activeElement);
+  if (!editorHasFocus) {
+    tags.push(SKIP_DOM_SELECTION_TAG);
+  }
+  return tags;
 }
 
 interface TabEditorProps {
@@ -200,17 +221,29 @@ export const TabEditor: React.FC<TabEditorProps> = ({
   const [monacoDiffChangeCount, setMonacoDiffChangeCount] = useState(0); // Number of changes in Monaco diff mode
   const [showTreeView, setShowTreeView] = useState(false); // Debug tree view for Lexical (dev mode only)
 
-  // Track editor type usage when file is opened
+  // Track editor type usage when a file is opened.
+  //
+  // The emission is deferred until the resolved editor type settles. At startup
+  // a file can mount in its fallback editor (Monaco/Lexical) before the
+  // extension that owns its compound type (e.g. `.mockup.html`, `.calc.md`)
+  // finishes registering. Emitting immediately would misreport it as `.html` /
+  // `.md`, and the one-shot guard would lock that in. We instead wait a short
+  // grace period and re-arm whenever the custom-editor registry changes
+  // (registryVersion), so we emit exactly once with the final editor type.
   const hasTrackedOpenRef = useRef<string | null>(null);
   useEffect(() => {
-    // Only track once per file path when it becomes active
-    if (isActive && isEditorReady && hasTrackedOpenRef.current !== filePath) {
+    if (!isActive || !isEditorReady) return;
+    if (hasTrackedOpenRef.current === filePath) return;
+
+    const timer = setTimeout(() => {
+      if (hasTrackedOpenRef.current === filePath) return;
       hasTrackedOpenRef.current = filePath;
 
-      // Determine file extension and editor category for tracking.
-      // For custom editors, prefer the registered key (e.g., '.reddit.watch.json',
-      // '.mockup.html') so analytics reflects the compound extension the editor
-      // was matched on, not just the file's final segment.
+      // Resolve the editor type from the live registry at emit time so a
+      // late-registering extension editor is reported correctly. For custom
+      // editors, prefer the registered key (e.g. '.reddit.watch.json',
+      // '.mockup.html') so analytics reflect the compound extension matched on,
+      // not just the file's final segment.
       const customMatch = customEditorRegistry.findMatchForFile(filePath);
       let fileExtension: string;
       if (customMatch) {
@@ -220,25 +253,25 @@ export const TabEditor: React.FC<TabEditorProps> = ({
         fileExtension = lastDot >= 0 ? filePath.substring(lastDot).toLowerCase() : '';
       }
 
-      let editorCategory = 'monaco'; // default for code files
+      const resolvedType = getFileType(filePath, () => customMatch != null);
+      let editorCategory: string;
       let hasMermaid = false;
       let hasDataModel = false;
-
-      if (isMarkdown) {
+      if (resolvedType === 'custom') {
+        // Use the registered editor name (e.g. "Mockup Editor", "PDF Viewer").
+        editorCategory = customMatch?.registration.name || 'custom';
+      } else if (resolvedType === 'markdown') {
         editorCategory = 'markdown';
-        // Check if markdown contains Mermaid diagrams
         if (initialContent.includes('```mermaid') || initialContent.includes('~~~mermaid')) {
           hasMermaid = true;
         }
-        // Check if markdown contains DataModel references
         if (initialContent.includes('```datamodel') || initialContent.includes('datamodel:')) {
           hasDataModel = true;
         }
-      } else if (isImage) {
+      } else if (resolvedType === 'image') {
         editorCategory = 'image';
-      } else if (isCustom) {
-        // Use the registered editor name (e.g., "Spreadsheet Editor", "PDF Viewer")
-        editorCategory = customMatch?.registration.name || 'custom';
+      } else {
+        editorCategory = 'monaco';
       }
 
       posthog?.capture('editor_type_opened', {
@@ -247,8 +280,10 @@ export const TabEditor: React.FC<TabEditorProps> = ({
         hasMermaid,
         hasDataModel,
       });
-    }
-  }, [isActive, isEditorReady, filePath, isMarkdown, isImage, isCustom, posthog, initialContent]);
+    }, 500);
+
+    return () => clearTimeout(timer);
+  }, [isActive, isEditorReady, filePath, registryVersion, posthog, initialContent]);
 
   // Track current file path to abort operations when switching files
   const currentFilePathRef = useRef(filePath);
@@ -528,13 +563,16 @@ export const TabEditor: React.FC<TabEditorProps> = ({
     mountEffectHandledPendingDiffRef.current = false;
 
     const checkAndApplyPendingDiffs = async () => {
+      const tCheckStart = performance.now();
       // For custom editors, wait a tick for their useEffect to register diff callbacks
       // This ensures diffRequestCallbackRef is set before we try to use it
       if (isCustom) {
         await new Promise(resolve => setTimeout(resolve, 50));
       }
       try {
+        const tGetPendingStart = performance.now();
         const pendingTags = await window.electronAPI.history.getPendingTags(filePath);
+        console.log(`[TabEditor.timing] getPendingTags: ${(performance.now() - tGetPendingStart).toFixed(1)}ms`);
         if (!pendingTags || pendingTags.length === 0) {
           return;
         }
@@ -555,9 +593,13 @@ export const TabEditor: React.FC<TabEditorProps> = ({
 
         // Get the baseline for diff comparison
         // This will be the latest incremental-approval tag if it exists, otherwise the pre-edit tag
+        const tBaselineStart = performance.now();
         const baseline = await window.electronAPI.invoke('history:get-diff-baseline', filePath);
+        console.log(`[TabEditor.timing] get-diff-baseline: ${(performance.now() - tBaselineStart).toFixed(1)}ms`);
         const oldContent = baseline ? baseline.content : pendingTag.content;
         const newContent = contentRef.current; // Use current content ref to get actual disk content
+
+        console.log(`[TabEditor.timing] oldContentLen=${oldContent?.length} newContentLen=${newContent?.length}`);
 
         logger.ui.info(`[TabEditor] Restoring pending AI edit on mount: tagId=${pendingTag.id}, status=${pendingTag.status}`);
         logger.ui.info(`[TabEditor] Diff content check: oldContentLength=${oldContent?.length}, newContentLength=${newContent?.length}, baseline=${!!baseline}, pendingTagContent=${pendingTag.content?.length}`);
@@ -616,15 +658,49 @@ export const TabEditor: React.FC<TabEditorProps> = ({
             return;
           }
 
-          // For markdown files, use Lexical diff mode
+          // For markdown files, use Lexical diff mode.
+          // Skip it for oversize payloads: the TOPT tree-matcher in
+          // applyMarkdownDiffToDocument is O(N^2) in root-children count and
+          // hits V8's Map size cap (~16M entries) on documents with >~1500
+          // root nodes. On a real CHANGELOG-shaped 280KB-vs-413KB pending
+          // diff this pins the renderer for ~57s before throwing a swallowed
+          // "Map maximum size exceeded" error. Until we rewrite the matcher
+          // (see nimbalyst-local/plans/lexical-diff-size-guard.md) we bail
+          // out before entering the slow path. The pendingAIEditTag is
+          // already set above, so the approval bar still appears and the
+          // user can accept/reject from there -- they just don't get the
+          // inline diff highlighting for this one file.
+          const LEXICAL_DIFF_MAX_BYTES = 200_000;
+          if (
+            (oldContent?.length ?? 0) > LEXICAL_DIFF_MAX_BYTES ||
+            (newContent?.length ?? 0) > LEXICAL_DIFF_MAX_BYTES
+          ) {
+            logger.ui.warn(
+              `[TabEditor] Skipping Lexical diff on mount for oversize payload: ` +
+                `oldLen=${oldContent?.length ?? 0} newLen=${newContent?.length ?? 0} ` +
+                `threshold=${LEXICAL_DIFF_MAX_BYTES} file=${fileName}`,
+            );
+            fetchDiffSessionInfo(
+              pendingTag.sessionId,
+              pendingTag.createdAt ? new Date(pendingTag.createdAt).getTime() : Date.now(),
+            );
+            return;
+          }
+
           // Reset editor to old (tagged) content first
           const transformers = getEditorTransformers();
 
+          const tReparseStart = performance.now();
           editorRef.current.update(() => {
+            const tInsideUpdateStart = performance.now();
             const root = $getRoot();
             root.clear();
+            const tAfterClear = performance.now();
             $convertFromEnhancedMarkdownString(oldContent, transformers);
+            const tAfterConvert = performance.now();
+            console.log(`[TabEditor.timing]   inside update: clear=${(tAfterClear - tInsideUpdateStart).toFixed(1)}ms convertFromMarkdown=${(tAfterConvert - tAfterClear).toFixed(1)}ms`);
           }, { tag: SKIP_SCROLL_INTO_VIEW_TAG });
+          console.log(`[TabEditor.timing] clear+reparseOldContent (editor.update wall): ${(performance.now() - tReparseStart).toFixed(1)}ms`);
 
           contentRef.current = oldContent;
 
@@ -639,7 +715,10 @@ export const TabEditor: React.FC<TabEditorProps> = ({
             const replacements = [{
               newText: newContent
             }];
+            const tDispatchStart = performance.now();
             editorRef.current.dispatchCommand(APPLY_MARKDOWN_REPLACE_COMMAND, replacements);
+            console.log(`[TabEditor.timing] APPLY_MARKDOWN_REPLACE_COMMAND dispatch: ${(performance.now() - tDispatchStart).toFixed(1)}ms`);
+            console.log(`[TabEditor.timing] TOTAL checkAndApplyPendingDiffs: ${(performance.now() - tCheckStart).toFixed(1)}ms`);
             console.log(`[TabEditor] Applied pending AI edit diff on mount`);
             // Fetch session info for the diff approval bar (for Lexical)
             fetchDiffSessionInfo(pendingTag.sessionId, pendingTag.createdAt ? new Date(pendingTag.createdAt).getTime() : Date.now());
@@ -743,15 +822,6 @@ export const TabEditor: React.FC<TabEditorProps> = ({
             // skips because lastSavedContentRef still mismatches disk on
             // every retry; the banner stays up.
             logger.ui.info('[TabEditor] Autosave conflict detected -- showing non-blocking banner, buffer preserved');
-            try {
-              window.electronAPI?.send?.('telemetry:file-save-blocked-after-delete', {
-                layer: 'conflict-mismatch',
-                filePath,
-                wasAutosave: true,
-              });
-            } catch {
-              // Telemetry must never affect program behavior.
-            }
             if (typeof result.diskContent === 'string') {
               setAutosaveConflictDiskContent(result.diskContent);
             } else {
@@ -1086,7 +1156,7 @@ export const TabEditor: React.FC<TabEditorProps> = ({
                 const root = $getRoot();
                 root.clear();
                 $convertFromEnhancedMarkdownString(content, transformers);
-              }, { tag: SKIP_SCROLL_INTO_VIEW_TAG });
+              }, { tag: externalContentUpdateTags(editorRef.current) });
             } else if (editorRef.current.setContent) {
               editorRef.current.setContent(content);
             }
@@ -1149,6 +1219,14 @@ export const TabEditor: React.FC<TabEditorProps> = ({
           onDirtyChange?.(false);
           try {
             await handle.resolveDiff(true);
+            // resolveDiff's notifyFileChanged fired while our diff guards were
+            // still set, so the subscribeToFileChanges wrapper dropped it -- and
+            // onDiffResolved excludes the resolving editor, so nothing else
+            // clears the pending tag. Without these two lines the open custom
+            // editor never sees this edit and stays deaf to every subsequent
+            // file change until the tab is reopened (NIM-1484).
+            setPendingAIEditTag(null);
+            editorHostFileChangeCallbackRef.current?.(newContent);
           } catch (err) {
             logger.ui.error('[TabEditor] Auto-accept diff failed for no-diff-view custom editor:', err);
           }
@@ -1164,7 +1242,7 @@ export const TabEditor: React.FC<TabEditorProps> = ({
                 const root = $getRoot();
                 root.clear();
                 $convertFromEnhancedMarkdownString(oldContent, transformers);
-              }, { tag: SKIP_SCROLL_INTO_VIEW_TAG });
+              }, { tag: externalContentUpdateTags(editorRef.current) });
 
               await new Promise((resolve) => setTimeout(resolve, 250));
 
@@ -2062,9 +2140,16 @@ export const TabEditor: React.FC<TabEditorProps> = ({
         // Also register with DocumentModel handle for coordinated notifications
         if (documentModelHandleRef.current) {
           return documentModelHandleRef.current.onFileChanged((content) => {
-            if (typeof content === 'string') {
-              callback(content);
-            }
+            if (typeof content !== 'string') return;
+            // Mirror the built-in editor guard (the `onFileChanged` handler above
+            // skips when isApplyingDiffRef/pendingAIEditTagRef is set): while an
+            // AI-edit diff is in flight, don't deliver the raw file change to a
+            // custom editor. Its external-change handler would discard the
+            // pending-review diff before it can render (#328). The modified
+            // content already reaches the editor through the diff request path,
+            // and the final content arrives via diff resolution.
+            if (isApplyingDiffRef.current || pendingAIEditTagRef.current) return;
+            callback(content);
           });
         }
         return () => {
@@ -2799,7 +2884,7 @@ export const TabEditor: React.FC<TabEditorProps> = ({
                 </button>
                 <button
                   onClick={handleReloadFromDisk}
-                  className="py-2 px-4 bg-nim-primary border-none rounded text-white cursor-pointer"
+                  className="py-2 px-4 bg-nim-primary border-none rounded text-nim-on-primary cursor-pointer"
                 >
                   Reload from Disk
                 </button>

@@ -14,18 +14,43 @@ import {
 } from '@nimbalyst/runtime';
 import crypto from 'crypto';
 import { getCurrentIdentity } from './TrackerIdentityService';
+import { applyCommentMutation, type CommentMutation } from './tracker/commentMutations';
+import { extractItemCustomFields } from './tracker/trackerRowCustomFields';
+import {
+  getBacklinks as getRelationshipBacklinks,
+  reindexItemRelationships,
+  rebuildWorkspaceRelationshipIndex,
+} from './tracker/trackerRelationshipIndexStore';
+import { propagateInverseRelationships } from './tracker/inverseRelationshipWrites';
+import { applyRelationshipFieldWrites } from './tracker/relationshipFieldWrite';
+import { nestRelationshipFieldsIntoCustomFields } from './tracker/relationshipFieldStorage';
 import { extractFrontmatter, extractCommonFields } from '../utils/frontmatterReader';
 import { VIRTUAL_DOCS, isVirtualPath } from '@nimbalyst/runtime';
-import { updateTrackerInFrontmatter, updateInlineTrackerItem, removeInlineTrackerItem } from '@nimbalyst/runtime/plugins/TrackerPlugin/documentHeader/frontmatterUtils';
+import {
+  updateTrackerInFrontmatter,
+  updateInlineTrackerItem,
+  removeInlineTrackerItem,
+  setShareInFrontmatter,
+  EXTENSION_OWNED_KEYS,
+  LEGACY_KEY_TO_TYPE,
+  buildFullDocumentTrackerId,
+  parseFullDocumentTrackerId,
+} from '@nimbalyst/runtime/plugins/TrackerPlugin/documentHeader/frontmatterUtils';
+import { globalRegistry } from '@nimbalyst/runtime/plugins/TrackerPlugin/models/TrackerDataModel';
 import { database } from '../database/PGLiteDatabaseWorker';
 import { shouldExcludeDir } from '../utils/fileFilters';
+import { getRegisteredExtensions } from '../extensions/RegisteredFileTypes';
 import { isPathInWorkspace, getRelativeWorkspacePath } from '../utils/workspaceDetection';
 import { syncTrackerItem, unsyncTrackerItem, isTrackerSyncActive } from './TrackerSyncManager';
 import {
   getEffectiveTrackerSyncPolicy,
   getInitialTrackerSyncStatus,
-  shouldSyncTrackerPolicy,
+  isTrackerItemShared,
+  shouldSyncTrackerItem,
 } from './TrackerPolicyService';
+import { computeFrontmatterTrackerTransition } from './tracker/frontmatterTrackerTransition';
+import { applyHeadlessBodyMarkdown } from './MainBodyDocService';
+import { getWorkspaceState } from '../utils/store';
 
 export interface ParsedInlineTrackerCandidate extends Omit<TrackerItem, 'id'> {
   id?: string;
@@ -37,6 +62,88 @@ interface ExistingInlineTrackerRow {
   type: string;
   line_number?: number | null;
   title?: string | null;
+}
+
+interface ResolvedFullDocumentFrontmatter {
+  trackerType: string;
+  trackerData: Record<string, any>;
+}
+
+function resolveFullDocumentFrontmatter(
+  frontmatter: Record<string, any> | undefined,
+): ResolvedFullDocumentFrontmatter | null {
+  if (!frontmatter) return null;
+
+  for (const [extKey, extType] of Object.entries(EXTENSION_OWNED_KEYS)) {
+    if (frontmatter[extKey] && typeof frontmatter[extKey] === 'object') {
+      const extData = frontmatter[extKey] as Record<string, any>;
+      const { [extKey]: _ext, trackerStatus: _ts, ...topLevel } = frontmatter;
+      return {
+        trackerType: extType,
+        trackerData: { ...topLevel, ...extData },
+      };
+    }
+  }
+
+  if (frontmatter.trackerStatus && typeof frontmatter.trackerStatus === 'object') {
+    const trackerStatus = frontmatter.trackerStatus as Record<string, any>;
+    const trackerType = typeof trackerStatus.type === 'string' && trackerStatus.type.trim().length > 0
+      ? trackerStatus.type.trim()
+      : 'plan';
+    const { trackerStatus: _ts, ...topLevel } = frontmatter;
+    return {
+      trackerType,
+      trackerData: { ...trackerStatus, ...topLevel },
+    };
+  }
+
+  for (const [legacyKey, legacyType] of Object.entries(LEGACY_KEY_TO_TYPE)) {
+    if (frontmatter[legacyKey] && typeof frontmatter[legacyKey] === 'object') {
+      const legacyData = frontmatter[legacyKey] as Record<string, any>;
+      const { [legacyKey]: _legacy, trackerStatus: _ts, ...topLevel } = frontmatter;
+      return {
+        trackerType: legacyType,
+        trackerData: { ...legacyData, ...topLevel },
+      };
+    }
+  }
+
+  return null;
+}
+
+export function getCanonicalTrackerItemIdFromRow(row: { id: string; type: string; source?: string | null; source_ref?: string | null }): string {
+  if (row.source === 'frontmatter' && typeof row.source_ref === 'string' && row.source_ref.length > 0) {
+    return buildFullDocumentTrackerId(row.type, row.source_ref);
+  }
+  return row.id;
+}
+
+/**
+ * Parse a column value that may be either a parsed object/array (PGLite
+ * JSONB / TEXT[] semantics) or a JSON-encoded string (SQLite TEXT
+ * semantics). Returns the parsed shape, or undefined on null/parse error.
+ */
+function parseJsonColumn<T>(value: unknown): T | undefined {
+  if (value === null || value === undefined) return undefined;
+  if (typeof value !== 'string') return value as T;
+  try {
+    return JSON.parse(value) as T;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * `tracker_items.content` is stored as JSON.stringify(markdown) (see
+ * updateTrackerItemContent). Undo that encoding; legacy/plain rows without
+ * JSON quoting pass through unchanged rather than becoming undefined.
+ */
+function parseTrackerContentColumn(raw: string): any {
+  try {
+    return JSON.parse(raw);
+  } catch {
+    return raw;
+  }
 }
 
 function normalizeTrackerTitle(title: string | undefined): string {
@@ -165,10 +272,19 @@ export class ElectronDocumentService implements DocumentService {
 
   // Performance limits - balance between completeness and performance
   private static readonly MAX_FILES_TO_SCAN = 2000;   // Stop adding regular files after 2000
-  private static readonly MAX_SCAN_TIME_MS = 10000;   // Stop scanning after 10 seconds (increased to allow full scan)
+  private static readonly MAX_SCAN_TIME_MS = 10000;   // Default scan budget (responsive on-demand scans)
+  // NIM-879: when a scan stops early, a background completion pass runs with this
+  // larger budget so the tracker metadata cache is never left silently incomplete
+  // (the symptom: gitignored nimbalyst-local/plans scanned after the cap = lost
+  // plans). The scan yields the event loop, so a longer budget never freezes the UI.
+  private static readonly EXTENDED_SCAN_TIME_MS = 120000;
   private static readonly MAX_DEPTH = 8;              // Maximum directory depth
 
   private isScanning = false; // Prevent concurrent scans
+  /** Whether the most recent scan stopped early (hit the time/file/depth cap). */
+  private lastScanStoppedEarly = false;
+  /** Guards against scheduling more than one background completion pass. */
+  private extendedScanScheduled = false;
 
   /**
    * Quick check if a markdown file contains tracker-relevant frontmatter
@@ -254,7 +370,10 @@ export class ElectronDocumentService implements DocumentService {
     }
   }
 
-  private async refreshDocuments() {
+  private async refreshDocuments(
+    budgetMs: number = ElectronDocumentService.MAX_SCAN_TIME_MS,
+    isExtendedPass = false,
+  ) {
     // Prevent concurrent scans
     if (this.isScanning) {
       return;
@@ -263,12 +382,7 @@ export class ElectronDocumentService implements DocumentService {
     this.isScanning = true;
     try {
       const oldDocuments = this.documents;
-      this.documents = await this.scanDocuments();
-
-      // console.log(`[DocumentService] refreshDocuments: found ${this.documents.length} documents`);
-      // if (this.documents.length > 0) {
-      //   console.log(`[DocumentService] Sample documents:`, this.documents.slice(0, 3).map(d => d.path));
-      // }
+      this.documents = await this.scanDocuments(budgetMs);
 
       // Update metadata cache
       await this.updateMetadataCache(oldDocuments, this.documents);
@@ -280,6 +394,50 @@ export class ElectronDocumentService implements DocumentService {
     } finally {
       this.isScanning = false;
     }
+
+    // NIM-879: if a default-budget scan stopped early (e.g. a slow startup under
+    // load truncated the walk before reaching gitignored nimbalyst-local/plans),
+    // run ONE background completion pass with an extended budget so the tracker
+    // metadata cache fills in and plans aren't silently lost. Never schedule from
+    // the extended pass itself (avoid an endless loop if even 120s isn't enough).
+    if (!isExtendedPass) {
+      this.scheduleExtendedScanIfNeeded();
+    }
+  }
+
+  /**
+   * Schedule a single background full re-scan (extended budget) when the last
+   * default-budget scan stopped early. Re-running with the SAME budget can't
+   * progress (the depth-first walk re-covers the same prefix), so the completion
+   * pass needs a larger budget. The scan yields the event loop, so it never
+   * freezes the UI. After it finishes, watchers + tracker consumers refresh.
+   */
+  private scheduleExtendedScanIfNeeded(): void {
+    if (!this.lastScanStoppedEarly || this.extendedScanScheduled) return;
+    this.extendedScanScheduled = true;
+    const attempt = async (triesLeft: number): Promise<void> => {
+      // Defer if another scan is in flight; retry a few times before giving up.
+      if (this.isScanning) {
+        if (triesLeft <= 0) { this.extendedScanScheduled = false; return; }
+        setTimeout(() => void attempt(triesLeft - 1), 1500);
+        return;
+      }
+      try {
+        await this.refreshDocuments(ElectronDocumentService.EXTENDED_SCAN_TIME_MS, true);
+        // Surface the now-complete tracker set so the Plans/tracker views update.
+        try {
+          const items = await this.listFullDocumentTrackerItemsFromMetadata();
+          if (items.length > 0) {
+            this.trackerItemWatchers.forEach(cb => cb({
+              added: [], updated: items, removed: [], timestamp: new Date(),
+            }));
+          }
+        } catch { /* best-effort UI refresh */ }
+      } finally {
+        this.extendedScanScheduled = false;
+      }
+    };
+    setTimeout(() => void attempt(5), 1500);
   }
 
   private hasDocumentListChanged(oldDocs: Document[], newDocs: Document[]): boolean {
@@ -389,6 +547,15 @@ export class ElectronDocumentService implements DocumentService {
             } else {
               updated.push(metadata);
             }
+
+            // Capture full-document tracker status transitions from a DIRECT
+            // in-session frontmatter edit (the normal way a plan/decision moves
+            // through the system). Gated on `oldDoc` so it never runs during the
+            // cold-open bulk scan -- avoiding the NIM-875 per-file upsert storm.
+            // Non-tracker frontmatter short-circuits before any DB query.
+            if (oldDoc && data) {
+              await this.captureFrontmatterTrackerTransition(newDoc.path, data);
+            }
           } else {
             // Frontmatter didn't change, but file mtime did - update mtime in cache
             this.fileStateCache.set(newDoc.path, {
@@ -429,7 +596,7 @@ export class ElectronDocumentService implements DocumentService {
     dirPath: string,
     basePath: string = '',
     depth: number = 0,
-    scanState: { count: number; trackerCount: number; startTime: number; stopped: boolean; sinceYield: number }
+    scanState: { count: number; trackerCount: number; startTime: number; stopped: boolean; sinceYield: number; budgetMs: number }
   ): Promise<Document[]> {
     const documents: Document[] = [];
 
@@ -439,7 +606,7 @@ export class ElectronDocumentService implements DocumentService {
     }
 
     const elapsed = Date.now() - scanState.startTime;
-    if (elapsed > ElectronDocumentService.MAX_SCAN_TIME_MS) {
+    if (elapsed > scanState.budgetMs) {
       scanState.stopped = true;
       return documents;
     }
@@ -471,6 +638,18 @@ export class ElectronDocumentService implements DocumentService {
       '.vue', '.svelte', '.astro'
     ];
 
+    // Extension-contributed file types. Extensions declare these via
+    // `contributions.customEditors[].filePatterns` in their manifest, and
+    // `initializeExtensionFileTypes` populates the central registry at
+    // boot. Merge them in here so files like `*.excalidraw`, `*.mockup.html`,
+    // `*.mindmap` etc. show up in the `@` typeahead without anyone editing
+    // this file.
+    const extensionContributedExtensions = Array.from(getRegisteredExtensions());
+    const supportedExtensionsSet = new Set<string>([
+      ...supportedExtensions,
+      ...extensionContributedExtensions,
+    ]);
+
     // Markdown extensions for tracker content check
     const markdownExtensions = ['.md', '.markdown'];
 
@@ -479,7 +658,7 @@ export class ElectronDocumentService implements DocumentService {
 
       for (const item of items) {
         // Check time limit on EVERY iteration to bail out quickly
-        if (Date.now() - scanState.startTime > ElectronDocumentService.MAX_SCAN_TIME_MS) {
+        if (Date.now() - scanState.startTime > scanState.budgetMs) {
           scanState.stopped = true;
           break;
         }
@@ -526,7 +705,7 @@ export class ElectronDocumentService implements DocumentService {
             documents.push(...subDocs);
           } else if (stats.isFile()) {
             const ext = path.extname(item).toLowerCase();
-            if (supportedExtensions.includes(ext)) {
+            if (supportedExtensionsSet.has(ext)) {
               const isMarkdown = markdownExtensions.includes(ext);
               const underLimit = scanState.count < ElectronDocumentService.MAX_FILES_TO_SCAN;
 
@@ -568,18 +747,22 @@ export class ElectronDocumentService implements DocumentService {
     return documents;
   }
 
-  private async scanDocuments(): Promise<Document[]> {
+  private async scanDocuments(budgetMs: number = ElectronDocumentService.MAX_SCAN_TIME_MS): Promise<Document[]> {
     try {
-      const scanState = { count: 0, trackerCount: 0, startTime: Date.now(), stopped: false, sinceYield: 0 };
+      const scanState = { count: 0, trackerCount: 0, startTime: Date.now(), stopped: false, sinceYield: 0, budgetMs };
       const docs = await this.scanDirectoryAsync(this.workspacePath, '', 0, scanState);
+
+      // Record whether this scan was truncated so the caller can schedule a
+      // background completion pass (NIM-879).
+      this.lastScanStoppedEarly = scanState.stopped;
 
       // Log info about scan results
       const elapsed = Date.now() - scanState.startTime;
       if (scanState.stopped) {
         console.warn(
           `[DocumentService] Scan stopped early: scanned ${scanState.count} files in ${elapsed}ms. ` +
-          `Time limit: ${ElectronDocumentService.MAX_SCAN_TIME_MS}ms, depth limit: ${ElectronDocumentService.MAX_DEPTH}. ` +
-          `Some files may not appear in @ mentions.`
+          `Time budget: ${budgetMs}ms, depth limit: ${ElectronDocumentService.MAX_DEPTH}. ` +
+          `A background completion pass will run; some files may be temporarily missing.`
         );
       } else if (scanState.trackerCount > 0) {
         // console.log(
@@ -641,8 +824,9 @@ export class ElectronDocumentService implements DocumentService {
   }
 
   async getDocumentByPath(path: string): Promise<Document | null> {
+    const normalizedPath = path.replace(/\\/g, '/');
     const documents = await this.listDocuments();
-    return documents.find(doc => doc.path === path) || null;
+    return documents.find(doc => doc.path.replace(/\\/g, '/') === normalizedPath) || null;
   }
 
   watchDocuments(callback: (documents: Document[]) => void): () => void {
@@ -658,7 +842,11 @@ export class ElectronDocumentService implements DocumentService {
     };
   }
 
-  async openDocument(documentId: string, fallback?: DocumentOpenOptions): Promise<void> {
+  async openDocument(
+    documentId: string,
+    fallback?: DocumentOpenOptions,
+    requester?: Electron.WebContents,
+  ): Promise<void> {
     let doc: Document | null = null;
 
     if (documentId) {
@@ -683,10 +871,16 @@ export class ElectronDocumentService implements DocumentService {
       );
     }
 
-    // Send message to renderer to open the document
-    const window = BrowserWindow.getFocusedWindow();
-    if (window) {
-      window.webContents.send('open-document', {
+    // Send message to renderer to open the document. Prefer the requesting
+    // webContents — the focused window can be a different window (or none at
+    // all, e.g. the app is in the background), which used to silently drop
+    // the open.
+    const target =
+      requester && !requester.isDestroyed()
+        ? requester
+        : BrowserWindow.getFocusedWindow()?.webContents;
+    if (target) {
+      target.send('open-document', {
         path: path.join(this.workspacePath, doc.path)
       });
     }
@@ -879,10 +1073,13 @@ export class ElectronDocumentService implements DocumentService {
       return null;
     }
 
-    // Find the virtual document descriptor
+    // Find the virtual document descriptor. Only built-in virtual docs (welcome,
+    // tracker views, etc.) have loadable text content here. Extension-owned
+    // virtual tabs (e.g. `virtual://com.nimbalyst.browser/…`) are rendered by
+    // their custom editor and have no content to load, so a miss is expected --
+    // return null quietly rather than logging an error on every such tab open.
     const virtualDoc = Object.values(VIRTUAL_DOCS).find(doc => doc.virtualPath === virtualPath);
     if (!virtualDoc) {
-      console.error(`[DocumentService] Unknown virtual document: ${virtualPath}`);
       return null;
     }
 
@@ -912,19 +1109,535 @@ export class ElectronDocumentService implements DocumentService {
     }
   }
 
+  private async listFullDocumentTrackerItemsFromMetadata(): Promise<TrackerItem[]> {
+    this.startScanIfNeeded();
+
+    const items: TrackerItem[] = [];
+
+    for (const metadata of this.metadataCache.values()) {
+      const pathLower = metadata.path.toLowerCase();
+      if (pathLower.includes('/agents/') || pathLower.includes('\\agents\\')) {
+        continue;
+      }
+
+      const resolved = resolveFullDocumentFrontmatter(metadata.frontmatter);
+      if (!resolved) continue;
+
+      const model = globalRegistry.get(resolved.trackerType);
+      if (!model?.modes?.fullDocument) continue;
+
+      const trackerData = resolved.trackerData;
+      const title = (trackerData.title as string)
+        || (metadata.frontmatter.title as string)
+        || metadata.path.split('/').pop()?.replace(/\.md$/, '')
+        || 'Untitled';
+
+      const coreFieldKeys = new Set([
+        'type', 'title', 'status', 'priority', 'owner', 'tags', 'created',
+        'updated', 'dueDate', 'progress', 'description',
+      ]);
+      const customFields: Record<string, any> = {};
+      for (const [key, value] of Object.entries(trackerData)) {
+        if (!coreFieldKeys.has(key) && value !== undefined) {
+          customFields[key] = value;
+        }
+      }
+
+      items.push({
+        id: buildFullDocumentTrackerId(resolved.trackerType, metadata.path),
+        type: resolved.trackerType as TrackerItemType,
+        typeTags: [resolved.trackerType],
+        title,
+        description: trackerData.description || undefined,
+        status: ((trackerData.status || metadata.frontmatter.status || 'to-do') as string).toLowerCase() as TrackerItem['status'],
+        priority: (trackerData.priority || metadata.frontmatter.priority || 'medium') as TrackerItem['priority'],
+        owner: trackerData.owner || undefined,
+        module: metadata.path,
+        lineNumber: 0,
+        workspace: this.workspacePath,
+        tags: Array.isArray(trackerData.tags) ? trackerData.tags : undefined,
+        created: trackerData.created ? String(trackerData.created) : undefined,
+        updated: trackerData.updated ? String(trackerData.updated) : undefined,
+        dueDate: trackerData.dueDate ? String(trackerData.dueDate) : undefined,
+        progress: typeof trackerData.progress === 'number' ? trackerData.progress : undefined,
+        lastIndexed: metadata.lastModified || metadata.lastIndexed || new Date(),
+        archived: false,
+        source: 'frontmatter',
+        sourceRef: metadata.path,
+        customFields: Object.keys(customFields).length > 0 ? customFields : undefined,
+      });
+    }
+
+    return items;
+  }
+
+  private async listMergedTrackerItems(): Promise<TrackerItem[]> {
+    const result = await database.query<any>(
+      `SELECT * FROM tracker_items WHERE workspace = $1 ORDER BY kanban_sort_order ASC NULLS LAST, last_indexed DESC`,
+      [this.workspacePath]
+    );
+    const dbItems = result.rows.map(row => this.rowToTrackerItem(row));
+    const metadataItems = await this.listFullDocumentTrackerItemsFromMetadata();
+
+    const merged = new Map<string, TrackerItem>();
+    for (const item of metadataItems) {
+      merged.set(item.id, item);
+    }
+    for (const item of dbItems) {
+      const existing = merged.get(item.id);
+      if (existing && item.source === 'frontmatter') {
+        merged.set(item.id, {
+          ...item,
+          title: existing.title,
+          description: existing.description,
+          status: existing.status,
+          priority: existing.priority,
+          owner: existing.owner,
+          module: existing.module,
+          tags: existing.tags,
+          created: existing.created,
+          updated: existing.updated,
+          dueDate: existing.dueDate,
+          progress: existing.progress,
+          lastIndexed: existing.lastIndexed,
+          source: existing.source,
+          sourceRef: existing.sourceRef,
+          customFields: {
+            ...(existing.customFields || {}),
+            ...(item.customFields || {}),
+          },
+        });
+      } else {
+        merged.set(item.id, item);
+      }
+    }
+
+    return Array.from(merged.values());
+  }
+
+  private async resolveTrackerRowForPublicId(
+    itemId: string,
+    options?: { createProjectionForFullDocument?: boolean }
+  ): Promise<any | null> {
+    const direct = await database.query<any>(
+      `SELECT * FROM tracker_items WHERE id = $1`,
+      [itemId]
+    );
+    if (direct.rows.length > 0) {
+      return direct.rows[0];
+    }
+
+    const parsed = parseFullDocumentTrackerId(itemId);
+    if (!parsed) return null;
+
+    const bySourceRef = await database.query<any>(
+      `SELECT * FROM tracker_items
+       WHERE workspace = $1 AND source = 'frontmatter' AND source_ref = $2 AND type = $3
+       ORDER BY updated DESC
+       LIMIT 1`,
+      [this.workspacePath, parsed.relativePath, parsed.trackerType]
+    );
+    if (bySourceRef.rows.length > 0) {
+      return bySourceRef.rows[0];
+    }
+
+    if (!options?.createProjectionForFullDocument) {
+      return null;
+    }
+
+    await this.ensureFrontmatterProjectionRow(parsed.relativePath, parsed.trackerType);
+
+    const created = await database.query<any>(
+      `SELECT * FROM tracker_items
+       WHERE workspace = $1 AND source = 'frontmatter' AND source_ref = $2 AND type = $3
+       ORDER BY updated DESC
+       LIMIT 1`,
+      [this.workspacePath, parsed.relativePath, parsed.trackerType]
+    );
+    return created.rows[0] || null;
+  }
+
+  private async ensureFrontmatterProjectionRow(
+    relativePath: string,
+    expectedType?: string,
+  ): Promise<TrackerItem | null> {
+    const fullPath = path.join(this.workspacePath, relativePath);
+
+    let fileContent: string;
+    try {
+      fileContent = await fs.readFile(fullPath, 'utf-8');
+    } catch {
+      return null;
+    }
+
+    const { data: frontmatter } = await extractFrontmatter(fullPath);
+    if (!frontmatter) return null;
+
+    const resolved = resolveFullDocumentFrontmatter(frontmatter);
+    if (!resolved) return null;
+    if (expectedType && resolved.trackerType !== expectedType) return null;
+
+    const title = (resolved.trackerData.title as string)
+      || (frontmatter.title as string)
+      || relativePath.split('/').pop()?.replace(/\.md$/, '')
+      || 'Untitled';
+    const bodyMatch = fileContent.match(/^---\s*\n[\s\S]*?\n---\s*\n([\s\S]*)$/);
+    const markdownBody = bodyMatch ? bodyMatch[1].trim() : '';
+    const canonicalId = buildFullDocumentTrackerId(resolved.trackerType, relativePath);
+
+    const data: Record<string, any> = { title };
+    for (const [key, value] of Object.entries(resolved.trackerData)) {
+      if (key === 'type' || key === 'trackerStatus') continue;
+      if (value !== undefined && value !== null) {
+        data[key] = value;
+      }
+    }
+
+    const existing = await database.query<any>(
+      `SELECT id FROM tracker_items
+       WHERE workspace = $1 AND source = 'frontmatter' AND source_ref = $2 AND type = $3
+       LIMIT 1`,
+      [this.workspacePath, relativePath, resolved.trackerType]
+    );
+
+    if (existing.rows.length > 0 && existing.rows[0].id !== canonicalId) {
+      await database.query(
+        `UPDATE tracker_items
+         SET data = $1, content = $2, source = 'frontmatter', source_ref = $3, document_path = $3, updated = NOW()
+         WHERE id = $4`,
+        [
+          JSON.stringify(data),
+          markdownBody ? JSON.stringify(markdownBody) : null,
+          relativePath,
+          existing.rows[0].id,
+        ]
+      );
+      const result = await database.query<any>(`SELECT * FROM tracker_items WHERE id = $1`, [existing.rows[0].id]);
+      return result.rows.length > 0 ? this.rowToTrackerItem(result.rows[0]) : null;
+    }
+
+    await database.query(
+      `INSERT INTO tracker_items (
+        id, type, data, workspace, document_path, line_number,
+        created, updated, last_indexed, sync_status,
+        content, archived, source, source_ref
+      ) VALUES ($1, $2, $3, $4, $5, 0, NOW(), NOW(), NOW(), 'local', $6, FALSE, 'frontmatter', $5)
+      ON CONFLICT (id) DO UPDATE SET
+        data = tracker_items.data || $3,
+        content = $6,
+        source = 'frontmatter',
+        source_ref = $5,
+        document_path = $5,
+        updated = NOW()`,
+      [
+        canonicalId,
+        resolved.trackerType,
+        JSON.stringify(data),
+        this.workspacePath,
+        relativePath,
+        markdownBody ? JSON.stringify(markdownBody) : null,
+      ]
+    );
+
+    const result = await database.query<any>(`SELECT * FROM tracker_items WHERE id = $1`, [canonicalId]);
+    return result.rows.length > 0 ? this.rowToTrackerItem(result.rows[0]) : null;
+  }
+
+  /**
+   * Capture a status/field transition for a full-document (frontmatter-backed)
+   * tracker when its frontmatter is edited directly on disk. This is what gives
+   * plans (and other full-document trackers) a status-over-time history even
+   * when the change never went through the tracker UI/MCP update path.
+   *
+   * The caller gates this to in-session frontmatter edits (an already-known doc
+   * whose frontmatter hash changed), so it never runs during the cold-open bulk
+   * scan. It updates an existing projection row (or lazily materializes one for
+   * the single edited file) and writes the full `data` payload computed in JS,
+   * which is safe across both DB backends and preserves system metadata.
+   */
+  private async captureFrontmatterTrackerTransition(
+    relativePath: string,
+    frontmatter: Record<string, any>,
+  ): Promise<void> {
+    try {
+      const resolved = resolveFullDocumentFrontmatter(frontmatter);
+      if (!resolved) return; // not a tracker document -> nothing to do (no DB hit)
+      const type = resolved.trackerType;
+      const canonicalId = buildFullDocumentTrackerId(type, relativePath);
+
+      const existingRes = await database.query<any>(
+        `SELECT id, data FROM tracker_items
+         WHERE workspace = $1 AND source = 'frontmatter' AND source_ref = $2 AND type = $3
+         ORDER BY updated DESC
+         LIMIT 1`,
+        [this.workspacePath, relativePath, type],
+      );
+      const row = existingRes.rows[0];
+      const existingData = row ? (parseJsonColumn<Record<string, any>>(row.data) ?? {}) : null;
+
+      // Tracked field values from the resolved frontmatter, minus routing keys.
+      // Title falls back to the filename, matching the projection path.
+      const title = (resolved.trackerData.title as string)
+        || (frontmatter.title as string)
+        || relativePath.split('/').pop()?.replace(/\.md$/, '')
+        || 'Untitled';
+      const newFields: Record<string, any> = { title };
+      for (const [key, value] of Object.entries(resolved.trackerData)) {
+        if (key === 'type' || key === 'trackerStatus' || key === 'activity') continue;
+        if (value !== undefined && value !== null) newFields[key] = value;
+      }
+
+      let identity: unknown = null;
+      try { identity = getCurrentIdentity(this.workspacePath); } catch { identity = null; }
+
+      const { data: nextData, changes, isNew } = computeFrontmatterTrackerTransition(
+        existingData,
+        newFields,
+        identity,
+        Date.now(),
+      );
+
+      // Reconcile the per-plan share flags explicitly from the CURRENT frontmatter.
+      // The generic transition only writes keys that are present and never
+      // deletes, so REMOVING the `share` block from frontmatter must clear the
+      // stored flag here -- otherwise an unshare-by-deletion would never take.
+      const fmShare = (resolved.trackerData as Record<string, any>).share;
+      const fmShared = (resolved.trackerData as Record<string, any>).shared;
+      if (fmShare !== undefined) nextData.share = fmShare; else delete nextData.share;
+      if (fmShared !== undefined) nextData.shared = fmShared; else delete nextData.shared;
+      // The sync round-trip nests the flag under `customFields.share`, and
+      // isTrackerItemShared lets the nested value win. Mirror the file's intent
+      // there too, so removing `share` from frontmatter actually unshares (the
+      // file is the source of truth for a frontmatter-backed item).
+      if (nextData.customFields && typeof nextData.customFields === 'object') {
+        if (fmShare !== undefined) nextData.customFields.share = fmShare;
+        else delete nextData.customFields.share;
+      }
+
+      // Detect a share-flag flip (NIM-876). A pure share toggle has no tracked-field
+      // change, so it must still force a write + reconcile.
+      const wasShared = isTrackerItemShared(existingData);
+      const nowShared = isTrackerItemShared(nextData);
+      const shareChanged = wasShared !== nowShared;
+
+      if (!row) {
+        // No projection row yet: materialize THIS single edited file (one insert,
+        // not a bulk-scan storm). content is filled in on the next full projection.
+        await database.query(
+          `INSERT INTO tracker_items (
+            id, type, data, workspace, document_path, line_number,
+            created, updated, last_indexed, sync_status,
+            content, archived, source, source_ref
+          ) VALUES ($1, $2, $3, $4, $5, 0, NOW(), NOW(), NOW(), 'local', NULL, FALSE, 'frontmatter', $5)
+          ON CONFLICT (id) DO UPDATE SET
+            data = tracker_items.data || $3,
+            updated = NOW()`,
+          [canonicalId, type, JSON.stringify(nextData), this.workspacePath, relativePath],
+        );
+      } else if (changes.length > 0 || shareChanged) {
+        // Existing row + a real transition (or share toggle): persist full data.
+        await database.query(
+          `UPDATE tracker_items SET data = $1, updated = NOW() WHERE id = $2`,
+          [JSON.stringify(nextData), row.id],
+        );
+      } else {
+        return; // existing row, no tracked-field change, no share flip -> no write
+      }
+
+      const persisted = await database.query<any>(
+        `SELECT * FROM tracker_items WHERE id = $1`,
+        [row?.id ?? canonicalId],
+      );
+      if (persisted.rows.length > 0) {
+        const item = this.rowToTrackerItem(persisted.rows[0]);
+        const changeEvent: TrackerItemChangeEvent = {
+          added: isNew ? [item] : [],
+          updated: isNew ? [] : [item],
+          removed: [],
+          timestamp: new Date(),
+        };
+        this.trackerItemWatchers.forEach(callback => callback(changeEvent));
+
+        // Reconcile team sharing when the share flag flipped (or a freshly
+        // materialized row is already flagged). Lifecycle-share rides the
+        // existing tracker sync path; the item carries its own body version.
+        if (shareChanged || (isNew && nowShared)) {
+          await this.reconcileFrontmatterShare(item, persisted.rows[0].id, relativePath, nowShared);
+        } else if (nowShared && changes.length > 0) {
+          // NIM-880: an ALREADY-shared plan whose lifecycle field changed (no
+          // share flip) must still push the updated metadata. The reconcile gate
+          // above only fires on a flip/new-flag, so without this the change was
+          // written locally and never reached the room (and the already-synced
+          // row -- sync_id set, status 'synced' -- isn't a backfill candidate
+          // either). Body is unchanged here, so no re-seed.
+          await this.syncSharedFrontmatterMetadata(item, persisted.rows[0].id);
+        }
+      }
+    } catch (error) {
+      console.error(`[DocumentService] captureFrontmatterTrackerTransition failed for ${relativePath}:`, error);
+    }
+  }
+
+  /**
+   * Push or remove a frontmatter-backed (full-document) tracker item from the
+   * team TrackerRoom when its per-plan `share` flag flips (NIM-876).
+   *
+   * Lifecycle-share rides the normal tracker sync path. The BODY is shared the
+   * same way every other tracker item's body is: through the
+   * `tracker-content/<itemId>` room (MainBodyDocService / applyHeadlessBodyMarkdown),
+   * NOT the file-share-to-team document index. We persist the file's markdown
+   * body to the row (bumping body_version + cache) and seed the live room, so a
+   * teammate opening the shared plan sees its content. When sharing is turned
+   * OFF, the item is deleted from the room and reset to local.
+   *
+   * @param item     the projected tracker item (canonical `fm:<type>:<path>` id)
+   * @param rowId    the backing DB row id (may differ from the canonical id for
+   *                 legacy rows) -- used for the local sync_status write
+   * @param relativePath workspace-relative path of the backing markdown file
+   * @param nowShared whether the item is currently flagged for sharing
+   */
+  private async reconcileFrontmatterShare(
+    item: TrackerItem,
+    rowId: string,
+    relativePath: string,
+    nowShared: boolean,
+  ): Promise<void> {
+    const workspace = item.workspace || this.workspacePath;
+    try {
+      if (nowShared) {
+        const policy = getEffectiveTrackerSyncPolicy(workspace, item.type);
+        // Respect the type policy: a `local` type never shares even if flagged.
+        if (!shouldSyncTrackerItem(policy, item)) return;
+        if (isTrackerSyncActive(workspace)) {
+          await syncTrackerItem(item);
+          // Body-share: push the file's markdown body through the SAME
+          // tracker-content room mechanism used for every tracker body, so the
+          // plan body is readable by teammates. No live renderer peer exists on
+          // this main-process path, so we seed the headless Y.Doc explicitly
+          // (mirroring the MCP tracker_create body path).
+          await this.shareFrontmatterBody(item.id, relativePath, workspace);
+        } else {
+          // Sync not live yet. Seed the body LOCALLY anyway (NIM-880): this bumps
+          // `body_version`, writes the body cache, and seeds the headless Y.Doc,
+          // so when the engine reconnects the backfill ships a real bodyVersion
+          // and the body is already present -- a pre-connect share that only
+          // marked pending used to push metadata with bodyVersion 0 and an empty
+          // body. Then mark pending so the reconnect backfill re-pushes it.
+          await this.shareFrontmatterBody(item.id, relativePath, workspace);
+          await database.query(
+            `UPDATE tracker_items SET sync_status = 'pending' WHERE id = $1`,
+            [rowId],
+          );
+        }
+      } else if (isTrackerSyncActive(workspace)) {
+        // Unshare (live): reset the local row FIRST so the unshare always lands
+        // locally even if the room delete is slow/erroring, then remove from the
+        // team room best-effort. Clearing `sync_id` keeps the backfill from
+        // re-processing it.
+        // console.log('[DocumentService] reconcile UNSHARE(live) resetting row', rowId);
+        await database.query(
+          `UPDATE tracker_items SET sync_status = 'local', sync_id = NULL WHERE id = $1`,
+          [rowId],
+        );
+        try {
+          await unsyncTrackerItem(item.id, workspace);
+        } catch (unsyncErr) {
+          console.error('[DocumentService] reconcile unsync (room delete) failed; local row already reset:', unsyncErr);
+        }
+      } else {
+        // Unshare (offline): `unsyncTrackerItem` would no-op with no engine, so
+        // resetting straight to 'local' (NIM-880) stranded the deletion -- the
+        // row kept its `sync_id` and never re-entered the backfill candidate set,
+        // so the team room kept the plan. Mark pending instead: the reconnect
+        // backfill sees a previously-shared (sync_id set) but now-unflagged item
+        // and issues the room tombstone.
+        await database.query(
+          `UPDATE tracker_items SET sync_status = 'pending' WHERE id = $1`,
+          [rowId],
+        );
+      }
+    } catch (err) {
+      console.error('[DocumentService] reconcileFrontmatterShare failed:', err);
+    }
+  }
+
+  /**
+   * Share a frontmatter-backed item's body through the standard tracker-content
+   * room: read the file's markdown (sans frontmatter), persist it as the item's
+   * body (bumping `body_version` + cache + metadata re-sync via
+   * `updateTrackerItemContent`), then seed the live `tracker-content/<itemId>`
+   * Y.Doc so a teammate who opens the item sees content immediately. Best-effort;
+   * the durable record is the PGLite body + version bump.
+   */
+  private async shareFrontmatterBody(
+    itemId: string,
+    relativePath: string,
+    workspace: string,
+  ): Promise<void> {
+    try {
+      const fullPath = path.join(this.workspacePath, relativePath);
+      let fileContent: string;
+      try {
+        fileContent = await fs.readFile(fullPath, 'utf-8');
+      } catch {
+        return; // file vanished mid-edit -> nothing to seed
+      }
+      const bodyMatch = fileContent.match(/^---\s*\n[\s\S]*?\n---\s*\n([\s\S]*)$/);
+      const markdownBody = (bodyMatch ? bodyMatch[1] : fileContent).trim();
+      if (!markdownBody) return; // empty body -> nothing to share
+
+      // Persist + bump version + cache + metadata re-sync (no headless seed here;
+      // updateTrackerItemContent intentionally skips it to avoid the renderer
+      // autosave loop -- but this path has no live peer, so we seed below).
+      await this.updateTrackerItemContent(itemId, markdownBody);
+      await applyHeadlessBodyMarkdown(workspace, itemId, markdownBody);
+    } catch (err) {
+      console.error('[DocumentService] shareFrontmatterBody failed:', err);
+    }
+  }
+
+  /**
+   * Push the metadata of an ALREADY-shared frontmatter item to the team room
+   * after a lifecycle/field change (NIM-880). No share flip and no body change,
+   * so this is a metadata-only push -- it does NOT re-seed the body. Gated by the
+   * per-item policy; when sync is offline the row is marked pending so the
+   * reconnect backfill re-pushes the new metadata.
+   */
+  private async syncSharedFrontmatterMetadata(item: TrackerItem, rowId: string): Promise<void> {
+    const workspace = item.workspace || this.workspacePath;
+    try {
+      const policy = getEffectiveTrackerSyncPolicy(workspace, item.type);
+      if (!shouldSyncTrackerItem(policy, item)) return;
+      if (isTrackerSyncActive(workspace)) {
+        await syncTrackerItem(item);
+      } else {
+        await database.query(
+          `UPDATE tracker_items SET sync_status = 'pending' WHERE id = $1`,
+          [rowId],
+        );
+      }
+    } catch (err) {
+      console.error('[DocumentService] syncSharedFrontmatterMetadata failed:', err);
+    }
+  }
+
+  /**
+   * Per-item team-sync decision for a resolved tracker item: combines the
+   * effective type policy with the per-item share flag (NIM-880). Call sites that
+   * push to the room (body save, archive toggle) must gate on this -- not merely
+   * on `isTrackerSyncActive` -- because `syncTrackerItem` itself does no policy
+   * gating, so an unflagged hybrid item would otherwise leak.
+   */
+  private shouldSyncItemNow(item: TrackerItem): boolean {
+    const workspace = item.workspace || this.workspacePath;
+    const policy = getEffectiveTrackerSyncPolicy(workspace, item.type);
+    return shouldSyncTrackerItem(policy, item);
+  }
+
   // Tracker Items API methods
   async listTrackerItems(): Promise<TrackerItem[]> {
     try {
-      // console.log(`[DocumentService] listTrackerItems called for workspace: ${this.workspacePath}`);
-      // Returns all items including archived - filtering happens in the UI layer
-      const result = await database.query<any>(
-        `SELECT * FROM tracker_items WHERE workspace = $1 ORDER BY kanban_sort_order ASC NULLS LAST, last_indexed DESC`,
-        [this.workspacePath]
-      );
-      // console.log(`[DocumentService] Query returned ${result.rows.length} tracker items`);
-      const items = result.rows.map(row => this.rowToTrackerItem(row));
-      // console.log(`[DocumentService] Returning ${items.length} tracker items`);
-      return items;
+      return await this.listMergedTrackerItems();
     } catch (error) {
       console.error('[DocumentService] Failed to list tracker items:', error);
       return [];
@@ -933,13 +1646,8 @@ export class ElectronDocumentService implements DocumentService {
 
   async getTrackerItemsByType(type: TrackerItemType): Promise<TrackerItem[]> {
     try {
-      // console.log(`[DocumentService] getTrackerItemsByType(${type}) for workspace: ${this.workspacePath}`);
-      const result = await database.query<any>(
-        `SELECT * FROM tracker_items WHERE workspace = $1 AND type = $2 ORDER BY kanban_sort_order ASC NULLS LAST, last_indexed DESC`,
-        [this.workspacePath, type]
-      );
-      // console.log(`[DocumentService] Query returned ${result.rows.length} items for type ${type}`);
-      return result.rows.map(row => this.rowToTrackerItem(row));
+      const items = await this.listMergedTrackerItems();
+      return items.filter(item => item.type === type);
     } catch (error) {
       console.error('[DocumentService] Failed to get tracker items by type:', error);
       return [];
@@ -948,11 +1656,8 @@ export class ElectronDocumentService implements DocumentService {
 
   async getTrackerItemsByModule(module: string): Promise<TrackerItem[]> {
     try {
-      const result = await database.query<any>(
-        `SELECT * FROM tracker_items WHERE workspace = $1 AND document_path = $2 ORDER BY line_number ASC`,
-        [this.workspacePath, module]
-      );
-      return result.rows.map(row => this.rowToTrackerItem(row));
+      const items = await this.listMergedTrackerItems();
+      return items.filter(item => item.module === module);
     } catch (error) {
       console.error('[DocumentService] Failed to get tracker items by module:', error);
       return [];
@@ -970,16 +1675,17 @@ export class ElectronDocumentService implements DocumentService {
   }
 
   private rowToTrackerItem(row: any): TrackerItem {
-    // Parse JSONB data field
-    const data = typeof row.data === 'string' ? JSON.parse(row.data) : row.data;
+    // Parse JSONB data field (PGLite returns object, SQLite returns JSON string)
+    const data = parseJsonColumn<Record<string, any>>(row.data) ?? {};
 
-    // type_tags from DB column; fall back to [type] for backward compat
-    const typeTags: string[] = row.type_tags && row.type_tags.length > 0
-      ? row.type_tags
-      : [row.type];
+    // type_tags from DB column; fall back to [type] for backward compat.
+    // PGLite stored this as TEXT[]; SQLite stores it as a JSON-encoded string.
+    const parsedTypeTags = parseJsonColumn<string[]>(row.type_tags);
+    const typeTags: string[] =
+      Array.isArray(parsedTypeTags) && parsedTypeTags.length > 0 ? parsedTypeTags : [row.type];
 
     return {
-      id: row.id,
+      id: getCanonicalTrackerItemIdFromRow(row),
       issueNumber: row.issue_number ?? undefined,
       issueKey: row.issue_key ?? undefined,
       type: row.type,
@@ -989,7 +1695,7 @@ export class ElectronDocumentService implements DocumentService {
       status: data.status || row.status, // Fallback to generated column
       priority: data.priority || undefined,
       owner: data.owner || undefined,
-      module: row.document_path, // Use new column name
+      module: row.document_path || ((row.source === 'frontmatter' || row.source === 'import') ? row.source_ref : undefined),
       lineNumber: row.line_number || undefined,
       workspace: row.workspace,
       tags: data.tags || undefined,
@@ -997,8 +1703,9 @@ export class ElectronDocumentService implements DocumentService {
       updated: data.updated || row.updated || undefined,
       dueDate: data.dueDate || undefined,
       lastIndexed: new Date(row.last_indexed),
-      // Rich content (Lexical editor state)
-      content: row.content != null ? row.content : undefined,
+      // Rich content (Lexical editor state). Stored as JSON.stringify(markdown);
+      // undo that on read or the raw JSON-quoted string renders as literal text.
+      content: row.content != null ? parseTrackerContentColumn(row.content) : undefined,
       // Archive state
       archived: row.archived ?? false,
       archivedAt: row.archived_at ? new Date(row.archived_at).toISOString() : undefined,
@@ -1018,25 +1725,20 @@ export class ElectronDocumentService implements DocumentService {
       linkedCommitSha: data.linkedCommitSha || undefined,
       documentId: data.documentId || undefined,
       syncStatus: row.sync_status || 'local',
-      // Map persisted per-field LWW timestamps to the top-level property
-      fieldUpdatedAt: data?._fieldUpdatedAt || undefined,
-      // Pass through extra JSONB data fields (e.g. kanbanSortOrder) so they
-      // survive the TrackerItem -> TrackerRecord conversion via customFields.
-      customFields: (() => {
-        const known = new Set([
-          'title', 'description', 'status', 'priority', 'owner', 'tags',
-          'created', 'updated', 'dueDate', 'assigneeEmail', 'reporterEmail',
-          'authorIdentity', 'lastModifiedBy', 'createdByAgent', 'assigneeId',
-          'reporterId', 'labels', 'linkedSessions', 'linkedCommitSha', 'documentId',
-        ]);
-        const extra: Record<string, any> = {};
-        if (data) {
-          for (const [k, v] of Object.entries(data)) {
-            if (!known.has(k) && v !== undefined) extra[k] = v;
-          }
-        }
-        return Object.keys(extra).length > 0 ? extra : undefined;
-      })(),
+      // Body Y.Doc version pointer (phase 4b). BIGINT in PGLite arrives
+      // as string|number depending on the driver path; normalize.
+      bodyVersion: row.body_version !== undefined && row.body_version !== null
+        ? Number(row.body_version)
+        : undefined,
+      // Pass through extra JSONB data fields (e.g. kanbanSortOrder) AND un-nest
+      // a nested `data.customFields` bag so custom schema columns (e.g. prUrl)
+      // survive the TrackerItem -> TrackerRecord conversion. See NIM-863.
+      customFields: extractItemCustomFields(data, new Set([
+        'title', 'description', 'status', 'priority', 'owner', 'tags',
+        'created', 'updated', 'dueDate', 'assigneeEmail', 'reporterEmail',
+        'authorIdentity', 'lastModifiedBy', 'createdByAgent', 'assigneeId',
+        'reporterId', 'labels', 'linkedSessions', 'linkedCommitSha', 'documentId',
+      ])),
     };
   }
 
@@ -1044,26 +1746,41 @@ export class ElectronDocumentService implements DocumentService {
    * Get a single tracker item by ID, or null if not found.
    */
   async getTrackerItemById(itemId: string): Promise<TrackerItem | null> {
-    const result = await database.query<any>(
-      `SELECT * FROM tracker_items WHERE id = $1`,
-      [itemId]
-    );
-    if (result.rows.length === 0) return null;
-    return this.rowToTrackerItem(result.rows[0]);
+    const merged = await this.listMergedTrackerItems();
+    const found = merged.find(item => item.id === itemId);
+    if (found) return found;
+
+    const row = await this.resolveTrackerRowForPublicId(itemId);
+    return row ? this.rowToTrackerItem(row) : null;
+  }
+
+  /**
+   * Ensure a backing projection row exists for a public tracker ID and return
+   * the projected item. This is primarily used by MCP-facing code so
+   * frontmatter-backed full-document items can participate in mutations that
+   * still need a `tracker_items` row.
+   */
+  async ensureTrackerProjection(itemId: string): Promise<TrackerItem | null> {
+    const row = await this.resolveTrackerRowForPublicId(itemId, {
+      createProjectionForFullDocument: true,
+    });
+    return row ? this.rowToTrackerItem(row) : null;
   }
 
   /**
    * Update the sync_status of a tracker item.
    */
   async updateTrackerItemSyncStatus(itemId: string, syncStatus: string): Promise<void> {
+    const row = await this.resolveTrackerRowForPublicId(itemId);
+    if (!row) return;
     await database.query(
       `UPDATE tracker_items SET sync_status = $1 WHERE id = $2`,
-      [syncStatus, itemId]
+      [syncStatus, row.id]
     );
     // Notify watchers
     const result = await database.query<any>(
       `SELECT * FROM tracker_items WHERE id = $1`,
-      [itemId]
+      [row.id]
     );
     if (result.rows.length > 0) {
       const item = this.rowToTrackerItem(result.rows[0]);
@@ -1082,16 +1799,10 @@ export class ElectronDocumentService implements DocumentService {
    * Merges provided fields into the existing JSONB data column.
    */
   async updateTrackerItem(itemId: string, updates: Record<string, any>): Promise<TrackerItem> {
-    // Read existing item
-    const existing = await database.query<any>(
-      `SELECT * FROM tracker_items WHERE id = $1`,
-      [itemId]
-    );
-    if (existing.rows.length === 0) {
+    const row = await this.resolveTrackerRowForPublicId(itemId, { createProjectionForFullDocument: true });
+    if (!row) {
       throw new Error(`Tracker item not found: ${itemId}`);
     }
-
-    const row = existing.rows[0];
     const data = typeof row.data === 'string' ? JSON.parse(row.data) : (row.data || {});
 
     // Handle typeTags separately -- stored in SQL column, not JSONB
@@ -1101,7 +1812,7 @@ export class ElectronDocumentService implements DocumentService {
       if (!newTypeTags.includes(row.type)) newTypeTags.unshift(row.type);
       await database.query(
         `UPDATE tracker_items SET type_tags = $1 WHERE id = $2`,
-        [newTypeTags, itemId]
+        [newTypeTags, row.id]
       );
     }
 
@@ -1109,27 +1820,28 @@ export class ElectronDocumentService implements DocumentService {
     // getCurrentIdentity imported statically at top of file
     data.lastModifiedBy = getCurrentIdentity(row.workspace);
 
-    // Stamp per-field LWW timestamps for sync conflict resolution
-    const fieldTimestamps: Record<string, number> = data._fieldUpdatedAt || {};
-    const now = Date.now();
-
     // Merge remaining updates into data (skip typeTags since it's a column)
     for (const [key, value] of Object.entries(updates)) {
       if (key === 'typeTags') continue;
       data[key] = value;
-      fieldTimestamps[key] = now;
     }
 
-    data._fieldUpdatedAt = fieldTimestamps;
+    const writtenFields = new Set(Object.keys(updates).filter((key) => key !== 'typeTags'));
+
+    // Relationship values must live under data.customFields (the durable synced
+    // shape). Route any relationship-typed field into the nested bag, preserving
+    // sibling custom fields and clearing the top-level shadow, so the value
+    // survives the sync re-serialization and inverse-write reads find it (NIM-1305).
+    nestRelationshipFieldsIntoCustomFields(data, globalRegistry.get(row.type)?.fields ?? [], { writtenFields });
 
     await database.query(
       `UPDATE tracker_items SET data = $1, updated = NOW() WHERE id = $2`,
-      [JSON.stringify(data), itemId]
+      [JSON.stringify(data), row.id]
     );
 
     const result = await database.query<any>(
       `SELECT * FROM tracker_items WHERE id = $1`,
-      [itemId]
+      [row.id]
     );
     const updated = this.rowToTrackerItem(result.rows[0]);
 
@@ -1145,18 +1857,295 @@ export class ElectronDocumentService implements DocumentService {
   }
 
   /**
+   * Materialize inverse relationship fields on target items after a source item's
+   * relationship field changed (Phase 3). Shared by the IPC update handler and the
+   * MCP `tracker_update` path so the two can't drift (NIM-1305 Defect A).
+   *
+   * Each inverse target write goes through `updateTrackerItem` (which nests the
+   * value under data.customFields and broadcasts a complete record), then the same
+   * sync gate + relationship reindex as the source. `propagateInverseRelationships`
+   * reads the target's existing inverse array customFields-aware, so adding one
+   * link preserves the target's other links. Loop-safe: targets are written via
+   * `updateTrackerItem`, never by re-entering this method.
+   */
+  async propagateInverseForUpdate(
+    source: { id: string; type: string; issueKey?: string; title?: string },
+    changedFields: Record<string, unknown>,
+    oldData: Record<string, unknown>,
+    syncMode?: string,
+  ): Promise<void> {
+    await propagateInverseRelationships(
+      source,
+      changedFields,
+      oldData,
+      {
+        loadItem: async (id) => {
+          const row = await database.query<any>(`SELECT id, type, data FROM tracker_items WHERE id = $1`, [id]);
+          if (!row.rows[0]) return null;
+          return {
+            id: row.rows[0].id,
+            type: row.rows[0].type,
+            data: parseJsonColumn<Record<string, unknown>>(row.rows[0].data) ?? {},
+          };
+        },
+        applyTargetUpdate: async (targetId, fieldName, value) => {
+          const target = await this.updateTrackerItem(targetId, { [fieldName]: value });
+          const targetPolicy = getEffectiveTrackerSyncPolicy(target.workspace, target.type, syncMode);
+          if (shouldSyncTrackerItem(targetPolicy, target)) {
+            if (isTrackerSyncActive(target.workspace)) {
+              await syncTrackerItem(target);
+            } else {
+              await this.updateTrackerItemSyncStatus(target.id, 'pending');
+            }
+          }
+          const targetDefs = globalRegistry.get(target.type)?.fields ?? [];
+          const targetData = await database.query<any>(`SELECT data, updated FROM tracker_items WHERE id = $1`, [target.id]);
+          const td = parseJsonColumn<Record<string, unknown>>(targetData.rows[0]?.data) ?? {};
+          const updatedAt = targetData.rows[0]?.updated
+            ? (typeof targetData.rows[0].updated === 'string' ? targetData.rows[0].updated : new Date(targetData.rows[0].updated).toISOString())
+            : null;
+          await reindexItemRelationships(target.workspace, target.id, td, targetDefs, updatedAt, database as any);
+        },
+      },
+    );
+  }
+
+  /**
+   * Flip a tracker item's team-share flag from the UI — the per-item "Share
+   * with team" toggle for `hybrid` trackers (e.g. plans). Writes the canonical
+   * `share` flag into the item's data and reconciles the team TrackerRoom:
+   * sharing pushes the item (its body rides the `tracker-content/<id>` room the
+   * open detail editor seeds once it becomes collaborative); unsharing tombstones
+   * it from the room and resets the local row to `local`.
+   *
+   * Native DB items only. File-backed (frontmatter) plans carry their share flag
+   * in the markdown and are reconciled by `reconcileFrontmatterShare` on save.
+   */
+  async setTrackerItemShared(itemId: string, shared: boolean): Promise<TrackerItem> {
+    const row = await this.resolveTrackerRowForPublicId(itemId, { createProjectionForFullDocument: true });
+    if (!row) {
+      throw new Error(`Tracker item not found: ${itemId}`);
+    }
+    const shareFlag = shared
+      ? { status: 'team', body: 'team' }
+      : { status: 'private', body: 'private' };
+
+    // File-backed plans/decisions (`fm:<type>:<path>`) carry their canonical
+    // share flag in the markdown frontmatter. Write ONLY the top-level `share`
+    // key (via setShareInFrontmatter) so the plan extension's own frontmatter
+    // block is left untouched -- updateTrackerItemInFile would migrate the
+    // legacy `planStatus:` block and reshuffle the file.
+    //
+    // Reconcile the room push EXPLICITLY here rather than rely on the
+    // file-change rescan: we also write the flag to the DB row below, so by the
+    // time the rescan runs captureFrontmatterTrackerTransition sees no change
+    // and skips its reconcile. reconcileFrontmatterShare pushes the item (and
+    // seeds its file body) on share, or tombstones it on unshare.
+    if ((row.source === 'frontmatter' || row.source === 'import') && (row.source_ref || row.document_path)) {
+      const relativePath = row.source_ref || row.document_path;
+      const fullPath = path.join(this.workspacePath, relativePath);
+      try {
+        const content = await fs.readFile(fullPath, 'utf-8');
+        const updatedContent = setShareInFrontmatter(content, shared ? shareFlag : null);
+        await fs.writeFile(fullPath, updatedContent, 'utf-8');
+      } catch (err) {
+        throw new Error(`Failed to write share flag to ${relativePath}: ${err instanceof Error ? err.message : String(err)}`);
+      }
+
+      // Mirror the flag into the DB row so the UI + reconcile see it at once.
+      // Deliberately do NOT bump the row's `updated` column -- sharing is not a
+      // content edit and must not advance the plan's "updated" timestamp.
+      //
+      // Clear/set BOTH the top-level `share` and the nested `customFields.share`:
+      // the sync round-trip stores the flag nested, and isTrackerItemShared makes
+      // the nested value win -- so an unshare that only cleared the top level
+      // would leave a stale nested `team` flag and the item would re-sync.
+      const fmData = typeof row.data === 'string' ? JSON.parse(row.data) : (row.data || {});
+      if (shared) {
+        fmData.share = shareFlag;
+        fmData.customFields = {
+          ...(fmData.customFields && typeof fmData.customFields === 'object' ? fmData.customFields : {}),
+          share: shareFlag,
+        };
+      } else {
+        delete fmData.share;
+        if (fmData.customFields && typeof fmData.customFields === 'object') {
+          delete fmData.customFields.share;
+        }
+      }
+      fmData.shared = false;
+      await database.query(
+        `UPDATE tracker_items SET data = $1 WHERE id = $2`,
+        [JSON.stringify(fmData), row.id],
+      );
+      const fmResult = await database.query<any>(`SELECT * FROM tracker_items WHERE id = $1`, [row.id]);
+      const fmItem = this.rowToTrackerItem(fmResult.rows[0]);
+
+      await this.reconcileFrontmatterShare(fmItem, row.id, relativePath, shared);
+
+      // Re-read so the emitted item reflects the final sync_status.
+      const finalResult = await database.query<any>(`SELECT * FROM tracker_items WHERE id = $1`, [row.id]);
+      const finalItem = this.rowToTrackerItem(finalResult.rows[0]);
+      this.trackerItemWatchers.forEach(callback => callback({
+        added: [], updated: [finalItem], removed: [], timestamp: new Date(),
+      }));
+      return finalItem;
+    }
+
+    // Native (DB-backed) item. Unsharing a native item is BLOCKED for now: the
+    // sync engine has no "remove from room, keep local" primitive -- unsync goes
+    // through engine.deleteItem, which tombstones the local row too. A file-backed
+    // plan re-projects from its file, but a native item would be permanently
+    // deleted. Until a real unshare primitive lands, refuse native unshare so the
+    // UI/data can't lose an item. (Native SHARE is fine.)
+    if (!shared) {
+      throw new Error(
+        'Unsharing a native tracker item is not supported yet (it would delete the item). ' +
+        'Only file-backed plans/decisions can be unshared from the UI.',
+      );
+    }
+
+    const data = typeof row.data === 'string' ? JSON.parse(row.data) : (row.data || {});
+
+    // Write the flag in BOTH storage shapes. The sync round-trip stores custom
+    // fields nested under `data.customFields`, and `extractItemCustomFields`
+    // makes the nested value WIN over the top-level one -- so writing only the
+    // top level would leave a stale nested `team` flag on unshare and the item
+    // would still read as shared. Keep both consistent.
+    data.share = shareFlag;
+    data.customFields = {
+      ...(data.customFields && typeof data.customFields === 'object' ? data.customFields : {}),
+      share: shareFlag,
+    };
+    data.shared = false; // drop any legacy boolean flag
+    data.lastModifiedBy = getCurrentIdentity(row.workspace);
+
+    await database.query(
+      `UPDATE tracker_items SET data = $1, updated = NOW() WHERE id = $2`,
+      [JSON.stringify(data), row.id],
+    );
+
+    // Read back for the reconcile (it needs the share flag for the policy gate).
+    let result = await database.query<any>(`SELECT * FROM tracker_items WHERE id = $1`, [row.id]);
+    let item = this.rowToTrackerItem(result.rows[0]);
+
+    await this.reconcileItemShare(item, row.id, shared);
+
+    // Re-read AFTER reconcile so the emitted item carries the final sync_status
+    // (synced/pending on share, local on unshare) -- otherwise the renderer's
+    // "is this item shared" check would lag a beat behind on the room state.
+    result = await database.query<any>(`SELECT * FROM tracker_items WHERE id = $1`, [row.id]);
+    item = this.rowToTrackerItem(result.rows[0]);
+    this.trackerItemWatchers.forEach(callback => callback({
+      added: [],
+      updated: [item],
+      removed: [],
+      timestamp: new Date(),
+    }));
+
+    return item;
+  }
+
+  /**
+   * Push or remove a native tracker item from the team TrackerRoom when its
+   * per-item `share` flag flips. Mirrors `reconcileFrontmatterShare` minus the
+   * file-body seed (a native item's body is seeded by the live collaborative
+   * editor that mounts once the item becomes shared).
+   *
+   *   - share + sync live    -> syncTrackerItem (push to room)
+   *   - share + offline      -> mark pending (reconnect backfill pushes it)
+   *   - unshare + sync live  -> unsyncTrackerItem + reset row to local
+   *   - unshare + offline    -> mark pending (reconnect backfill tombstones it)
+   */
+  private async reconcileItemShare(item: TrackerItem, rowId: string, nowShared: boolean): Promise<void> {
+    const workspace = item.workspace || this.workspacePath;
+    try {
+      if (nowShared) {
+        const policy = getEffectiveTrackerSyncPolicy(workspace, item.type);
+        // Respect the type policy: a `local` type never shares even if flagged.
+        if (!shouldSyncTrackerItem(policy, item)) return;
+        if (isTrackerSyncActive(workspace)) {
+          await syncTrackerItem(item);
+        } else {
+          await database.query(
+            `UPDATE tracker_items SET sync_status = 'pending' WHERE id = $1`,
+            [rowId],
+          );
+        }
+      } else if (isTrackerSyncActive(workspace)) {
+        // Unshare (live): reset the local row FIRST so the unshare always lands
+        // locally even if the room delete is slow/erroring, then remove from the
+        // team room best-effort. Clearing `sync_id` keeps the backfill from
+        // re-processing it.
+        // console.log('[DocumentService] reconcile UNSHARE(live) resetting row', rowId);
+        await database.query(
+          `UPDATE tracker_items SET sync_status = 'local', sync_id = NULL WHERE id = $1`,
+          [rowId],
+        );
+        try {
+          await unsyncTrackerItem(item.id, workspace);
+        } catch (unsyncErr) {
+          console.error('[DocumentService] reconcile unsync (room delete) failed; local row already reset:', unsyncErr);
+        }
+      } else {
+        // Unshare (offline): mark pending so the reconnect backfill sees a
+        // previously-shared (sync_id set) but now-unflagged item and issues the
+        // room tombstone (NIM-880).
+        await database.query(
+          `UPDATE tracker_items SET sync_status = 'pending' WHERE id = $1`,
+          [rowId],
+        );
+      }
+    } catch (err) {
+      console.error('[DocumentService] reconcileItemShare failed:', err);
+    }
+  }
+
+  /**
    * Update the rich content (Lexical editor state) of a tracker item.
    */
   async updateTrackerItemContent(itemId: string, content: any): Promise<void> {
+    const row = await this.resolveTrackerRowForPublicId(itemId, { createProjectionForFullDocument: true });
+    if (!row) {
+      throw new Error(`Tracker item not found: ${itemId}`);
+    }
     const contentJson = content != null ? JSON.stringify(content) : null;
-    await database.query(
-      `UPDATE tracker_items SET content = $1, updated = NOW() WHERE id = $2`,
-      [contentJson, itemId]
+    // Phase 4b: every body save bumps `body_version` and writes a row
+    // into `tracker_body_cache` keyed by `(item_id, body_version)`. The
+    // bumped version travels through the metadata sync envelope so
+    // remote clients learn the body changed without re-fetching the Y.Doc.
+    //
+    // The UPDATE + cache INSERT are issued serially via the PGLite
+    // worker, which serializes calls. A crash between the two leaves
+    // tracker_items.body_version bumped but tracker_body_cache without
+    // the new row -- on next save the bump re-fires and the cache row
+    // gets a fresher version anyway, so we don't end up wedged.
+    const updateResult = await database.query<{ body_version: string | number | null }>(
+      `UPDATE tracker_items
+         SET content = $1,
+             body_version = COALESCE(body_version, 0) + 1,
+             updated = NOW()
+       WHERE id = $2
+       RETURNING body_version`,
+      [contentJson, row.id]
     );
+    const newBodyVersion = Number(updateResult.rows[0]?.body_version ?? 0);
+
+    if (contentJson !== null && newBodyVersion > 0) {
+      // ON CONFLICT DO NOTHING covers the rare case where two saves race
+      // on the same version assignment (shouldn't happen via PGLite's
+      // single-writer worker, but cheap insurance).
+      await database.query(
+        `INSERT INTO tracker_body_cache (item_id, body_version, content, cached_at)
+         VALUES ($1, $2, $3, NOW())
+         ON CONFLICT (item_id, body_version) DO NOTHING`,
+        [row.id, newBodyVersion, contentJson]
+      );
+    }
 
     const result = await database.query<any>(
       `SELECT * FROM tracker_items WHERE id = $1`,
-      [itemId]
+      [row.id]
     );
     if (result.rows.length > 0) {
       const item = this.rowToTrackerItem(result.rows[0]);
@@ -1167,57 +2156,162 @@ export class ElectronDocumentService implements DocumentService {
         timestamp: new Date(),
       };
       this.trackerItemWatchers.forEach(callback => callback(changeEvent));
+
+      // Phase 4b: fire a metadata-layer sync so remote cold clients
+      // learn about the bumped body_version. Warm clients with the
+      // DocumentRoom Y.Doc open already see body changes directly --
+      // this push exists for the "search / preview / never-opened"
+      // surface, which only ever reads the metadata projection. The
+      // 800ms debounce upstream keeps the burst rate reasonable.
+      //
+      // Gate on the per-item policy (NIM-880): `syncTrackerItem` does no policy
+      // check, so an unflagged hybrid item's body save would otherwise leak to
+      // the room. The legit frontmatter body-share path (shareFrontmatterBody)
+      // still passes here because by then the row carries the share flag.
+      if (isTrackerSyncActive(item.workspace) && this.shouldSyncItemNow(item)) {
+        try {
+          await syncTrackerItem(item);
+        } catch (syncErr) {
+          console.error('[DocumentService] updateTrackerItemContent sync failed:', syncErr);
+        }
+        // Intentionally NOT calling `applyHeadlessBodyMarkdown` here.
+        //
+        // The renderer save path that hits this IPC already wrote the
+        // body to the live DocumentRoom Y.Doc through its own
+        // `CollabLexicalProvider` -- the autosave fires AFTER the local
+        // Y.Doc edit has propagated. Re-applying the same markdown via
+        // the main-process headless peer is not just redundant: the
+        // headless write does `root.clear()` + re-parse, generating
+        // brand-new XmlElement IDs that the renderer's `@lexical/yjs`
+        // binding sees as remote structural changes. That fires
+        // `onDirtyChange` on the editor, which triggers another save,
+        // which fires another headless write, and so on -- the loop
+        // that just clobbered NIM-633's body cache 100+ times in 90
+        // seconds with "asd" while we were debugging.
+        //
+        // MCP-driven body writes (handleTrackerCreate /
+        // handleTrackerUpdate in trackerToolHandlers) still call
+        // `applyHeadlessBodyMarkdown` themselves -- they are the path
+        // that needs it because there is no live renderer peer to
+        // write the Y.Doc.
+      }
     }
+  }
+
+  /**
+   * Read a body snapshot at a specific version from the cache. Used by
+   * future cold-read paths (search, history, preview) so they don't pay
+   * the cost of resolving the Y.Doc just to look at body text.
+   *
+   * Returns `null` when no cached row exists at that version (e.g. the
+   * cache was provisioned after the version was written, or the row was
+   * evicted by a future pruning policy).
+   */
+  async getTrackerBodyCacheAtVersion(itemId: string, bodyVersion: number): Promise<any | null> {
+    const row = await this.resolveTrackerRowForPublicId(itemId);
+    if (!row) return null;
+    const result = await database.query<{ content: string | null }>(
+      `SELECT content FROM tracker_body_cache
+        WHERE item_id = $1 AND body_version = $2`,
+      [row.id, bodyVersion]
+    );
+    const raw = result.rows[0]?.content;
+    if (raw === undefined || raw === null) return null;
+    try {
+      return JSON.parse(raw);
+    } catch {
+      // Not JSON -- return as-is. The cache stores whatever the host wrote.
+      return raw;
+    }
+  }
+
+  /**
+   * Read the latest body cache row for an item -- the one matching the
+   * item's current `body_version`. Used by the renderer's cold-open path
+   * so the editor can paint authoritative content before the
+   * DocumentRoom Y.Doc finishes its initial sync. CollabLexicalProvider's
+   * `deferInitialSync: true` mode ensures the bootstrap decision still
+   * happens AFTER the server's initial sync response, so a non-empty
+   * room won't be clobbered by this optimistic paint.
+   *
+   * Returns `null` when the item is missing, has never been saved
+   * (body_version = 0), or the cache row was never written.
+   */
+  async getTrackerBodyCacheLatest(itemId: string): Promise<{ bodyVersion: number; content: any } | null> {
+    const trackerRow = await this.resolveTrackerRowForPublicId(itemId);
+    if (!trackerRow) return null;
+    const result = await database.query<{ body_version: string | number | null; content: string | null }>(
+      `SELECT t.body_version, c.content
+         FROM tracker_items t
+         LEFT JOIN tracker_body_cache c
+           ON c.item_id = t.id AND c.body_version = t.body_version
+        WHERE t.id = $1`,
+      [trackerRow.id]
+    );
+    const row = result.rows[0];
+    if (!row) return null;
+    const bodyVersion = Number(row.body_version ?? 0);
+    if (bodyVersion <= 0) return null;
+    const raw = row.content;
+    if (raw === undefined || raw === null) return null;
+    let parsed: any = raw;
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      // Not JSON -- return as-is. The cache stores whatever the host wrote.
+    }
+    return { bodyVersion, content: parsed };
   }
 
   /**
    * Get the rich content (Lexical editor state) of a tracker item.
    */
   async getTrackerItemContent(itemId: string): Promise<any | null> {
+    const row = await this.resolveTrackerRowForPublicId(itemId);
+    if (!row) return null;
     const result = await database.query<any>(
       `SELECT content FROM tracker_items WHERE id = $1`,
-      [itemId]
+      [row.id]
     );
     if (result.rows.length === 0) return null;
-    return result.rows[0].content ?? null;
+    const raw = result.rows[0].content;
+    return raw != null ? parseTrackerContentColumn(raw) : null;
   }
 
   /**
    * Archive or unarchive a tracker item.
    */
   async archiveTrackerItem(itemId: string, archive: boolean): Promise<TrackerItem> {
+    const row = await this.resolveTrackerRowForPublicId(itemId, { createProjectionForFullDocument: true });
+    if (!row) {
+      throw new Error(`Tracker item not found: ${itemId}`);
+    }
+
     // For inline/frontmatter items, write archived state back to the source file
-    const preResult = await database.query<any>(
-      `SELECT source, document_path FROM tracker_items WHERE id = $1`,
-      [itemId]
-    );
-    if (preResult.rows.length > 0) {
-      const { source, document_path: documentPath } = preResult.rows[0];
-      if ((source === 'inline' || source === 'frontmatter') && documentPath) {
-        try {
-          await this.updateTrackerItemInFile(itemId, { archived: archive ? 'true' : null });
-        } catch (err) {
-          // File may be gone -- fall through to DB-only update
-          // console.log(`[DocumentService] Failed to write archived state to file for ${itemId}:`, err);
-        }
+    const documentPath = row.document_path || row.source_ref;
+    if ((row.source === 'inline' || row.source === 'frontmatter') && documentPath) {
+      try {
+        await this.updateTrackerItemInFile(itemId, { archived: archive ? 'true' : null });
+      } catch (err) {
+        // File may be gone -- fall through to DB-only update
       }
     }
 
     if (archive) {
       await database.query(
         `UPDATE tracker_items SET archived = TRUE, archived_at = NOW(), updated = NOW() WHERE id = $1`,
-        [itemId]
+        [row.id]
       );
     } else {
       await database.query(
         `UPDATE tracker_items SET archived = FALSE, archived_at = NULL, updated = NOW() WHERE id = $1`,
-        [itemId]
+        [row.id]
       );
     }
 
     const result = await database.query<any>(
       `SELECT * FROM tracker_items WHERE id = $1`,
-      [itemId]
+      [row.id]
     );
     if (result.rows.length === 0) {
       throw new Error(`Tracker item not found: ${itemId}`);
@@ -1232,8 +2326,10 @@ export class ElectronDocumentService implements DocumentService {
     };
     this.trackerItemWatchers.forEach(callback => callback(changeEvent));
 
-    // Push archived state to sync server so other clients see it
-    if (isTrackerSyncActive(item.workspace)) {
+    // Push archived state to sync server so other clients see it. Gate on the
+    // per-item policy (NIM-880) so an unflagged hybrid item doesn't leak to the
+    // room just because it was archived.
+    if (isTrackerSyncActive(item.workspace) && this.shouldSyncItemNow(item)) {
       try {
         await syncTrackerItem(item);
       } catch (syncErr) {
@@ -1248,18 +2344,17 @@ export class ElectronDocumentService implements DocumentService {
    * Permanently delete a tracker item from the database.
    */
   async deleteTrackerItem(itemId: string): Promise<void> {
+    const row = await this.resolveTrackerRowForPublicId(itemId);
+    const rowId = row?.id || itemId;
+
     // For inline items, remove the line from the source file before deleting from DB
-    const result = await database.query<any>(
-      `SELECT source, document_path FROM tracker_items WHERE id = $1`,
-      [itemId]
-    );
-    if (result.rows.length > 0) {
-      const { source, document_path: documentPath } = result.rows[0];
+    if (row) {
+      const { source, document_path: documentPath } = row;
       if (source === 'inline' && documentPath) {
         const fullPath = path.join(this.workspacePath, documentPath);
         try {
           const fileContent = await fs.readFile(fullPath, 'utf-8');
-          const updated = removeInlineTrackerItem(fileContent, itemId);
+          const updated = removeInlineTrackerItem(fileContent, rowId);
           if (updated !== null) {
             await fs.writeFile(fullPath, updated, 'utf-8');
           }
@@ -1274,13 +2369,13 @@ export class ElectronDocumentService implements DocumentService {
 
     await database.query(
       `DELETE FROM tracker_items WHERE id = $1`,
-      [itemId]
+      [rowId]
     );
 
     // Notify sync server so other clients remove the item too
     if (isTrackerSyncActive(this.workspacePath)) {
       try {
-        await unsyncTrackerItem(itemId, this.workspacePath);
+        await unsyncTrackerItem(rowId, this.workspacePath);
       } catch (syncErr) {
         console.error('[DocumentService] deleteTrackerItem sync failed:', syncErr);
       }
@@ -1300,22 +2395,30 @@ export class ElectronDocumentService implements DocumentService {
    * Handles both frontmatter-based items (YAML) and inline items (#type[...]).
    */
   async updateTrackerItemInFile(itemId: string, updates: Record<string, any>): Promise<TrackerItem> {
-    // Look up the item to find the source file
-    const result = await database.query<any>(
-      `SELECT * FROM tracker_items WHERE id = $1`,
-      [itemId]
-    );
-    if (result.rows.length === 0) {
+    let row = await this.resolveTrackerRowForPublicId(itemId, { createProjectionForFullDocument: false });
+    const parsedFullDocumentId = parseFullDocumentTrackerId(itemId);
+    if (!row && parsedFullDocumentId) {
+      row = {
+        id: itemId,
+        type: parsedFullDocumentId.trackerType,
+        source: 'frontmatter',
+        source_ref: parsedFullDocumentId.relativePath,
+        document_path: parsedFullDocumentId.relativePath,
+        data: {},
+        workspace: this.workspacePath,
+      };
+    }
+    if (!row) {
       throw new Error(`Tracker item not found: ${itemId}`);
     }
-    const row = result.rows[0];
+
     const source = row.source; // 'inline', 'frontmatter', 'import'
     const sourceRef = row.source_ref;
     const documentPath = row.document_path;
     const trackerType = row.type;
 
     // Determine the file path -- inline items use document_path, frontmatter uses source_ref
-    const relativePath = source === 'inline' ? documentPath : sourceRef;
+    const relativePath = source === 'inline' ? documentPath : (sourceRef || documentPath);
     if (!relativePath) {
       throw new Error(`Item ${itemId} has no source file reference`);
     }
@@ -1339,15 +2442,34 @@ export class ElectronDocumentService implements DocumentService {
     if (fileContent !== null) {
       let updatedContent: string;
       if (source === 'inline') {
-        // Inline items: rewrite #type[...] metadata in the line
-        const result = updateInlineTrackerItem(fileContent, itemId, updates);
+        // Inline items: rewrite #type[...] metadata in the line. Markers without
+        // an explicit id: are located via the row's line + title, since the id is
+        // a deterministic hash that never reaches the file (GitHub #404).
+        const result = updateInlineTrackerItem(fileContent, itemId, updates, {
+          lineNumber: row.line_number != null ? Number(row.line_number) : undefined,
+          title: typeof row.title === 'string' ? row.title : undefined,
+        });
         if (!result) {
           throw new Error(`Could not find inline item ${itemId} in ${relativePath}`);
         }
         updatedContent = result;
       } else {
-        // Frontmatter/import items: update YAML frontmatter
-        updatedContent = updateTrackerInFrontmatter(fileContent, trackerType, updates);
+        const { description, ...frontmatterUpdates } = updates;
+        updatedContent = Object.keys(frontmatterUpdates).length > 0
+          ? updateTrackerInFrontmatter(fileContent, trackerType, frontmatterUpdates)
+          : fileContent;
+        if (description !== undefined) {
+          const normalizedBody = typeof description === 'string'
+            ? description.replace(/\\n/g, '\n')
+            : String(description ?? '');
+          const frontmatterRegex = /^---\r?\n[\s\S]*?\r?\n---\r?\n?/;
+          const frontmatterMatch = updatedContent.match(frontmatterRegex);
+          if (frontmatterMatch) {
+            updatedContent = `${frontmatterMatch[0]}${normalizedBody}${normalizedBody.endsWith('\n') ? '' : '\n'}`;
+          } else {
+            updatedContent = normalizedBody;
+          }
+        }
       }
 
       // Write back
@@ -1358,19 +2480,63 @@ export class ElectronDocumentService implements DocumentService {
     // (the file watcher will re-index later, but this gives instant feedback)
     // Only update the data JSONB column -- top-level columns (status, title, etc.)
     // are generated columns and cannot be SET directly.
-    const existingData = typeof row.data === 'string' ? JSON.parse(row.data) : (row.data || {});
-    const mergedData = { ...existingData, ...updates };
-    await database.query(
-      `UPDATE tracker_items SET data = $1, updated = NOW() WHERE id = $2`,
-      [JSON.stringify(mergedData), itemId]
-    );
+    const resolvedRow = await this.resolveTrackerRowForPublicId(itemId, {
+      createProjectionForFullDocument: source === 'frontmatter' || source === 'import',
+    });
 
-    // Re-read the updated item
-    const updated = await database.query<any>(
-      `SELECT * FROM tracker_items WHERE id = $1`,
-      [itemId]
-    );
-    const item = this.rowToTrackerItem(updated.rows[0]);
+    let item: TrackerItem;
+    if (resolvedRow) {
+      const existingData = typeof resolvedRow.data === 'string' ? JSON.parse(resolvedRow.data) : (resolvedRow.data || {});
+      const mergedData = { ...existingData, ...updates };
+      const normalizedDescription = typeof updates.description === 'string'
+        ? updates.description.replace(/\\n/g, '\n')
+        : undefined;
+      if ((source === 'frontmatter' || source === 'import') && updates.description !== undefined) {
+        delete mergedData.description;
+        const contentJson = normalizedDescription != null ? JSON.stringify(normalizedDescription) : null;
+        const versionResult = await database.query<{ body_version: string | number | null }>(
+          `UPDATE tracker_items
+             SET data = $1,
+                 content = $2,
+                 body_version = COALESCE(body_version, 0) + 1,
+                 updated = NOW()
+           WHERE id = $3
+           RETURNING body_version`,
+          [JSON.stringify(mergedData), contentJson, resolvedRow.id]
+        );
+        const newBodyVersion = Number(versionResult.rows[0]?.body_version ?? 0);
+        if (contentJson !== null && newBodyVersion > 0) {
+          await database.query(
+            `INSERT INTO tracker_body_cache (item_id, body_version, content, cached_at)
+             VALUES ($1, $2, $3, NOW())
+             ON CONFLICT (item_id, body_version) DO NOTHING`,
+            [resolvedRow.id, newBodyVersion, contentJson]
+          );
+        }
+      } else {
+        await database.query(
+          `UPDATE tracker_items SET data = $1, updated = NOW() WHERE id = $2`,
+          [JSON.stringify(mergedData), resolvedRow.id]
+        );
+      }
+
+      const updated = await database.query<any>(
+        `SELECT * FROM tracker_items WHERE id = $1`,
+        [resolvedRow.id]
+      );
+      item = this.rowToTrackerItem(updated.rows[0]);
+    } else {
+      const metadata = this.metadataByPath.get(relativePath);
+      if (!metadata) {
+        throw new Error(`Tracker item ${itemId} was updated in file but could not be reloaded from metadata`);
+      }
+      const synthesized = (await this.listFullDocumentTrackerItemsFromMetadata())
+        .find(candidate => candidate.id === itemId);
+      if (!synthesized) {
+        throw new Error(`Tracker item ${itemId} was updated in file but could not be synthesized`);
+      }
+      item = synthesized;
+    }
 
     // Notify watchers
     const changeEvent: TrackerItemChangeEvent = {
@@ -1419,11 +2585,25 @@ export class ElectronDocumentService implements DocumentService {
       return { item: null, skipped: false, error: 'No valid frontmatter found' };
     }
 
-    // Resolve tracker frontmatter: check trackerStatus (canonical format)
+    // Resolve tracker frontmatter. Keep this in sync with
+    // `detectTrackerFromFrontmatter` / `resolveTrackerFrontmatter` so import
+    // accepts extension-owned keys, canonical trackerStatus docs, and older
+    // legacy per-type keys like `planStatus`. Otherwise import rejects files
+    // that the tracker UI still considers valid tracker documents.
     let trackerData: Record<string, any> | null = null;
     let trackerType = 'plan'; // default
 
-    if (frontmatter.trackerStatus && typeof frontmatter.trackerStatus === 'object') {
+    for (const [extKey, extType] of Object.entries(EXTENSION_OWNED_KEYS)) {
+      if (frontmatter[extKey] && typeof frontmatter[extKey] === 'object') {
+        const extData = frontmatter[extKey] as Record<string, any>;
+        const { [extKey]: _ext, trackerStatus: _ts, ...topLevel } = frontmatter;
+        trackerType = extType;
+        trackerData = { ...topLevel, ...extData };
+        break;
+      }
+    }
+
+    if (!trackerData && frontmatter.trackerStatus && typeof frontmatter.trackerStatus === 'object') {
       const ts = frontmatter.trackerStatus as Record<string, any>;
       trackerType = (ts.type as string) || 'plan';
       // Top-level fields are canonical, trackerStatus holds only type
@@ -1432,7 +2612,19 @@ export class ElectronDocumentService implements DocumentService {
     }
 
     if (!trackerData) {
-      return { item: null, skipped: false, error: 'No tracker frontmatter found (expected trackerStatus with type field)' };
+      for (const [legacyKey, legacyType] of Object.entries(LEGACY_KEY_TO_TYPE)) {
+        if (frontmatter[legacyKey] && typeof frontmatter[legacyKey] === 'object') {
+          const legacyData = frontmatter[legacyKey] as Record<string, any>;
+          const { [legacyKey]: _, trackerStatus: _ts, ...topLevel } = frontmatter;
+          trackerType = legacyType;
+          trackerData = { ...legacyData, ...topLevel };
+          break;
+        }
+      }
+    }
+
+    if (!trackerData) {
+      return { item: null, skipped: false, error: 'No tracker frontmatter found' };
     }
 
     // Extract markdown body (everything after frontmatter)
@@ -1444,10 +2636,9 @@ export class ElectronDocumentService implements DocumentService {
       || (frontmatter.title as string)
       || relativePath.split('/').pop()?.replace(/\.md$/, '') || 'Untitled';
 
-    // Generate stable ID from file path
-    const prefix = trackerType.substring(0, 3);
-    const hash = crypto.createHash('md5').update(relativePath).digest('hex').substring(0, 10);
-    const id = `${prefix}_imp_${hash}`;
+    // Generate stable canonical ID from tracker type + file path so UI, MCP,
+    // and file-backed mutation paths all resolve the same logical item.
+    const id = buildFullDocumentTrackerId(trackerType, relativePath);
 
     // Build JSONB data: ALL frontmatter fields go into the data bag generically.
     // No privileged field vocabulary -- the schema determines which fields matter.
@@ -1468,9 +2659,9 @@ export class ElectronDocumentService implements DocumentService {
         id, type, data, workspace, document_path, line_number,
         created, updated, last_indexed, sync_status,
         content, archived, source, source_ref
-      ) VALUES ($1, $2, $3, $4, '', NULL, NOW(), NOW(), NOW(), 'local', $5, FALSE, 'frontmatter', $6)
+      ) VALUES ($1, $2, $3, $4, $6, NULL, NOW(), NOW(), NOW(), 'local', $5, FALSE, 'frontmatter', $6)
       ON CONFLICT (id) DO UPDATE SET
-        data = tracker_items.data || $3, content = $5, source = 'frontmatter', source_ref = $6, updated = NOW()`,
+        data = tracker_items.data || $3, content = $5, source = 'frontmatter', source_ref = $6, document_path = $6, updated = NOW()`,
       [id, trackerType, JSON.stringify(data), this.workspacePath, contentJson, relativePath]
     );
 
@@ -1580,7 +2771,6 @@ export class ElectronDocumentService implements DocumentService {
     syncMode?: string;
   }): Promise<TrackerItem> {
     // Check if this type allows creation
-    const { globalRegistry } = await import('@nimbalyst/runtime/plugins/TrackerPlugin/models/TrackerDataModel');
     const model = globalRegistry.get(payload.type);
     if (model && model.creatable === false) {
       throw new Error(`Cannot create items of type '${payload.type}': type is not creatable`);
@@ -1623,30 +2813,29 @@ export class ElectronDocumentService implements DocumentService {
       Object.assign(data, payload.customFields);
     }
 
-    // Stamp per-field LWW timestamps for sync conflict resolution on create
-    const now = Date.now();
-    const fieldTimestamps: Record<string, number> = {};
-    for (const key of Object.keys(data)) {
-      // Skip system/internal keys that aren't user fields
-      if (key === '_fieldUpdatedAt' || key === 'authorIdentity' || key === 'kanbanSortOrder') continue;
-      fieldTimestamps[key] = now;
-    }
-    data._fieldUpdatedAt = fieldTimestamps;
-
     const source = payload.source || 'native';
     const contentJson = payload.content ? JSON.stringify(payload.content) : null;
     const syncPolicy = getEffectiveTrackerSyncPolicy(payload.workspace, payload.type, payload.syncMode);
-    const syncStatus = getInitialTrackerSyncStatus(syncPolicy);
+    // Per-item decision (NIM-876): hybrid types only sync flagged items.
+    const syncStatus = getInitialTrackerSyncStatus(syncPolicy, data);
+
+    // NIM-454: persist the tracker-type tag on the row so the item reliably
+    // appears in its type view and syncs correctly, instead of relying on a
+    // read-time fallback. Mirrors the MCP create path (typeTags always includes
+    // the primary type). The DB layer maps a JS array to TEXT[] on PGLite / a
+    // JSON string on better-sqlite3.
+    const typeTags: string[] = [payload.type];
 
     await database.query(
       `INSERT INTO tracker_items (
-        id, type, data, workspace, document_path, line_number,
+        id, type, type_tags, data, workspace, document_path, line_number,
         created, updated, last_indexed, sync_status,
         content, archived, source, source_ref
-      ) VALUES ($1, $2, $3, $4, '', NULL, NOW(), NOW(), NOW(), $5, $6, FALSE, $7, $8)`,
+      ) VALUES ($1, $2, $3, $4, $5, '', NULL, NOW(), NOW(), NOW(), $6, $7, FALSE, $8, $9)`,
       [
         payload.id,
         payload.type,
+        typeTags,
         JSON.stringify(data),
         payload.workspace,
         syncStatus,
@@ -1655,6 +2844,26 @@ export class ElectronDocumentService implements DocumentService {
         payload.sourceRef || null,
       ]
     );
+
+    // NIM-363: allocate a NIM-### issue key for items created through the
+    // native/UI path (quick-add) the same way the MCP create path does, so
+    // every type -- including ideas -- gets a key. Without this, manual creates
+    // had no issue key while MCP creates did.
+    try {
+      const prefix = getWorkspaceState(payload.workspace).issueKeyPrefix || 'NIM';
+      const maxResult = await database.query<{ max_num: number | null }>(
+        `SELECT MAX(issue_number) as max_num FROM tracker_items WHERE workspace = $1`,
+        [payload.workspace]
+      );
+      const nextNum = (maxResult.rows[0]?.max_num ?? 0) + 1;
+      const issueKey = `${prefix}-${nextNum}`;
+      await database.query(
+        `UPDATE tracker_items SET issue_number = $1, issue_key = $2 WHERE id = $3`,
+        [nextNum, issueKey, payload.id]
+      );
+    } catch (issueKeyError) {
+      console.error('[DocumentService] Local issue key allocation failed:', issueKeyError);
+    }
 
     const result = await database.query<any>(
       `SELECT * FROM tracker_items WHERE id = $1`,
@@ -1688,9 +2897,15 @@ export class ElectronDocumentService implements DocumentService {
       const items: ParsedInlineTrackerCandidate[] = [];
       const lines = content.split('\n');
 
-      // Regex to match: text #type[id:... status:...]
-      // Accept any alphanumeric type with hyphens (e.g. bug, task, devblog-post, feature-request)
-      const trackerRegex = /(.+?)\s+#([\w-]+)\[(.+?)\]/;
+      // Anchor the tracker token on whitespace (or start-of-line) instead of
+      // leading with a lazy `.+?`. The previous pattern
+      // `/(.+?)\s+#([\w-]+)\[(.+?)\]/` had two unbounded lazy groups and
+      // exhibited O(N^2)+ catastrophic backtracking on long lines containing
+      // scattered `#`, `[`, `]` characters without a real tracker token. A
+      // single inline base64 image (`![](data:image/png;base64,...)`,
+      // ~300k chars on one line) locked the main process for 100+ seconds
+      // during the file-watcher-driven cache refresh after AI edits.
+      const trackerRegex = /(?:^|\s)#([\w-]+)\[([^\]\r\n]+)\]/;
 
       // Track whether we're inside a code block
       let inCodeBlock = false;
@@ -1709,6 +2924,18 @@ export class ElectronDocumentService implements DocumentService {
           continue;
         }
 
+        // Defense-in-depth: skip pathological lines before the regex runs.
+        // Real tracker syntax is well under 500 chars; anything longer is an
+        // inline base64 image, minified JSON, or similar — never a tracker.
+        if (line.length > 4096) {
+          continue;
+        }
+
+        // Cheap prefilter: a tracker token requires both `#` and `[`.
+        if (line.indexOf('#') < 0 || line.indexOf('[') < 0) {
+          continue;
+        }
+
         // Skip lines that are indented code blocks (4+ spaces or tab at start)
         if (line.match(/^(\s{4,}|\t)/)) {
           continue;
@@ -1716,18 +2943,27 @@ export class ElectronDocumentService implements DocumentService {
 
         const match = line.match(trackerRegex);
 
-        if (match) {
+        if (match && match.index !== undefined) {
+          // Reconstruct the title from the slice of the line preceding the
+          // tag. The new regex no longer captures the title group; deriving
+          // it positionally keeps the title O(N) instead of forcing the
+          // engine into a lazy-prefix backtrack.
+          const title = line.slice(0, match.index).trim();
+          if (!title) {
+            // Preserve original semantic: a tracker line must have a title.
+            continue;
+          }
+
           // Additional check: ensure the match is not inside inline code (backticks)
           // This prevents matching `#bug[...]` within inline code blocks
-          const matchIndex = line.indexOf(match[0]);
-          const beforeMatch = line.substring(0, matchIndex);
+          const beforeMatch = line.substring(0, match.index);
           const backtickCount = (beforeMatch.match(/`/g) || []).length;
 
           // If odd number of backticks before the match, we're inside inline code
           if (backtickCount % 2 !== 0) {
             continue;
           }
-          const [, title, type, propsStr] = match;
+          const [, type, propsStr] = match;
 
           // Parse key:value pairs
           const props: Record<string, string> = {};
@@ -1761,7 +2997,7 @@ export class ElectronDocumentService implements DocumentService {
             id: props.id || undefined,
             explicitId: Boolean(props.id),
             type: type as TrackerItemType,
-            title: title.trim().replace(/^- /, '').replace(/^\[ \] /, '').replace(/^\[x\] /, ''),
+            title: title.replace(/^- /, '').replace(/^\[ \] /, '').replace(/^\[x\] /, ''),
             description,
             status: (props.status || 'to-do') as any,
             priority: props.priority as any,
@@ -1838,41 +3074,47 @@ export class ElectronDocumentService implements DocumentService {
         );
       }
 
-      // Upsert new/updated items
-      // console.log(`[DocumentService] Upserting ${items.length} tracker items to database`);
-      for (const item of items) {
-        // Build JSONB data object
-        const data = {
-          title: item.title,
-          description: item.description,
-          status: item.status,
-          priority: item.priority,
-          owner: item.owner,
-          tags: item.tags || [],
-          dueDate: item.dueDate,
-          created: item.created,
-          updated: item.updated
-        };
-
-        const isArchived = item.archived === true;
-
-        // console.log(`[DocumentService] Inserting tracker item: ${item.id} (${item.type})`);
-        // Only set archived on INSERT (new items default to false).
-        // On UPDATE: only set archived=true if the file explicitly says so.
-        // Never reset archived to false from re-indexing -- the DB is the authority
-        // for archive state when the file doesn't have an archived prop.
-        // On conflict: merge file-derived fields INTO existing JSONB (preserves
-        // system metadata like authorIdentity, createdByAgent, linkedSessions,
-        // activity, comments that the indexer doesn't know about).
-        const result = await database.query(
-          `INSERT INTO tracker_items (
-            id, type, data, workspace, document_path, line_number, created, updated, last_indexed, archived, archived_at
-          ) VALUES ($1, $2, $3, $4, $5, $6, NOW(), NOW(), $7, $8, $9)
-          ON CONFLICT (id) DO UPDATE SET
-            type = $2, data = tracker_items.data || $3, workspace = $4, document_path = $5, line_number = $6, updated = NOW(), last_indexed = $7,
-            archived = CASE WHEN $8 = TRUE THEN TRUE ELSE tracker_items.archived END,
-            archived_at = CASE WHEN $8 = TRUE THEN $9 ELSE tracker_items.archived_at END`,
-          [
+      // Upsert new/updated items.
+      //
+      // NIM-875: a cold open treats every markdown file as changed and used to
+      // run one awaited INSERT ... ON CONFLICT per tracker item in a sequential
+      // loop. On a tracker-heavy project that serial N+1 flooded the single DB
+      // worker and starved the session-list query, hanging the window. Batch
+      // each file's items into a single multi-row upsert (chunked to stay under
+      // the SQLite bound-variable limit) so one file is one round-trip.
+      //
+      // Only set archived on INSERT (new items default to false). On UPDATE:
+      // only set archived=true if the file explicitly says so. Never reset
+      // archived to false from re-indexing -- the DB is the authority for
+      // archive state when the file doesn't have an archived prop. On conflict:
+      // merge file-derived fields INTO existing JSONB (preserves system metadata
+      // like authorIdentity, createdByAgent, linkedSessions, activity, comments
+      // that the indexer doesn't know about).
+      const COLS_PER_ROW = 9; // params per row; NOW(), NOW() are inlined
+      const UPSERT_CHUNK = 100; // 900 bound vars/chunk, safely under SQLite's limit
+      for (let offset = 0; offset < items.length; offset += UPSERT_CHUNK) {
+        const chunk = items.slice(offset, offset + UPSERT_CHUNK);
+        const valuesClauses: string[] = [];
+        const params: any[] = [];
+        for (let i = 0; i < chunk.length; i++) {
+          const item = chunk[i];
+          const data = {
+            title: item.title,
+            description: item.description,
+            status: item.status,
+            priority: item.priority,
+            owner: item.owner,
+            tags: item.tags || [],
+            dueDate: item.dueDate,
+            created: item.created,
+            updated: item.updated
+          };
+          const isArchived = item.archived === true;
+          const b = i * COLS_PER_ROW;
+          valuesClauses.push(
+            `($${b + 1}, $${b + 2}, $${b + 3}, $${b + 4}, $${b + 5}, $${b + 6}, NOW(), NOW(), $${b + 7}, $${b + 8}, $${b + 9})`
+          );
+          params.push(
             item.id,
             item.type,
             JSON.stringify(data),
@@ -1882,9 +3124,24 @@ export class ElectronDocumentService implements DocumentService {
             item.lastIndexed,
             isArchived,
             isArchived ? new Date().toISOString() : null
-          ]
+          );
+        }
+        await database.query(
+          `INSERT INTO tracker_items (
+            id, type, data, workspace, document_path, line_number, created, updated, last_indexed, archived, archived_at
+          ) VALUES ${valuesClauses.join(', ')}
+          ON CONFLICT (id) DO UPDATE SET
+            type = EXCLUDED.type,
+            data = tracker_items.data || EXCLUDED.data,
+            workspace = EXCLUDED.workspace,
+            document_path = EXCLUDED.document_path,
+            line_number = EXCLUDED.line_number,
+            updated = NOW(),
+            last_indexed = EXCLUDED.last_indexed,
+            archived = CASE WHEN EXCLUDED.archived = TRUE THEN TRUE ELSE tracker_items.archived END,
+            archived_at = CASE WHEN EXCLUDED.archived = TRUE THEN EXCLUDED.archived_at ELSE tracker_items.archived_at END`,
+          params
         );
-        // console.log(`[DocumentService] Insert result:`, result);
       }
 
       // Notify watchers if there are changes.
@@ -2122,7 +3379,7 @@ export function setupDocumentServiceHandlers(resolver: DocumentServiceResolver) 
   safeHandle('document-service:open', async (event, payload: { documentId: string; fallback?: DocumentOpenOptions }) => {
     try {
       const { documentId, fallback } = payload ?? { documentId: '' };
-      return await requireDocumentService(event).openDocument(documentId, fallback);
+      return await requireDocumentService(event).openDocument(documentId, fallback, event.sender);
     } catch (error) {
       console.error('[DocumentService] open failed:', error);
       throw error;
@@ -2357,7 +3614,7 @@ export function setupDocumentServiceHandlers(resolver: DocumentServiceResolver) 
       const item = await requireDocumentService(event).createTrackerItem(payload);
       // console.log('[DocumentService] create-tracker-item created locally:', item.id);
 
-      if (shouldSyncTrackerPolicy(syncPolicy)) {
+      if (shouldSyncTrackerItem(syncPolicy, item)) {
         const active = isTrackerSyncActive(payload.workspace);
         // console.log('[DocumentService] create-tracker-item sync check:', { syncPolicy, active });
         if (active) {
@@ -2389,10 +3646,37 @@ export function setupDocumentServiceHandlers(resolver: DocumentServiceResolver) 
       //   requestedSyncMode: payload.syncMode,
       //   updateKeys: Object.keys(payload.updates),
       // });
-      const item = await requireDocumentService(event).updateTrackerItem(payload.itemId, payload.updates);
+      const svc = requireDocumentService(event);
+
+      // Capture the pre-update relationship values so inverse propagation (below)
+      // can diff added/dropped targets. Best-effort by canonical id; if the row
+      // can't be read here we simply skip inverse propagation for this update.
+      let oldData: Record<string, unknown> = {};
+      let oldType: string | null = null;
+      try {
+        const oldRow = await database.query<any>(`SELECT type, data FROM tracker_items WHERE id = $1`, [payload.itemId]);
+        if (oldRow.rows[0]) {
+          oldType = oldRow.rows[0].type ?? null;
+          oldData = parseJsonColumn<Record<string, unknown>>(oldRow.rows[0].data) ?? {};
+        }
+      } catch { /* skip inverse propagation if old data is unavailable */ }
+
+      const updates = { ...payload.updates };
+      if (oldType) {
+        const relWrite = applyRelationshipFieldWrites(
+          updates,
+          globalRegistry.get(oldType)?.fields ?? [],
+          payload.itemId,
+        );
+        if (!relWrite.ok) {
+          throw new Error(`Invalid relationship field "${relWrite.field}": ${relWrite.errors.join('; ')}`);
+        }
+      }
+
+      const item = await svc.updateTrackerItem(payload.itemId, updates);
       const syncPolicy = getEffectiveTrackerSyncPolicy(item.workspace, item.type, payload.syncMode);
 
-      if (shouldSyncTrackerPolicy(syncPolicy)) {
+      if (shouldSyncTrackerItem(syncPolicy, item)) {
         const syncActive = isTrackerSyncActive(item.workspace);
         // console.log('[DocumentService] update-tracker-item sync gate:', { syncPolicy, workspace: item.workspace, syncActive });
         try {
@@ -2400,7 +3684,7 @@ export function setupDocumentServiceHandlers(resolver: DocumentServiceResolver) 
             await syncTrackerItem(item);
             // console.log('[DocumentService] update-tracker-item synced:', item.id);
           } else {
-            await requireDocumentService(event).updateTrackerItemSyncStatus(item.id, 'pending');
+            await svc.updateTrackerItemSyncStatus(item.id, 'pending');
             // console.log('[DocumentService] update-tracker-item skipped: sync not active for workspace');
           }
         } catch (syncErr) {
@@ -2410,9 +3694,37 @@ export function setupDocumentServiceHandlers(resolver: DocumentServiceResolver) 
         // console.log('[DocumentService] update-tracker-item no sync: effective mode =', syncPolicy.mode);
       }
 
+      // Phase 3: materialize inverse relationship fields on target items via the
+      // shared, customFields-aware helper (same path the MCP tracker_update handler
+      // uses, so the two can't drift — NIM-1305 Defect A).
+      try {
+        await svc.propagateInverseForUpdate(
+          { id: item.id, type: item.type, issueKey: item.issueKey, title: item.title },
+          updates,
+          oldData,
+          payload.syncMode,
+        );
+      } catch (invErr) {
+        console.error('[DocumentService] inverse relationship propagation failed:', invErr);
+      }
+
       return { success: true, item };
     } catch (error) {
       console.error('[DocumentService] update-tracker-item failed:', error);
+      return { success: false, error: error instanceof Error ? error.message : String(error) };
+    }
+  });
+
+  // Per-item "Share with team" toggle for hybrid trackers (e.g. plans).
+  safeHandle('document-service:set-tracker-item-shared', async (event, payload: {
+    itemId: string;
+    shared: boolean;
+  }) => {
+    try {
+      const item = await requireDocumentService(event).setTrackerItemShared(payload.itemId, payload.shared);
+      return { success: true, item };
+    } catch (error) {
+      console.error('[DocumentService] set-tracker-item-shared failed:', error);
       return { success: false, error: error instanceof Error ? error.message : String(error) };
     }
   });
@@ -2425,15 +3737,13 @@ export function setupDocumentServiceHandlers(resolver: DocumentServiceResolver) 
     try {
       await requireDocumentService(event).updateTrackerItemContent(payload.itemId, payload.content);
 
-      // Stamp fieldUpdatedAt.content and trigger sync
+      // Trigger sync; the new sync engine orders writes by server-assigned syncId.
       try {
-        const row = await database.query<any>(`SELECT * FROM tracker_items WHERE id = $1`, [payload.itemId]);
+        const row = await database.query<any>(
+          `SELECT workspace, type FROM tracker_items WHERE id = $1`,
+          [payload.itemId],
+        );
         if (row.rows.length > 0) {
-          const data = typeof row.rows[0].data === 'string' ? JSON.parse(row.rows[0].data) : row.rows[0].data || {};
-          const fieldUpdatedAt = data._fieldUpdatedAt || {};
-          fieldUpdatedAt.content = Date.now();
-          data._fieldUpdatedAt = fieldUpdatedAt;
-          await database.query(`UPDATE tracker_items SET data = $1 WHERE id = $2`, [JSON.stringify(data), payload.itemId]);
           await syncAfterCommentMutation(event, payload.itemId, row.rows[0].workspace, row.rows[0].type);
         }
       } catch (syncErr) {
@@ -2456,6 +3766,21 @@ export function setupDocumentServiceHandlers(resolver: DocumentServiceResolver) 
       return { success: true, content };
     } catch (error) {
       console.error('[DocumentService] tracker-item-get-content failed:', error);
+      return { success: false, error: error instanceof Error ? error.message : String(error) };
+    }
+  });
+
+  // Latest body cache row for an item -- cold-open paint path. Returns
+  // { bodyVersion, content } so the renderer can paint authoritative
+  // content while the DocumentRoom Y.Doc connects in the background.
+  safeHandle('document-service:get-tracker-body-cache-for-detail', async (event, payload: {
+    itemId: string;
+  }) => {
+    try {
+      const row = await requireDocumentService(event).getTrackerBodyCacheLatest(payload.itemId);
+      return { success: true, row };
+    } catch (error) {
+      console.error('[DocumentService] get-tracker-body-cache-for-detail failed:', error);
       return { success: false, error: error instanceof Error ? error.message : String(error) };
     }
   });
@@ -2540,15 +3865,14 @@ export function setupDocumentServiceHandlers(resolver: DocumentServiceResolver) 
   async function syncAfterCommentMutation(event: IpcMainInvokeEvent, itemId: string, workspace: string, itemType: string): Promise<void> {
     try {
       const syncPolicy = getEffectiveTrackerSyncPolicy(workspace, itemType as any);
-      if (shouldSyncTrackerPolicy(syncPolicy)) {
+      const service = requireDocumentService(event);
+      const item = await service.getTrackerItemById(itemId);
+      // Per-item decision (NIM-876): hybrid types only sync flagged items.
+      if (item && shouldSyncTrackerItem(syncPolicy, item)) {
         if (isTrackerSyncActive(workspace)) {
-          const service = requireDocumentService(event);
-          const item = await service.getTrackerItemById(itemId);
-          if (item) {
-            await syncTrackerItem(item);
-          }
+          await syncTrackerItem(item);
         } else {
-          await requireDocumentService(event).updateTrackerItemSyncStatus(itemId, 'pending');
+          await service.updateTrackerItemSyncStatus(itemId, 'pending');
         }
       }
     } catch (syncErr) {
@@ -2562,8 +3886,10 @@ export function setupDocumentServiceHandlers(resolver: DocumentServiceResolver) 
       const result = await database.query<any>(`SELECT * FROM tracker_items WHERE id = $1`, [itemId]);
       if (result.rows.length === 0) return;
       const r = result.rows[0];
-      const d = typeof r.data === 'string' ? JSON.parse(r.data) : r.data || {};
-      const typeTags: string[] = r.type_tags?.length > 0 ? r.type_tags : [r.type];
+      const d = parseJsonColumn<Record<string, any>>(r.data) ?? {};
+      const parsedTags = parseJsonColumn<string[]>(r.type_tags);
+      const typeTags: string[] =
+        Array.isArray(parsedTags) && parsedTags.length > 0 ? parsedTags : [r.type];
       const item: TrackerItem = {
         id: r.id, issueNumber: r.issue_number ?? undefined, issueKey: r.issue_key ?? undefined,
         type: r.type, typeTags, title: d.title || r.title, description: d.description || undefined,
@@ -2583,16 +3909,14 @@ export function setupDocumentServiceHandlers(resolver: DocumentServiceResolver) 
         labels: d.labels || undefined, linkedSessions: d.linkedSessions || undefined,
         linkedCommitSha: d.linkedCommitSha || undefined, documentId: d.documentId || undefined,
         syncStatus: r.sync_status || 'local',
-        fieldUpdatedAt: d._fieldUpdatedAt || undefined,
       };
-      // Pass through extra JSONB data fields (activity, comments, etc.)
+      // Pass through extra JSONB data fields (activity, comments, etc.) AND
+      // un-nest a nested `data.customFields` bag so custom schema columns
+      // survive the TrackerItem -> TrackerRecord conversion. See NIM-863.
       // Uses the item's own keys as the "known" set -- no hardcoded list.
       const itemKeys = new Set(Object.keys(item));
-      const extra: Record<string, any> = {};
-      for (const [k, v] of Object.entries(d)) {
-        if (v !== undefined && !itemKeys.has(k)) extra[k] = v;
-      }
-      if (Object.keys(extra).length > 0) (item as any).customFields = extra;
+      const cf = extractItemCustomFields(d, itemKeys);
+      if (cf) (item as any).customFields = cf;
       event.sender.send('document-service:tracker-items-changed', {
         added: [], updated: [item], removed: [], timestamp: new Date(),
       });
@@ -2635,11 +3959,6 @@ export function setupDocumentServiceHandlers(resolver: DocumentServiceResolver) 
       });
       data.activity = activity.length > 100 ? activity.slice(-100) : activity;
 
-      // Stamp field-level LWW timestamp for sync conflict resolution
-      const fieldUpdatedAt = data._fieldUpdatedAt || {};
-      fieldUpdatedAt.comments = Date.now();
-      data._fieldUpdatedAt = fieldUpdatedAt;
-
       await database.query(
         `UPDATE tracker_items SET data = $1, updated = NOW() WHERE id = $2`,
         [JSON.stringify(data), payload.itemId]
@@ -2669,22 +3988,25 @@ export function setupDocumentServiceHandlers(resolver: DocumentServiceResolver) 
 
       const data = typeof row.rows[0].data === 'string' ? JSON.parse(row.rows[0].data) : row.rows[0].data || {};
       const comments = data.comments || [];
-      const idx = comments.findIndex((c: any) => c.id === payload.commentId);
-      if (idx === -1) return { success: false, error: 'Comment not found' };
 
-      if (payload.body !== undefined) {
-        comments[idx].body = payload.body;
-        comments[idx].updatedAt = Date.now();
-      }
-      if (payload.deleted !== undefined) {
-        comments[idx].deleted = payload.deleted;
-      }
-      data.comments = comments;
+      // NIM-360: edit/delete are author-only. Build the requested mutation
+      // (delete wins over edit if both are set) and let the pure guard enforce
+      // authorship + LWW stamping. Fails closed for non-authors / unknown ids.
+      const actor = getCurrentIdentity(row.rows[0].workspace);
+      const mutation: CommentMutation | null =
+        payload.deleted === true
+          ? { kind: 'delete' }
+          : payload.body !== undefined
+            ? { kind: 'edit', body: payload.body }
+            : null;
+      if (!mutation) return { success: false, error: 'No comment change requested' };
 
-      // Stamp field-level LWW timestamp for sync conflict resolution
-      const fieldUpdatedAt = data._fieldUpdatedAt || {};
-      fieldUpdatedAt.comments = Date.now();
-      data._fieldUpdatedAt = fieldUpdatedAt;
+      const result = applyCommentMutation(comments, payload.commentId, mutation, actor, Date.now());
+      if (!result.ok) {
+        return { success: false, error: result.error, code: result.code };
+      }
+      data.comments = result.comments;
+      data.lastModifiedBy = actor;
 
       await database.query(
         `UPDATE tracker_items SET data = $1, updated = NOW() WHERE id = $2`,
@@ -2697,6 +4019,71 @@ export function setupDocumentServiceHandlers(resolver: DocumentServiceResolver) 
       // Trigger sync
       await syncAfterCommentMutation(event, payload.itemId, row.rows[0].workspace, row.rows[0].type);
 
+      return { success: true };
+    } catch (error) {
+      return { success: false, error: error instanceof Error ? error.message : String(error) };
+    }
+  });
+
+  // Relationship backlinks (Epic C Phase 2). The tracker_relationship_index is a
+  // local, rebuildable projection of relationship field values; build it lazily
+  // per workspace on first request, then return incoming links for an item. The
+  // UI resolves source titles from its already-loaded items map, so we return
+  // only the edge identity.
+  // Throttle full-workspace rebuilds: cheap enough to re-run so MCP/agent writes
+  // (which don't reindex incrementally) surface in backlinks, but not on every
+  // rapid item open. UI field edits reindex their own item immediately.
+  const relationshipIndexBuiltAt = new Map<string, number>();
+  const RELATIONSHIP_INDEX_TTL_MS = 2000;
+
+  async function ensureRelationshipIndex(workspace: string): Promise<void> {
+    const last = relationshipIndexBuiltAt.get(workspace) ?? 0;
+    if (Date.now() - last < RELATIONSHIP_INDEX_TTL_MS) return;
+    relationshipIndexBuiltAt.set(workspace, Date.now()); // set before await to dedupe concurrent builds
+    try {
+      await rebuildWorkspaceRelationshipIndex(
+        workspace,
+        (type) => globalRegistry.get(type)?.fields ?? [],
+        database as any,
+      );
+    } catch (err) {
+      relationshipIndexBuiltAt.delete(workspace); // allow a retry on next request
+      console.error('[DocumentService] relationship index build failed:', err);
+    }
+  }
+
+  safeHandle('document-service:tracker-item-backlinks', async (_event, payload: { itemId: string }) => {
+    try {
+      const row = await database.query<any>(`SELECT workspace FROM tracker_items WHERE id = $1`, [payload.itemId]);
+      const workspace = row.rows[0]?.workspace;
+      if (!workspace) return { success: true, backlinks: [] };
+      await ensureRelationshipIndex(workspace);
+      const backlinks = await getRelationshipBacklinks(workspace, payload.itemId, database as any);
+      return {
+        success: true,
+        backlinks: backlinks.map((b) => ({
+          sourceItemId: b.sourceItemId,
+          sourceFieldId: b.sourceFieldId,
+          relationshipTypeKey: b.relationshipTypeKey,
+        })),
+      };
+    } catch (error) {
+      return { success: false, error: error instanceof Error ? error.message : String(error), backlinks: [] };
+    }
+  });
+
+  // Incremental reindex of one item's outgoing relationship edges. Called by the
+  // renderer after a relationship field changes so backlinks update without a
+  // full workspace rebuild. Idempotent.
+  safeHandle('document-service:tracker-item-reindex-relationships', async (_event, payload: { itemId: string }) => {
+    try {
+      const row = await database.query<any>(`SELECT id, type, data, workspace, updated FROM tracker_items WHERE id = $1`, [payload.itemId]);
+      if (row.rows.length === 0) return { success: false, error: 'Item not found' };
+      const r = row.rows[0];
+      const data = typeof r.data === 'string' ? JSON.parse(r.data) : (r.data || {});
+      const defs = globalRegistry.get(r.type)?.fields ?? [];
+      const updatedAt = typeof r.updated === 'string' ? r.updated : (r.updated ? new Date(r.updated).toISOString() : null);
+      await reindexItemRelationships(r.workspace, r.id, data, defs, updatedAt, database as any);
       return { success: true };
     } catch (error) {
       return { success: false, error: error instanceof Error ? error.message : String(error) };

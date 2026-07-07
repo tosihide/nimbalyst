@@ -16,12 +16,19 @@
 
 import React, { useCallback, useRef, useImperativeHandle, forwardRef, useEffect, useState, useMemo } from 'react';
 import { useAtom, useSetAtom, useAtomValue } from 'jotai';
-import { store, setInteractiveWidgetHost } from '@nimbalyst/runtime/store';
-import { AgentTranscriptPanel, TodoItem, type InteractiveWidgetHost, type PermissionScope } from '@nimbalyst/runtime';
+import { store, registerInteractiveWidgetHost, unregisterInteractiveWidgetHost } from '@nimbalyst/runtime/store';
 import type { SessionData, ChatAttachment, TranscriptViewMessage } from '@nimbalyst/runtime/ai/server/types';
+import { AgentTranscriptPanel } from '@nimbalyst/runtime/ui/AgentTranscript/components/AgentTranscriptPanel';
+import { ClaudeCliTerminalStrip } from './ClaudeCliTerminalStrip';
+import { ClaudeCliNotInstalledNotice } from './ClaudeCliNotInstalledNotice';
+import type { InteractiveWidgetHost, PermissionScope } from '@nimbalyst/runtime/ui/AgentTranscript/components/CustomToolWidgets/InteractiveWidgetHost';
+import type { TodoItem } from '@nimbalyst/runtime/ui/AgentTranscript/types';
 import { isToolLikeMessage } from '@nimbalyst/runtime/ui/AgentTranscript/utils/messageTypeHelpers';
 import { AIInput, AIInputRef } from './AIInput';
 import { PromptQueueList } from './PromptQueueList';
+import { TranscriptEmbeddedFileCard } from './TranscriptEmbeddedFileCard';
+import { getDiffPeekSizeForInteractiveWidgetHost } from './interactiveWidgetHostProxy';
+import { customEditorRegistry } from '../CustomEditors/registry';
 import { useDialog } from '../../contexts/DialogContext';
 import { FileGutter } from '../AIChat/FileGutter';
 import { recordClaudeActivity } from '../../store/listeners/claudeUsageListeners';
@@ -31,16 +38,27 @@ import { WakeupBanner } from '../AIChat/WakeupBanner';
 import type { AIMode } from './ModeTag';
 // Note: ExitPlanMode, AskUserQuestion, and ToolPermission use inline widgets via InteractiveWidgetHost (in runtime package)
 import { SlashCommandSuggestions } from './SlashCommandSuggestions';
+import { InlineTipDisplay } from '../../tips/InlineTipDisplay';
+import { activeTipIdAtom } from '../../tips/atoms';
+import { supportsWorkspaceSlashCommands } from '../Typeahead/slashCommandAutocomplete';
 import type { TextSelection } from './TextSelectionIndicator';
 import { type SerializableDocumentContext } from '../../hooks/useDocumentContext';
+import { isClaudeCliTerminalSession } from './claudeCliInputRouting';
 import { diffTreeGroupByDirectoryAtom, setDiffTreeGroupByDirectoryAtom } from '../../store/atoms/projectState';
 import {
   sessionDraftInputAtom,
   sessionDraftAttachmentsAtom,
   sessionStoreAtom,
+  sessionLoadedAtom,
   sessionMessagesAtom,
   sessionProviderAtom,
   sessionTokenUsageAtom,
+  sessionStatusAtom,
+  sessionCurrentTeammatesAtom,
+  sessionCurrentTodosAtom,
+  sessionWorktreePathAtom,
+  sessionDocumentContextAtom,
+  sessionEffortLevelRawAtom,
   sessionLoadingAtom,
   sessionModeAtom,
   sessionModelAtom,
@@ -48,6 +66,8 @@ import {
   sessionProcessingAtom,
   sessionHasPendingInteractivePromptAtom,
   sessionWorktreeIdAtom,
+  sessionPhaseAtom,
+  sessionRegistryAtom,
   loadSessionDataAtom,
   reloadSessionDataAtom,
   updateSessionStoreAtom,
@@ -71,16 +91,55 @@ import {
 import { streamCompletionSignalAtom } from '../../store/atoms/sessionTranscript';
 import { convertToWorkstreamAtom, sessionPromptAdditionsAtom, sessionLastSubmitAtAtom, sessionDraftLocalModifiedAtAtom, nextOptimisticId } from '../../store/atoms/sessions';
 import { clearAIInputHistoryAtom } from '../../store/atoms/aiInputUndo';
+import {
+  cliTerminalExpandedAtom,
+  cliTerminalFocusNonceAtom,
+  cliTerminalUserCollapsedAtom,
+  toggleCliTerminalDrawerAtom,
+  cliTerminalHeightAtom,
+  DEFAULT_CLI_TERMINAL_HEIGHT,
+  MIN_CLI_TERMINAL_HEIGHT,
+  MAX_CLI_TERMINAL_HEIGHT,
+} from '../../store/atoms/terminals';
 import { scrollToTeammateAtom, scrollToMessageAtom, requestOpenSessionAtom } from '../../store/atoms/agentMode';
 import { usePostHog } from 'posthog-js/react';
-import { setAgentModeSettingsAtom, showPromptAdditionsAtom, hasExternalEditorAtom, externalEditorNameAtom, openInExternalEditorAtom, defaultAgentModelAtom, defaultEffortLevelAtom } from '../../store/atoms/appSettings';
+import { setAgentModeSettingsAtom, showPromptAdditionsAtom, hasExternalEditorAtom, externalEditorNameAtom, openInExternalEditorAtom, defaultAgentModelAtom, defaultEffortLevelAtom, chatShowToolCallsAtom } from '../../store/atoms/appSettings';
 import { supportsEffortLevel, parseEffortLevel, type EffortLevel } from '../../utils/modelUtils';
 import { buildPlanImplementationPrompt, resolvePlanFilePath } from '../../utils/pathUtils';
+import { resolveTranscriptClickPath } from '../../utils/resolveTranscriptClickPath';
 import { autoCommitEnabledAtom, setAutoCommitEnabledAtom } from '../../store/atoms/autoCommitAtoms';
 import { diffPeekSizeAtom, setDiffPeekSizeAtom } from '../../store/atoms/diffPeekSizeAtoms';
 import { registerSessionWorkspace, loadInitialSessionFileState } from '../../store/listeners/fileStateListeners';
 import { SESSION_PHASE_COLUMNS, setSessionPhaseAtom, type SessionPhase } from '../../store/atoms/sessionKanban';
-import { sessionRegistryAtom } from '../../store';
+
+/**
+ * Detect a metadata value that's the artifact of `{...stringValue, ...}` -
+ * the spread treats each character of the string as a numeric-keyed
+ * property, producing objects with millions of `"0"`, `"1"`, ... entries.
+ * Spreading such an object via `...metadata` later in the render path
+ * throws V8's "RangeError: Too many properties to enumerate" and crashes
+ * the session view. Two known sessions in production hit this state via
+ * a legacy bad write upstream; the row should be cleaned DB-side, but
+ * the UI must not crash before that runs.
+ *
+ * Heuristic uses only the `in` operator (O(1) property lookups) so we
+ * never trigger the same enumeration that would re-throw the RangeError.
+ * If keys "0","1","2" all exist as own properties AND none of the real
+ * metadata field names do, treat as the spread-of-string artifact.
+ */
+function isCorruptedSpreadOfString(value: unknown): boolean {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const obj = value as Record<string, unknown>;
+  if (!('0' in obj) || !('1' in obj) || !('2' in obj)) return false;
+  // Known real metadata fields. Any one of them present means the object
+  // has at least some legitimate structure even if it also has stray
+  // numeric keys (which we'd rather keep than wipe).
+  const realKeys = ['tags', 'phase', 'metadata', 'tokenUsage', 'hasUnread', 'effortLevel', 'linkedTrackerItemIds'];
+  for (const k of realKeys) {
+    if (k in obj) return false;
+  }
+  return true;
+}
 
 /**
  * Expand @@[name](shortId) session mentions to @@[name](fullUuid).
@@ -114,6 +173,17 @@ function makeOptimisticError(text: string, extra?: Partial<TranscriptViewMessage
     systemMessage: { systemType: 'error' },
     ...extra,
   };
+}
+
+function summarizeTeammates(
+  teammates: Array<{ agentId: string; status: 'running' | 'completed' | 'errored' | 'idle' }> | undefined
+): string {
+  if (!teammates || teammates.length === 0) return 'none';
+  return teammates.map(tm => `${tm.agentId}:${tm.status}`).join(', ');
+}
+
+function emitSessionRenderTrace(event: string, payload: Record<string, unknown>): void {
+  // console.info(`[RenderTrace][SessionTranscript] ${event} ${JSON.stringify(payload)}`);
 }
 
 function makeOptimisticUserMessage(
@@ -217,7 +287,7 @@ const readFile = async (filePath: string): Promise<{ success: boolean; content?:
   try {
     const result = await window.electronAPI.readFileContent(filePath);
     if (!result) {
-      return { success: false, error: 'No response from file reader' };
+      return { success: false, error: `File not found: ${filePath}` };
     }
     if (!result.success) {
       return { success: false, error: result.error || 'Failed to read file' };
@@ -269,6 +339,69 @@ async function updateSessionMetadataField<T>(
   }
 }
 
+// Props for the input wrapper — same as AIInput minus the value/onChange
+// pair (which the wrapper owns) and attachments handling (we wire it up
+// directly so the attachments subscription is isolated too).
+type SessionAIInputProps = Omit<
+  React.ComponentProps<typeof AIInput>,
+  'value' | 'onChange' | 'attachments' | 'onAttachmentAdd' | 'onAttachmentRemove'
+> & {
+  sessionId: string;
+  workspacePath: string;
+  enableAttachments: boolean;
+  onAttachmentAdd?: (attachment: ChatAttachment) => void;
+  onAttachmentRemove?: (attachmentId: string) => void;
+};
+
+/**
+ * Thin wrapper that owns the draft-input and draft-attachments
+ * subscriptions for one session. Extracted from SessionTranscript so that
+ * each keystroke re-renders only this component (and the textarea inside
+ * AIInput) instead of cascading through the entire transcript / banners /
+ * queue list — which used to break text selection in the messages area.
+ *
+ * Also owns the debounced persistence of the draft to PGLite (formerly in
+ * SessionTranscript), since that effect needs to fire on every draftInput
+ * change.
+ */
+const SessionAIInput = forwardRef<AIInputRef, SessionAIInputProps>(function SessionAIInput(
+  { sessionId, workspacePath, enableAttachments, onAttachmentAdd, onAttachmentRemove, ...rest },
+  ref,
+) {
+  const [draftInput, setDraftInputRaw] = useAtom(sessionDraftInputAtom(sessionId));
+  const draftAttachments = useAtomValue(sessionDraftAttachmentsAtom(sessionId));
+  const setDraftLocalModifiedAt = useSetAtom(sessionDraftLocalModifiedAtAtom(sessionId));
+
+  const handleChange = useCallback((value: string) => {
+    setDraftInputRaw(value);
+    setDraftLocalModifiedAt(Date.now());
+  }, [setDraftInputRaw, setDraftLocalModifiedAt]);
+
+  // Debounced persistence of draft input to database — survives restarts.
+  useEffect(() => {
+    if (!workspacePath) return;
+    const timeoutId = setTimeout(() => {
+      window.electronAPI.invoke('ai:saveDraftInput', sessionId, draftInput, workspacePath)
+        .catch(err => console.error('[SessionAIInput] Failed to persist draft input:', err));
+    }, 1000);
+    return () => clearTimeout(timeoutId);
+  }, [sessionId, draftInput, workspacePath]);
+
+  return (
+    <AIInput
+      ref={ref}
+      value={draftInput}
+      onChange={handleChange}
+      workspacePath={workspacePath}
+      sessionId={sessionId}
+      attachments={enableAttachments ? draftAttachments : undefined}
+      onAttachmentAdd={enableAttachments ? onAttachmentAdd : undefined}
+      onAttachmentRemove={enableAttachments ? onAttachmentRemove : undefined}
+      {...rest}
+    />
+  );
+});
+
 /**
  * SessionTranscript - Fully encapsulated transcript + input for one session
  */
@@ -311,12 +444,25 @@ export const SessionTranscript = forwardRef<SessionTranscriptRef, SessionTranscr
   const provider = useAtomValue(sessionProviderAtom(sessionId));
   const tokenUsage = useAtomValue(sessionTokenUsageAtom(sessionId));
   const isDataLoading = useAtomValue(sessionLoadingAtom(sessionId));
+  const chatShowToolCalls = useAtomValue(chatShowToolCallsAtom);
   const [aiMode, setAiMode] = useAtom(sessionModeAtom(sessionId));
   const [currentModel, setCurrentModel] = useAtom(sessionModelAtom(sessionId));
   const [isArchived, setIsArchived] = useAtom(sessionArchivedAtom(sessionId));
   const [isProcessing, setIsProcessing] = useAtom(sessionProcessingAtom(sessionId));
   const hasPendingInteractivePrompt = useAtomValue(sessionHasPendingInteractivePromptAtom(sessionId));
   const worktreeId = useAtomValue(sessionWorktreeIdAtom(sessionId));
+  const hasSessionData = useAtomValue(sessionLoadedAtom(sessionId));
+  // NOTE: deliberately NOT subscribing to sessionUpdatedAtAtom. updatedAt churns
+  // ~10 Hz during streaming, and nothing downstream actually depends on it
+  // for rendering — AgentTranscriptPanel/RichTranscriptView ignore it in their
+  // memo comparators. Subscribing here was repainting the input/queue/banners
+  // every few ms and breaking text selection.
+  const sessionStatus = useAtomValue(sessionStatusAtom(sessionId));
+  const metadataTeammates = useAtomValue(sessionCurrentTeammatesAtom(sessionId));
+  const currentTodos = useAtomValue(sessionCurrentTodosAtom(sessionId)) as Todo[];
+  const sessionWorktreePath = useAtomValue(sessionWorktreePathAtom(sessionId));
+  const sessionDocumentContext = useAtomValue(sessionDocumentContextAtom(sessionId));
+  const rawEffortLevel = useAtomValue(sessionEffortLevelRawAtom(sessionId));
   const loadSessionData = useSetAtom(loadSessionDataAtom);
   const reloadSessionData = useSetAtom(reloadSessionDataAtom);
   const updateSessionStore = useSetAtom(updateSessionStoreAtom);
@@ -329,19 +475,115 @@ export const SessionTranscript = forwardRef<SessionTranscriptRef, SessionTranscr
   const defaultModel = useAtomValue(defaultAgentModelAtom);
   const defaultEffortLevel = useAtomValue(defaultEffortLevelAtom);
 
-  // Still need full sessionData for certain operations (updating, checking loaded state)
-  const sessionData = useAtomValue(sessionStoreAtom(sessionId));
+  const sessionData = useMemo(() => {
+    if (!hasSessionData) return null;
+    const snapshot = store.get(sessionStoreAtom(sessionId));
+    // Guard against corrupted metadata: some legacy rows have a metadata
+    // value that's the result of `{...stringValue, ...}`, producing an
+    // object with millions of numeric-string keys (each char of the
+    // original JSON as its own property). Spreading that into the
+    // memoized object below throws "RangeError: Too many properties to
+    // enumerate" and crashes the transcript. Sniff for the spread-of-
+    // string shape and fall back to an empty object rather than crashing.
+    // The underlying row should also be repaired DB-side, but this keeps
+    // the UI usable until then.
+    const rawMetadata = snapshot?.metadata;
+    const safeMetadata = isCorruptedSpreadOfString(rawMetadata)
+      ? {}
+      : (rawMetadata ?? {});
+    return {
+      ...(snapshot ?? {}),
+      id: snapshot?.id ?? sessionId,
+      workspacePath: snapshot?.workspacePath ?? workspacePath,
+      worktreePath: sessionWorktreePath ?? snapshot?.worktreePath ?? undefined,
+      messages,
+      provider,
+      tokenUsage,
+      documentContext: sessionDocumentContext ?? snapshot?.documentContext,
+      // Read updatedAt imperatively from the snapshot — see note above on why
+      // we don't subscribe to it.
+      updatedAt: snapshot?.updatedAt ?? 0,
+      metadata: {
+        ...safeMetadata,
+        effortLevel: rawEffortLevel ?? (safeMetadata as Record<string, unknown> | undefined)?.effortLevel ?? null,
+        sessionStatus,
+        currentTeammates: metadataTeammates,
+        currentTodos,
+      },
+    } as SessionData;
+  }, [
+    hasSessionData,
+    sessionId,
+    workspacePath,
+    messages,
+    provider,
+    tokenUsage,
+    sessionDocumentContext,
+    sessionWorktreePath,
+    rawEffortLevel,
+    sessionStatus,
+    metadataTeammates,
+    currentTodos,
+  ]);
 
   // Effort level: read from session metadata, fall back to global default
   const showEffortLevel = useMemo(() => supportsEffortLevel(currentModel), [currentModel]);
   const effortLevel = useMemo(() => {
-    const raw = (sessionData?.metadata as Record<string, unknown> | undefined)?.effortLevel;
-    return raw != null ? parseEffortLevel(raw) : defaultEffortLevel;
-  }, [sessionData?.metadata, defaultEffortLevel]);
+    return rawEffortLevel != null ? parseEffortLevel(rawEffortLevel) : defaultEffortLevel;
+  }, [rawEffortLevel, defaultEffortLevel]);
 
-  // Draft input state via Jotai atoms - only this component re-renders on typing
-  const [draftInput, setDraftInputRaw] = useAtom(sessionDraftInputAtom(sessionId));
-  const [draftAttachments, setDraftAttachments] = useAtom(sessionDraftAttachmentsAtom(sessionId));
+  // Memoize the teammate list passed to AgentTranscriptPanel so its memo
+  // comparison doesn't see a new array reference on every keystroke. Without
+  // this, typing in the AI input re-rendered SessionTranscript (intended),
+  // which created a fresh `transcriptTeammates` array (regression), which
+  // tripped AgentTranscriptPanel's `currentTeammates` reference check and
+  // re-rendered the entire transcript per character typed.
+  const transcriptTeammates = useMemo(() => [
+    ...(metadataTeammates ?? []),
+    ...(additionalTeammates ?? []),
+  ], [metadataTeammates, additionalTeammates]);
+
+  const previousRenderRef = useRef<{
+    messageCount: number;
+    messageRef: TranscriptViewMessage[] | undefined;
+    tokenUsageRef: unknown;
+    tokenUsageSummary: string;
+    provider: unknown;
+    isProcessing: boolean;
+    hasPendingInteractivePrompt: boolean;
+    aiMode: unknown;
+    currentModel: unknown;
+    isArchived: boolean;
+    pendingReviewFilesRef: unknown;
+    pendingReviewFilesSummary: string;
+    pendingPromptsCount: number;
+    queuedPromptsCount: number;
+    todosRef: unknown;
+    todosSummary: string;
+    sessionErrorRef: unknown;
+    promptAdditionsRef: unknown;
+    currentPhase: unknown;
+    appStartTime: number | null;
+    scrollToTeammateTarget: string | null;
+    scrollToMessageTarget: string | null;
+    sessionStatus: unknown;
+    metadataTeammatesRef: unknown;
+    metadataTeammatesSummary: string;
+    additionalTeammatesRef: unknown;
+    additionalTeammatesSummary: string;
+    mergedTeammatesRef: unknown;
+    mergedTeammatesSummary: string;
+    updatedAt: unknown;
+  } | null>(null);
+
+  // Draft input setters only — the actual draftInput / draftAttachments
+  // subscriptions live inside <SessionAIInput>. Subscribing here would
+  // re-render the entire transcript on every keystroke and break text
+  // selection in the messages area. Code paths that need the current value
+  // (handleSend, handleQueue, openSessionWithDraft callers) read it
+  // imperatively via store.get().
+  const setDraftInputRaw = useSetAtom(sessionDraftInputAtom(sessionId));
+  const setDraftAttachments = useSetAtom(sessionDraftAttachmentsAtom(sessionId));
   const setLastSubmitAt = useSetAtom(sessionLastSubmitAtAtom(sessionId));
   const setDraftLocalModifiedAt = useSetAtom(sessionDraftLocalModifiedAtAtom(sessionId));
   const clearAIInputHistory = useSetAtom(clearAIInputHistoryAtom);
@@ -351,21 +593,6 @@ export const SessionTranscript = forwardRef<SessionTranscriptRef, SessionTranscr
     setDraftInputRaw(value);
     setDraftLocalModifiedAt(Date.now());
   }, [setDraftInputRaw, setDraftLocalModifiedAt]);
-
-  // Debounced persistence of draft input to database
-  // This ensures drafts survive app restarts
-  useEffect(() => {
-    // Don't persist empty drafts or undefined workspacePath
-    if (!workspacePath) return;
-
-    const timeoutId = setTimeout(() => {
-      // Only persist if there's actual content (or we need to clear a previously saved draft)
-      window.electronAPI.invoke('ai:saveDraftInput', sessionId, draftInput, workspacePath)
-        .catch(err => console.error('[SessionTranscript] Failed to persist draft input:', err));
-    }, 1000); // 1 second debounce
-
-    return () => clearTimeout(timeoutId);
-  }, [sessionId, draftInput, workspacePath]);
 
   // Prompt history navigation via Jotai atoms
   const navigateHistory = useSetAtom(navigateSessionHistoryAtom);
@@ -391,7 +618,7 @@ export const SessionTranscript = forwardRef<SessionTranscriptRef, SessionTranscr
   const openInExternalEditor = useSetAtom(openInExternalEditorAtom);
 
   // Local state
-  const [todos, setTodos] = useState<Todo[]>([]);
+  const todos = currentTodos;
   const pendingReviewFiles = useAtomValue(sessionPendingReviewFilesAtom(sessionId));
   // Prompt additions state (dev mode) - uses Jotai atom for persistence across navigation
   const [promptAdditions, setPromptAdditions] = useAtom(sessionPromptAdditionsAtom(sessionId));
@@ -417,6 +644,125 @@ export const SessionTranscript = forwardRef<SessionTranscriptRef, SessionTranscr
   // Track if we're currently queueing a message (prevents double-submission)
   const [isQueueing, setIsQueueing] = useState(false);
 
+  // claude-code-cli (NIM-806, Phase 3): the rich transcript is primary; the
+  // genuine TUI lives in a collapsible "raw terminal" drawer. Default EXPANDED so
+  // the strip's IntersectionObserver fires and the CLI actually spawns; once
+  // launched, TerminalPanel latches, so collapsing afterward is safe.
+  // State is a per-session atom (NIM-810) so the central reveal listener can
+  // auto-expand + focus the drawer when the CLI opens a native picker (/model …).
+  const [cliTerminalExpanded, setCliTerminalExpanded] = useAtom(cliTerminalExpandedAtom(sessionId));
+  const cliTerminalFocusNonce = useAtomValue(cliTerminalFocusNonceAtom(sessionId));
+  const setCliTerminalUserCollapsed = useSetAtom(cliTerminalUserCollapsedAtom(sessionId));
+  const toggleCliTerminalDrawer = useSetAtom(toggleCliTerminalDrawerAtom);
+
+  // NIM-812: the raw-terminal drawer is vertically resizable; its height +
+  // collapsed state persist per-session in session metadata
+  // (cliRawTerminalHeight / cliRawTerminalCollapsed).
+  const [cliTerminalHeight, setCliTerminalHeight] = useAtom(cliTerminalHeightAtom(sessionId));
+  // Observed by ClaudeCliTerminalStrip so the CLI still spawns while collapsed
+  // (the body is display:none when collapsed and would never intersect).
+  const cliTerminalDrawerRef = useRef<HTMLDivElement>(null);
+  const [cliTerminalResizing, setCliTerminalResizing] = useState(false);
+  // NIM-852: whether the genuine `claude` CLI is installed. null until checked.
+  // When false we render an install notice instead of spawning the terminal strip.
+  const [claudeCliInstalled, setClaudeCliInstalled] = useState<boolean | null>(null);
+  const cliResizeStartY = useRef(0);
+  const cliResizeStartHeight = useRef(0);
+  // Hydrate height + collapsed from session metadata once per session, before the
+  // user interacts, so we don't clobber a fresh drag/toggle.
+  const cliTerminalHydratedRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (cliTerminalHydratedRef.current === sessionId) return;
+    const meta = store.get(sessionStoreAtom(sessionId))?.metadata as
+      | Record<string, unknown>
+      | undefined;
+    if (!meta) return; // session data not loaded yet; retry on next render
+    cliTerminalHydratedRef.current = sessionId;
+    const savedHeight = meta.cliRawTerminalHeight;
+    if (typeof savedHeight === 'number' && Number.isFinite(savedHeight)) {
+      setCliTerminalHeight(
+        Math.min(Math.max(savedHeight, MIN_CLI_TERMINAL_HEIGHT), MAX_CLI_TERMINAL_HEIGHT)
+      );
+    }
+    const savedCollapsed = meta.cliRawTerminalCollapsed;
+    if (typeof savedCollapsed === 'boolean') {
+      setCliTerminalExpanded(!savedCollapsed);
+      // A persisted collapse was a user decision — keep it sticky against
+      // output-sourced auto-reveals (NIM-820).
+      setCliTerminalUserCollapsed(savedCollapsed);
+    }
+  }, [sessionId, hasSessionData, setCliTerminalHeight, setCliTerminalExpanded, setCliTerminalUserCollapsed]);
+
+  const handleCliTerminalResizeMouseDown = useCallback((e: React.MouseEvent) => {
+    e.preventDefault();
+    setCliTerminalResizing(true);
+    cliResizeStartY.current = e.clientY;
+    cliResizeStartHeight.current = cliTerminalHeight;
+  }, [cliTerminalHeight]);
+
+  useEffect(() => {
+    if (!cliTerminalResizing) return undefined;
+    const handleMouseMove = (e: MouseEvent) => {
+      // The drawer sits below the transcript, so dragging the top handle UP grows it.
+      const deltaY = cliResizeStartY.current - e.clientY;
+      const next = Math.min(
+        Math.max(cliResizeStartHeight.current + deltaY, MIN_CLI_TERMINAL_HEIGHT),
+        MAX_CLI_TERMINAL_HEIGHT
+      );
+      setCliTerminalHeight(next);
+    };
+    const handleMouseUp = () => {
+      setCliTerminalResizing(false);
+      void updateSessionMetadataField(
+        sessionId,
+        'cliRawTerminalHeight',
+        store.get(cliTerminalHeightAtom(sessionId)),
+        null,
+        updateSessionStore
+      );
+    };
+    document.addEventListener('mousemove', handleMouseMove);
+    document.addEventListener('mouseup', handleMouseUp);
+    document.body.style.cursor = 'ns-resize';
+    document.body.style.userSelect = 'none';
+    return () => {
+      document.removeEventListener('mousemove', handleMouseMove);
+      document.removeEventListener('mouseup', handleMouseUp);
+      document.body.style.cursor = '';
+      document.body.style.userSelect = '';
+    };
+  }, [cliTerminalResizing, sessionId, setCliTerminalHeight, updateSessionStore]);
+
+  const handleToggleCliTerminal = useCallback(() => {
+    // Shared toggle (NIM-820): flips the drawer, marks/clears the sticky
+    // user-collapsed flag, clears auto-reveal, and persists the metadata —
+    // same action the keyboard shortcut dispatches.
+    toggleCliTerminalDrawer(sessionId);
+    // Keep the in-memory session store's metadata in sync so a remount's
+    // hydration doesn't restore a stale collapsed state.
+    const isNowCollapsed = !store.get(cliTerminalExpandedAtom(sessionId));
+    const currentSessionData = store.get(sessionStoreAtom(sessionId));
+    if (currentSessionData) {
+      updateSessionStore({
+        sessionId,
+        updates: {
+          metadata: {
+            ...((currentSessionData.metadata as Record<string, unknown>) || {}),
+            cliRawTerminalCollapsed: isNowCollapsed,
+          },
+        },
+      });
+    }
+  }, [sessionId, toggleCliTerminalDrawer, updateSessionStore]);
+
+  // claude-code-cli (NIM-806): a brand-new, empty CLI session DEFERS spawning the
+  // genuine `claude` CLI until the user commits by sending the first prompt — so an
+  // empty session still shows the model/provider picker and the user can switch
+  // provider before any billed process spawns. We track the committed session by id
+  // (not a bare boolean) so the flag can't leak across sessions if this component
+  // instance is reused for a different sessionId.
+  const [startedCliSessionId, setStartedCliSessionId] = useState<string | null>(null);
+
   // Diff tree grouping state
   const [groupByDirectory] = useAtom(diffTreeGroupByDirectoryAtom);
   const setDiffTreeGroupByDirectory = useSetAtom(setDiffTreeGroupByDirectoryAtom);
@@ -433,8 +779,7 @@ export const SessionTranscript = forwardRef<SessionTranscriptRef, SessionTranscr
   const setDiffPeekSize = useSetAtom(setDiffPeekSizeAtom);
 
   // Session phase for kanban board
-  const sessionRegistry = useAtomValue(sessionRegistryAtom);
-  const currentPhase = sessionRegistry.get(sessionId)?.phase ?? null;
+  const currentPhase = useAtomValue(sessionPhaseAtom(sessionId));
   const setSessionPhase = useSetAtom(setSessionPhaseAtom);
   const handleSetPhase = useCallback((phase: string | null) => {
     setSessionPhase({ sessionId, phase: phase as SessionPhase | null });
@@ -451,7 +796,7 @@ export const SessionTranscript = forwardRef<SessionTranscriptRef, SessionTranscr
   // ============================================================
   useEffect(() => {
     if (!sessionId || !workspacePath) return;
-    if (!sessionData) {
+    if (!hasSessionData) {
       loadSessionData({ sessionId, workspacePath });
     } else if (!isProcessing) {
       // Session data exists but session is idle/completed -- reload from DB
@@ -459,8 +804,7 @@ export const SessionTranscript = forwardRef<SessionTranscriptRef, SessionTranscr
       // (e.g., the user navigated away during streaming and came back after completion)
       reloadSessionData({ sessionId, workspacePath });
     }
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [sessionId, workspacePath]);
+  }, [sessionId, workspacePath, hasSessionData, isProcessing, loadSessionData, reloadSessionData]);
 
   // Ensure centralized file/pending atoms are initialized for this session in Files mode.
   useEffect(() => {
@@ -477,7 +821,7 @@ export const SessionTranscript = forwardRef<SessionTranscriptRef, SessionTranscr
   const hasFocusedRef = useRef(false);
   const visibilityObserverRef = useRef<IntersectionObserver | null>(null);
   useEffect(() => {
-    if (!sessionData || hasFocusedRef.current) return;
+    if (!hasSessionData || hasFocusedRef.current) return;
 
     // Defer to next tick so the DOM is ready after render
     const timerId = setTimeout(() => {
@@ -508,7 +852,7 @@ export const SessionTranscript = forwardRef<SessionTranscriptRef, SessionTranscr
       visibilityObserverRef.current?.disconnect();
       visibilityObserverRef.current = null;
     };
-  }, [sessionData]);
+  }, [hasSessionData]);
 
   // ============================================================
   // IPC events handled by centralized listeners (sessionStateListeners.ts, sessionTranscriptListeners.ts)
@@ -548,21 +892,27 @@ export const SessionTranscript = forwardRef<SessionTranscriptRef, SessionTranscr
       // For Codex sessions, OpenAI auth errors are already displayed by the
       // canonical transcript events (via the persisted raw event). Skip creating a
       // duplicate in-memory error message that would show two auth widgets.
-      const isCodexOpenAIAuthError = sessionData?.provider === 'openai-codex' &&
+      const isCodexOpenAIAuthError = provider === 'openai-codex' &&
         sessionError.message.toLowerCase().includes('api.openai.com') &&
         (sessionError.message.toLowerCase().includes('401 unauthorized') ||
          (sessionError.message.toLowerCase().includes('401') && sessionError.message.toLowerCase().includes('authentication')));
 
       if (!isCodexOpenAIAuthError) {
-        // Add error as an assistant message so user can see what went wrong
+        // Add error as an assistant message so user can see what went wrong.
+        // isCodexAuthRequired short-circuits the rendered text to a CTA widget
+        // that opens the Codex auth section in settings; the raw error string
+        // becomes the widget's fallback subtitle.
+        const extra: Partial<TranscriptViewMessage> = {};
+        if (sessionError.isAuthError) extra.isAuthError = true;
+        if (sessionError.isCodexAuthRequired) extra.isCodexAuthRequired = true;
         const errorMessage = makeOptimisticError(
           `Error: ${sessionError.message}`,
-          sessionError.isAuthError ? { isAuthError: true } : undefined,
+          Object.keys(extra).length > 0 ? extra : undefined,
         );
         updateSessionStore({
           sessionId,
           updates: {
-            messages: [...(sessionData?.messages || []), errorMessage],
+            messages: [...messages, errorMessage],
           },
         });
       }
@@ -573,11 +923,51 @@ export const SessionTranscript = forwardRef<SessionTranscriptRef, SessionTranscr
     };
 
     handleError();
-  }, [sessionError, sessionId, sessionData?.messages, updateSessionStore, setIsProcessing, confirm]);
+  }, [sessionError, sessionId, provider, messages, updateSessionStore, setIsProcessing, confirm]);
 
   // Derived values
   const isLoading = isProcessing;
-  const sessionHasMessages = (sessionData?.messages?.length ?? 0) > 0;
+  const sessionHasMessages = messages.length > 0;
+
+  // claude-code-cli (NIM-806): "committed" = the user has started this CLI session.
+  // True once it has any transcript message (a turn has run / a prompt was logged)
+  // or the user just sent the first prompt this render-cycle. Until committed, we
+  // keep the model/provider picker visible and do NOT mount the terminal strip, so
+  // an empty new CLI session can switch provider without eagerly spawning the
+  // genuine `claude` process. Mirrors the backend's own "started session" gate
+  // (shouldBlockStartedSessionProviderSwitch keys off messages.length > 0).
+  const cliSessionCommitted = sessionHasMessages || startedCliSessionId === sessionId;
+
+  // NIM-852: for a claude-code-cli session, detect whether the genuine `claude`
+  // CLI is installed. Re-check when the session commits (a fresh install between
+  // mount and first prompt is then reflected). When not installed we show an
+  // install notice and skip mounting the terminal strip (which would otherwise
+  // spawn a bare `claude` → cryptic `command not found`).
+  useEffect(() => {
+    if (provider !== 'claude-code-cli') {
+      setClaudeCliInstalled(null);
+      return;
+    }
+    // Guard: an older preload (e.g. before an app restart picks up the new IPC)
+    // won't expose this function. Assume installed so we never block a working CLI.
+    const check = window.electronAPI.terminal.isClaudeCliInstalled;
+    if (typeof check !== 'function') {
+      setClaudeCliInstalled(true);
+      return;
+    }
+    let cancelled = false;
+    void check()
+      .then((installed) => {
+        if (!cancelled) setClaudeCliInstalled(installed);
+      })
+      .catch(() => {
+        // On a detection failure, assume installed so we don't block a working CLI.
+        if (!cancelled) setClaudeCliInstalled(true);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [provider, cliSessionCommitted]);
 
   // ============================================================
   // Confirmation dialogs (ExitPlanMode, AskUserQuestion, ToolPermission)
@@ -621,27 +1011,23 @@ export const SessionTranscript = forwardRef<SessionTranscriptRef, SessionTranscr
     prevIsLoadingRef.current = isLoading;
   }, [isLoading, sessionId]);
 
-  // Trigger queue processing when queuedPrompts change and AI is idle
+  // Trigger queue processing when queuedPrompts change and AI is idle.
+  // claude-code-cli is excluded: its queue is flushed to the PTY by the
+  // main-process PID-idle flusher (claudeCliQueueFlush), not the SDK send loop
+  // (ai:triggerQueueProcessing → ai:sendMessage, which throws for the CLI).
   useEffect(() => {
-    if (queuedPrompts.length > 0 && !isLoading && workspacePath) {
+    if (
+      queuedPrompts.length > 0 &&
+      !isLoading &&
+      workspacePath &&
+      !isClaudeCliTerminalSession(provider)
+    ) {
       window.electronAPI.invoke('ai:triggerQueueProcessing', sessionId, workspacePath)
         .catch(error => {
           console.error('[SessionTranscript] Failed to trigger queue processing:', error);
         });
     }
-  }, [queuedPrompts.length, isLoading, sessionId, workspacePath]);
-
-  // ============================================================
-  // Todos
-  // ============================================================
-  useEffect(() => {
-    const currentTodos = sessionData?.metadata?.currentTodos;
-    if (Array.isArray(currentTodos)) {
-      setTodos(currentTodos);
-    } else {
-      setTodos([]);
-    }
-  }, [sessionData?.metadata?.currentTodos]);
+  }, [queuedPrompts.length, isLoading, sessionId, workspacePath, provider]);
 
   // ============================================================
   // Expose ref methods
@@ -653,10 +1039,6 @@ export const SessionTranscript = forwardRef<SessionTranscriptRef, SessionTranscr
   // ============================================================
   // Handlers
   // ============================================================
-  const handleInputChange = useCallback((value: string) => {
-    setDraftInput(value);
-  }, [setDraftInput]);
-
   const handleAttachmentAdd = useCallback((attachment: ChatAttachment) => {
     setDraftAttachments(prev => [...prev, attachment]);
   }, [setDraftAttachments]);
@@ -674,19 +1056,23 @@ export const SessionTranscript = forwardRef<SessionTranscriptRef, SessionTranscr
       const effectiveContext = await getEffectiveDocumentContext();
       const serializableContext = serializeDocumentContext(effectiveContext);
 
+      // Read attachments imperatively — we don't subscribe to keep typing
+      // from re-rendering the entire transcript.
+      const currentAttachments = store.get(sessionDraftAttachmentsAtom(sessionId)) ?? [];
+
       // If there's already a pending queued prompt, append to it instead of
       // creating a separate entry. This bundles multiple queued messages into
       // one prompt, matching how Claude Code handles stacked queries.
       const lastQueued = queuedPrompts[queuedPrompts.length - 1];
       let combinedPrompt = message.trim();
-      let combinedAttachments = draftAttachments;
+      let combinedAttachments = currentAttachments;
 
       if (lastQueued) {
         // Delete the existing queued prompt so we can replace it
         await window.electronAPI.invoke('ai:deleteQueuedPrompt', lastQueued.id);
         combinedPrompt = lastQueued.prompt + '\n\n' + message.trim();
         // Merge attachments from both prompts
-        combinedAttachments = [...(lastQueued.attachments || []), ...draftAttachments];
+        combinedAttachments = [...(lastQueued.attachments || []), ...currentAttachments];
       }
 
       const result = await window.electronAPI.invoke(
@@ -718,18 +1104,78 @@ export const SessionTranscript = forwardRef<SessionTranscriptRef, SessionTranscr
     } finally {
       setIsQueueing(false);
     }
-  }, [sessionId, getEffectiveDocumentContext, draftAttachments, setDraftInput, setDraftAttachments, setLastSubmitAt, isQueueing, queuedPrompts, clearAIInputHistory]);
+  }, [sessionId, getEffectiveDocumentContext, setDraftInput, setDraftAttachments, setLastSubmitAt, isQueueing, queuedPrompts, clearAIInputHistory]);
 
   const handleSend = useCallback(async () => {
-    if (!draftInput.trim() || !sessionData) return;
+    // Read draft state imperatively — we deliberately don't subscribe to
+    // these atoms in SessionTranscript (see SessionAIInput).
+    const currentDraftInput = store.get(sessionDraftInputAtom(sessionId)) ?? '';
+    if (!currentDraftInput.trim() || !sessionData) return;
 
-    if (isLoading) {
-      handleQueue(draftInput.trim());
+    // claude-code-cli (subscription, NIM-806): the genuine `claude` CLI runs in
+    // the terminal strip and is driven by its PTY, not the Agent SDK loop. The
+    // main-process `claude-cli:submit-prompt` IPC composes the PTY line (prompt +
+    // inline attachment paths), writes it to the terminal, and logs the clean
+    // typed prompt (+ attachment chips) as the transcript user row. We bypass the
+    // SDK send path (ai:sendMessage throws for this provider) and the
+    // /plan//implement//clear interception (the CLI owns its own slash commands).
+    if (isClaudeCliTerminalSession(provider)) {
+      const cliMessage = currentDraftInput.trim();
+      // Commit the session on first send: mounting the terminal strip (gated on
+      // cliSessionCommitted) is what spawns the genuine CLI. We DEFER that spawn
+      // until now so an empty new session still shows the model/provider picker.
+      if (startedCliSessionId !== sessionId) {
+        setStartedCliSessionId(sessionId);
+      }
+      // Route through the Nimbalyst queue when the CLI isn't ready for a direct
+      // PTY write — before its first turn has run (the strip is still spawning) or
+      // while a turn is in flight. The main-process PID-idle flusher drains the
+      // queue to the PTY once the CLI is idle (same store + UI as the SDK path;
+      // handleQueue reads attachments imperatively). Only a committed, idle session
+      // that already has a prior turn writes keystrokes directly.
+      if (!sessionHasMessages || isLoading) {
+        handleQueue(cliMessage);
+        return;
+      }
+      const attachments = store.get(sessionDraftAttachmentsAtom(sessionId)) ?? [];
+      setDraftInput('');
+      setDraftAttachments([]);
+      clearAIInputHistory(sessionId);
+      resetHistory(sessionId);
+      try {
+        if (workspacePath) {
+          // NIM-818: capture the active-doc/selection context at send time —
+          // the composer appends a compact context block to the PTY line so
+          // the CLI knows what "this doc" / "this selection" refers to.
+          // (The queued path already carries it via ai:createQueuedPrompt.)
+          let documentContext: unknown;
+          try {
+            documentContext = serializeDocumentContext(await getEffectiveDocumentContext());
+          } catch (contextError) {
+            console.warn('[SessionTranscript] Failed to capture document context for CLI submit:', contextError);
+          }
+          await window.electronAPI.terminal.submitClaudeCliPrompt({
+            sessionId,
+            workspacePath,
+            prompt: cliMessage,
+            attachments,
+            documentContext,
+          });
+        }
+        recordClaudeActivity();
+      } catch (error) {
+        console.error('[SessionTranscript] Failed to submit claude-cli prompt:', error);
+      }
       return;
     }
 
-    let message = draftInput.trim();
-    const attachments = draftAttachments;
+    if (isLoading) {
+      handleQueue(currentDraftInput.trim());
+      return;
+    }
+
+    let message = currentDraftInput.trim();
+    const attachments = store.get(sessionDraftAttachmentsAtom(sessionId)) ?? [];
 
     // Intercept /plan command - strip it and switch to planning mode
     // Match "/plan" only when followed by whitespace or end of string (not "/planning" or "/planify")
@@ -748,7 +1194,7 @@ export const SessionTranscript = forwardRef<SessionTranscriptRef, SessionTranscr
       } catch (error) {
         console.error('[SessionTranscript] Failed to update session mode:', error);
         // Revert local state since persistence failed
-        setAiMode(aiMode);
+        setAiMode(aiMode as AIMode);
         // Show error to user
         const errorMessage = makeOptimisticError('Failed to switch to planning mode. Please try again.');
         updateSessionStore({
@@ -770,9 +1216,9 @@ export const SessionTranscript = forwardRef<SessionTranscriptRef, SessionTranscr
     }
 
     // Intercept /implement command - switch to agent mode if in planning mode
-    // This allows the /implement command (or nimbalyst-planning:implement) to actually code
-    // Match both "/implement" and "/nimbalyst-planning:implement" followed by space or end
-    const implementCommandMatch = message.match(/^\/(nimbalyst-planning:)?implement(?:\s|$)/);
+    // This allows the /implement command (or planning:implement) to actually code
+    // Match "/implement", "/planning:implement", and the legacy "/nimbalyst-planning:implement" form
+    const implementCommandMatch = message.match(/^\/(?:nimbalyst-planning:|planning:)?implement(?:\s|$)/);
     if (implementCommandMatch && overrideMode === 'planning') {
       // Switch to agent mode for implementation
       overrideMode = 'agent';
@@ -805,6 +1251,7 @@ export const SessionTranscript = forwardRef<SessionTranscriptRef, SessionTranscr
     }
 
     // Expand @@[name](shortId) -> @@[name](fullUuid) for agent consumption
+    const sessionRegistry = store.get(sessionRegistryAtom);
     message = expandSessionMentions(message, sessionRegistry);
 
     setLastSubmitAt(Date.now());
@@ -836,6 +1283,7 @@ export const SessionTranscript = forwardRef<SessionTranscriptRef, SessionTranscr
         ...serializeDocumentContext(effectiveContext),
         attachments: attachments.length > 0 ? attachments : undefined,
         mode: overrideMode,
+        inputType: 'user' as const,
       };
 
       await window.electronAPI.invoke('ai:sendMessage', message, docContext, sessionId, workspacePath);
@@ -860,44 +1308,105 @@ export const SessionTranscript = forwardRef<SessionTranscriptRef, SessionTranscr
       });
       setIsProcessing(false);
     }
-  }, [sessionId, sessionData, draftInput, draftAttachments, isLoading, getEffectiveDocumentContext, aiMode, workspacePath, setDraftInput, setDraftAttachments, setLastSubmitAt, resetHistory, updateSessionStore, handleQueue, setIsProcessing, messages, mode, onClearSession, onClearAgentSession, sessionRegistry, clearAIInputHistory]);
+  }, [sessionId, sessionData, isLoading, getEffectiveDocumentContext, aiMode, workspacePath, setDraftInput, setDraftAttachments, setLastSubmitAt, resetHistory, updateSessionStore, handleQueue, setIsProcessing, messages, sessionHasMessages, startedCliSessionId, mode, onClearSession, onClearAgentSession, clearAIInputHistory, provider, recordClaudeActivity]);
+
+  // Launch a sibling session from a `launch: new-session` action prompt.
+  // Builds the originating-session mention prefix here (in the renderer) so the
+  // main process doesn't have to know about session titles or shortIds, and
+  // delegates the spawn + draft/focus orchestration to the action-prompts IPC.
+  const handleLaunchActionInNewSession = useCallback(
+    async (action: import('../../store/atoms/actionPrompts').ActionPrompt) => {
+      if (!workspacePath) return;
+      if (!action?.config || action.config.launch !== 'new-session') return;
+
+      const registry = store.get(sessionRegistryAtom);
+      const parentMeta = registry.get(sessionId);
+      const parentTitle = (parentMeta?.title || 'Session').trim();
+      // Action body comes first so slash commands like /implement and /review
+      // remain at character 0 of the prompt (Claude Code only recognizes them
+      // when they lead the message).
+      //
+      // Append the full UUID (not the 5-char short ID used in the composer)
+      // for two reasons:
+      //   1. The receiving session's MarkdownRenderer only treats a link as a
+      //      session reference when the href matches the full UUID format
+      //      (SESSION_UUID_RE in runtime/MarkdownRenderer.tsx). A short ID
+      //      renders as plain text.
+      //   2. The receiving agent's session-context MCP tools
+      //      (get_session_summary, etc.) take a full UUID; a 5-char prefix
+      //      isn't resolvable on the server side and we don't run the
+      //      composer-side expandSessionMentions() pass on this path.
+      const prompt = `${action.body}\n\nOriginating session: @@[${parentTitle}](${sessionId})`;
+
+      try {
+        await window.electronAPI.invoke('action-prompts:launch-new-session', {
+          workspacePath,
+          parentSessionId: sessionId,
+          prompt,
+          actionLabel: action.label,
+          config: {
+            model: action.config.model,
+            foreground: action.config.foreground,
+            autoSubmit: action.config.autoSubmit,
+            worktree: action.config.worktree,
+          },
+        });
+      } catch (err) {
+        console.error('[SessionTranscript] Failed to launch action in new session:', err);
+      }
+    },
+    [workspacePath, sessionId]
+  );
 
   const handleCancel = useCallback(async () => {
     try {
+      if (isClaudeCliTerminalSession(provider)) {
+        // Escalating stop (NIM-814): Ctrl-C → Ctrl-C → SIGINT in the main
+        // process. Fire-and-forget — escalation can take a few seconds and the
+        // button must stay responsive to repeat presses.
+        void window.electronAPI.terminal.interruptClaudeCli(sessionId).catch((err) => {
+          console.error('[SessionTranscript] Failed to interrupt Claude CLI:', err);
+        });
+        recordClaudeActivity();
+        return;
+      }
+
       await window.electronAPI.invoke('ai:cancelRequest', sessionId);
       // Note: session:interrupted event will also set this to false via sessionStateListeners
       setIsProcessing(false);
     } catch (error) {
       console.error('[SessionTranscript] Failed to cancel request:', error);
     }
-  }, [sessionId, setIsProcessing]);
+  }, [provider, sessionId, setIsProcessing, recordClaudeActivity]);
 
   const handleFileClick = useCallback((filePath: string) => {
-    onFileClick?.(filePath);
-  }, [onFileClick]);
+    const baseDir = sessionWorktreePath ?? workspacePath;
+    onFileClick?.(resolveTranscriptClickPath(filePath, baseDir));
+  }, [onFileClick, sessionWorktreePath, workspacePath]);
 
   const setRequestOpenSession = useSetAtom(requestOpenSessionAtom);
   const handleOpenSession = useCallback((targetSessionId: string) => {
     setRequestOpenSession(targetSessionId);
   }, [setRequestOpenSession]);
 
-  const getToolCallDiffs = useCallback(async (toolCallItemId: string, toolCallTimestamp?: number) => {
-    try {
-      const result = await window.electronAPI.invoke(
-        'session-files:get-tool-call-diffs',
-        sessionId,
-        toolCallItemId,
-        toolCallTimestamp
-      );
-      return result.success && result.diffs?.length > 0 ? result.diffs : null;
-    } catch {
-      return null;
-    }
-  }, [sessionId]);
-
   const handleOpenInExternalEditor = useCallback((filePath: string) => {
     openInExternalEditor(filePath);
   }, [openInExternalEditor]);
+
+  const renderEmbeddedFile = useCallback(({ filePath, defaultExpanded }: { filePath: string; defaultExpanded?: boolean }) => {
+    return (
+      <TranscriptEmbeddedFileCard
+        filePath={filePath}
+        onOpenFile={handleFileClick}
+        defaultExpanded={defaultExpanded}
+      />
+    );
+  }, [handleFileClick]);
+
+  const canEmbedFile = useCallback((filePath: string) => {
+    const registration = customEditorRegistry.findRegistrationForFile(filePath);
+    return !!registration?.supportsTranscriptEmbed;
+  }, []);
 
   const handleCompact = useCallback(async () => {
     if (!sessionData) return;
@@ -920,6 +1429,7 @@ export const SessionTranscript = forwardRef<SessionTranscriptRef, SessionTranscr
       const docContext = {
         ...serializeDocumentContext(effectiveContext),
         mode: aiMode,
+        inputType: 'user' as const,
       };
 
       await window.electronAPI.invoke('ai:sendMessage', message, docContext, sessionId, workspacePath);
@@ -949,7 +1459,10 @@ export const SessionTranscript = forwardRef<SessionTranscriptRef, SessionTranscr
     try {
       await window.electronAPI.invoke('ai:deleteQueuedPrompt', id);
       setQueuedPrompts(prev => prev.filter(p => p.id !== id));
-      setDraftInput(prompt);
+      // Append to any existing draft so editing multiple queued items doesn't
+      // clobber prior text; matches how handleQueue bundles consecutive
+      // queued prompts with a blank-line separator.
+      setDraftInput(prev => prev.trim().length > 0 ? `${prev}\n\n${prompt}` : prompt);
       inputRef.current?.focus();
     } catch (error) {
       console.error('[SessionTranscript] Failed to edit queued prompt:', error);
@@ -958,14 +1471,21 @@ export const SessionTranscript = forwardRef<SessionTranscriptRef, SessionTranscr
 
   const handleSendNowQueuedPrompt = useCallback(async (_id: string, _prompt: string) => {
     try {
-      // Interrupt the current turn using the SDK's interrupt(). This gracefully
-      // stops the current turn, the completion handler fires normally, and the
-      // existing queue processing picks up the next pending prompt.
+      // Two-step send-now: (1) interrupt the current turn (graceful for
+      // Claude Code, hard abort for other providers via the BaseAIProvider
+      // default); (2) explicitly trigger queue processing. The natural
+      // completion-handler path also triggers it, and the server's
+      // sessionsProcessingQueue guard de-dupes, so this is safe to call.
+      // We don't rely on the isLoading auto-effect because session:completed
+      // may race or, in some edge cases, may not fire cleanly after abort.
       await window.electronAPI.invoke('ai:interruptCurrentTurn', sessionId);
+      if (workspacePath) {
+        await window.electronAPI.invoke('ai:triggerQueueProcessing', sessionId, workspacePath);
+      }
     } catch (error) {
       console.error('[SessionTranscript] Failed to interrupt for send-now:', error);
     }
-  }, [sessionId]);
+  }, [sessionId, workspacePath]);
 
   const handleCloseAndArchive = useCallback(async () => {
     try {
@@ -1001,13 +1521,21 @@ export const SessionTranscript = forwardRef<SessionTranscriptRef, SessionTranscr
     // Save as the default model for new sessions
     setAgentModeSettings({ defaultModel: modelId });
     try {
+      // claude-code-cli (NIM-806): a RUNNING CLI session retunes via the
+      // genuine CLI's `/model` slash command typed into its PTY (main-process
+      // IPC) — no respawn. Must happen before the metadata update so a failed
+      // PTY switch rolls everything back. The picker is disabled while a turn
+      // is running (readOnlyModel below), so this only fires on idle sessions.
+      if (isClaudeCliTerminalSession(provider) && cliSessionCommitted) {
+        await window.electronAPI.terminal.setClaudeCliModel(sessionId, modelId);
+      }
       await window.electronAPI.invoke('sessions:update-metadata', sessionId, { model: modelId });
     } catch (error) {
       console.error('[SessionTranscript] Failed to update model:', error);
       setCurrentModel(previousModel);
       setAgentModeSettings({ defaultModel: previousModel });
     }
-  }, [currentModel, sessionId, setCurrentModel, setAgentModeSettings]);
+  }, [currentModel, sessionId, setCurrentModel, setAgentModeSettings, provider, cliSessionCommitted]);
 
   const handleEffortLevelChange = useCallback(async (level: EffortLevel) => {
     const previousLevel = effortLevel;
@@ -1143,7 +1671,7 @@ export const SessionTranscript = forwardRef<SessionTranscriptRef, SessionTranscr
         return;
       }
 
-      const basePath = sessionData?.worktreePath || workspacePath;
+      const basePath = sessionWorktreePath || workspacePath;
       const absolutePlanPath = resolvePlanFilePath(planFilePath, basePath);
       if (!absolutePlanPath && planFilePath) {
         console.warn('[SessionTranscript] Could not resolve plan file path, using raw path in draft:', planFilePath);
@@ -1166,7 +1694,7 @@ export const SessionTranscript = forwardRef<SessionTranscriptRef, SessionTranscr
     } catch (error) {
       console.error('[SessionTranscript] Failed to start new session for implementation:', error);
     }
-  }, [sessionChildren, sessionParentId, workspacePath, worktreeId, onCreateWorktreeSession, createChildSession, convertToWorkstream, sessionData?.worktreePath, posthog, defaultModel, openSessionWithDraft, stopExitPlanModeSession]);
+  }, [sessionChildren, sessionParentId, workspacePath, worktreeId, onCreateWorktreeSession, createChildSession, convertToWorkstream, sessionWorktreePath, posthog, defaultModel, openSessionWithDraft, stopExitPlanModeSession]);
 
   const handleExitPlanModeCancel = useCallback(async (requestId: string, confirmSessionId: string) => {
     try {
@@ -1183,10 +1711,21 @@ export const SessionTranscript = forwardRef<SessionTranscriptRef, SessionTranscr
 
   // Note: AskUserQuestion, ToolPermission handlers removed - now handled by inline widgets via InteractiveWidgetHost
 
-  // Set the interactive widget host in the atom - widgets read from here
-  // This provides methods for widgets to call that have access to atoms, callbacks, and analytics
-  useEffect(() => {
-    const host: InteractiveWidgetHost = {
+  // Set the interactive widget host in the atom - widgets read from here.
+  // This provides methods for widgets to call that have access to atoms, callbacks, and analytics.
+  //
+  // We use a *stable proxy* whose methods read from `liveHostRef` (refreshed
+  // every render), and a multi-owner registry (`registerInteractiveWidgetHost`)
+  // so two SessionTranscripts displaying the same session -- e.g. one in
+  // Files-mode ChatSidebar and one in Agent mode -- can coexist without
+  // clobbering each other's host. Without multi-owner, the chat sidebar's
+  // host effect unmount/cleanup would null the atom even though the
+  // agent-mode transcript is still mounted, leaving the AskUserQuestion
+  // widget stuck with no host (header visible, options blank) until the
+  // user switched sessions.
+  const liveHostRef = useRef<InteractiveWidgetHost | null>(null);
+  // Build the live host on every render so its closures stay current.
+  const liveHost: InteractiveWidgetHost = {
       sessionId,
       workspacePath: workspacePath || '',
       worktreeId,
@@ -1201,6 +1740,38 @@ export const SessionTranscript = forwardRef<SessionTranscriptRef, SessionTranscr
       askUserQuestionCancel: async (questionId: string) => {
         await window.electronAPI.invoke('claude-code:cancel-question', { questionId, sessionId });
         posthog?.capture('ask_user_question_cancelled');
+      },
+
+      // RequestUserInput operations - durable prompt path
+      requestUserInputSubmit: async (promptId: string, answers) => {
+        await window.electronAPI.invoke('messages:respond-to-prompt', {
+          sessionId,
+          promptId,
+          promptType: 'request_user_input_request' as const,
+          response: { answers, cancelled: false },
+          respondedBy: 'desktop' as const,
+        });
+        // Counts of each field type, no PII.
+        const fieldTypeCounts: Record<string, number> = {};
+        for (const a of Object.values(answers)) {
+          fieldTypeCounts[a.type] = (fieldTypeCounts[a.type] ?? 0) + 1;
+        }
+        posthog?.capture('request_user_input_answered', {
+          numFields: Object.keys(answers).length,
+          fieldTypeCounts,
+        });
+        refreshPendingPrompts(sessionId);
+      },
+      requestUserInputCancel: async (promptId: string) => {
+        await window.electronAPI.invoke('messages:respond-to-prompt', {
+          sessionId,
+          promptId,
+          promptType: 'request_user_input_request' as const,
+          response: { answers: {}, cancelled: true },
+          respondedBy: 'desktop' as const,
+        });
+        posthog?.capture('request_user_input_cancelled');
+        refreshPendingPrompts(sessionId);
       },
 
       // ExitPlanMode operations
@@ -1268,7 +1839,7 @@ export const SessionTranscript = forwardRef<SessionTranscriptRef, SessionTranscr
         try {
           // Execute the git commit via IPC
           // Use worktree path for git operations when in a worktree session
-          const gitWorkspacePath = sessionData?.worktreePath || workspacePath;
+          const gitWorkspacePath = sessionWorktreePath || workspacePath;
           const result = await window.electronAPI.invoke(
             'git:commit',
             gitWorkspacePath,
@@ -1276,13 +1847,17 @@ export const SessionTranscript = forwardRef<SessionTranscriptRef, SessionTranscr
             files
           ) as { success: boolean; commitHash?: string; commitDate?: string; error?: string };
 
-          // Send response via unified IPC channel for the durable prompt
+          // Send response via unified IPC channel for the durable prompt.
+          // A real failure (success=false with an error) maps to action='error',
+          // not 'cancelled'. 'cancelled' is reserved for the explicit user-cancel
+          // path; collapsing failures into 'cancelled' makes the widget render
+          // the cancelled state instead of surfacing the error to the user.
           await window.electronAPI.invoke('messages:respond-to-prompt', {
             sessionId,
             promptId: proposalId,
             promptType: 'git_commit_proposal_request' as const,
             response: {
-              action: result.success ? 'committed' : 'cancelled',
+              action: result.success ? 'committed' : 'error',
               commitHash: result.commitHash,
               commitDate: result.commitDate,
               error: result.error,
@@ -1299,13 +1874,14 @@ export const SessionTranscript = forwardRef<SessionTranscriptRef, SessionTranscr
             error: error instanceof Error ? error.message : String(error),
           };
 
-          // Send error result back via unified IPC
+          // IPC threw outright. Surface as action='error' for the same reason
+          // as above: the user needs to see the failure, not a cancelled state.
           await window.electronAPI.invoke('messages:respond-to-prompt', {
             sessionId,
             promptId: proposalId,
             promptType: 'git_commit_proposal_request' as const,
             response: {
-              action: 'cancelled',
+              action: 'error',
               error: errorResult.error,
             },
             respondedBy: 'desktop' as const,
@@ -1329,7 +1905,7 @@ export const SessionTranscript = forwardRef<SessionTranscriptRef, SessionTranscr
 
       gitFileDiff: async (filePath: string) => {
         try {
-          const gitWorkspacePath = sessionData?.worktreePath || workspacePath;
+          const gitWorkspacePath = sessionWorktreePath || workspacePath;
           const result = await window.electronAPI.invoke(
             'git:file-diff',
             gitWorkspacePath,
@@ -1386,7 +1962,7 @@ export const SessionTranscript = forwardRef<SessionTranscriptRef, SessionTranscr
           await window.electronAPI.invoke(
             'ai:sendMessage',
             feedbackMessage,
-            undefined,
+            { inputType: 'user' },
             sessionId,
             workspacePath
           );
@@ -1427,35 +2003,47 @@ export const SessionTranscript = forwardRef<SessionTranscriptRef, SessionTranscr
       trackEvent: (eventName: string, properties?: Record<string, unknown>) => {
         posthog?.capture(eventName, properties);
       },
+  };
+  liveHostRef.current = liveHost;
+
+  useEffect(() => {
+    // Stable proxy: identity is fixed for the lifetime of this {sessionId,
+    // workspacePath, worktreeId} tuple. Methods delegate to the live ref so
+    // closures stay current without re-registering the host on every render.
+    const proxy: InteractiveWidgetHost = {
+      get sessionId() { return liveHostRef.current?.sessionId ?? sessionId; },
+      get workspacePath() { return liveHostRef.current?.workspacePath ?? (workspacePath || ''); },
+      get worktreeId() { return liveHostRef.current?.worktreeId ?? worktreeId; },
+      get autoCommitEnabled() { return liveHostRef.current?.autoCommitEnabled ?? false; },
+      get diffPeekSize() { return getDiffPeekSizeForInteractiveWidgetHost(liveHostRef.current); },
+      askUserQuestionSubmit: (...args) => liveHostRef.current!.askUserQuestionSubmit(...args),
+      askUserQuestionCancel: (...args) => liveHostRef.current!.askUserQuestionCancel(...args),
+      requestUserInputSubmit: (...args) => liveHostRef.current!.requestUserInputSubmit(...args),
+      requestUserInputCancel: (...args) => liveHostRef.current!.requestUserInputCancel(...args),
+      exitPlanModeApprove: (...args) => liveHostRef.current!.exitPlanModeApprove(...args),
+      exitPlanModeStartNewSession: (...args) => liveHostRef.current!.exitPlanModeStartNewSession(...args),
+      exitPlanModeDeny: (...args) => liveHostRef.current!.exitPlanModeDeny(...args),
+      exitPlanModeCancel: (...args) => liveHostRef.current!.exitPlanModeCancel(...args),
+      toolPermissionSubmit: (...args) => liveHostRef.current!.toolPermissionSubmit(...args),
+      toolPermissionCancel: (...args) => liveHostRef.current!.toolPermissionCancel(...args),
+      setAutoCommitEnabled: (...args) => liveHostRef.current!.setAutoCommitEnabled(...args),
+      gitCommit: (...args) => liveHostRef.current!.gitCommit(...args),
+      gitCommitCancel: (...args) => liveHostRef.current!.gitCommitCancel(...args),
+      gitFileDiff: (...args) => liveHostRef.current!.gitFileDiff!(...args),
+      setDiffPeekSize: (...args) => liveHostRef.current!.setDiffPeekSize!(...args),
+      superLoopBlockedFeedback: (...args) => liveHostRef.current!.superLoopBlockedFeedback(...args),
+      openFile: (...args) => liveHostRef.current!.openFile(...args),
+      trackEvent: (...args) => liveHostRef.current!.trackEvent(...args),
     };
 
-    setInteractiveWidgetHost(sessionId, host);
-
-    // Cleanup on unmount or sessionId change
+    registerInteractiveWidgetHost(sessionId, proxy);
     return () => {
-      setInteractiveWidgetHost(sessionId, null);
+      unregisterInteractiveWidgetHost(sessionId, proxy);
     };
-  }, [
-    sessionId,
-    workspacePath,
-    worktreeId,
-    sessionData?.worktreePath,
-    handleExitPlanModeApprove,
-    handleExitPlanModeStartNewSession,
-    handleExitPlanModeDeny,
-    handleExitPlanModeCancel,
-    refreshPendingPrompts,
-    respondToPrompt,
-    posthog,
-    autoCommitEnabled,
-    setAutoCommitEnabled,
-    diffPeekSize,
-    setDiffPeekSize,
-    onFileClick,
-  ]);
+  }, [sessionId, workspacePath, worktreeId]);
 
   // Feature flags
-  const enableSlashCommands = sessionData?.provider === 'claude-code';
+  const enableSlashCommands = supportsWorkspaceSlashCommands(provider);
   const enableAttachments = true;
   const enableHistoryNavigation = true;
 
@@ -1466,21 +2054,34 @@ export const SessionTranscript = forwardRef<SessionTranscriptRef, SessionTranscr
     return userMessages[userMessages.length - 1].createdAt?.getTime() || null;
   }, [messages]);
 
-  // Slash command suggestions for empty sessions
+  // Extra content rendered in the empty-session panel: an inline contextual
+  // tip (any provider) above the slash command suggestions (claude-code
+  // only). InlineTipDisplay registers itself with TipProvider so tips only
+  // activate while this surface is mounted.
   const renderEmptyExtra = React.useCallback(() => {
-    if (provider !== 'claude-code' || messages.length > 0) {
-      return null;
-    }
+    if (messages.length > 0) return null;
     return (
-      <SlashCommandSuggestions
-        provider={provider}
-        hasMessages={messages.length > 0}
-        workspacePath={workspacePath}
-        sessionId={sessionId}
-        onCommandSelect={handleCommandSelect}
-      />
+      <div className="rich-transcript-empty-extras w-full max-w-[640px] flex flex-col items-center gap-6">
+        <InlineTipDisplay
+          onInsertPrompt={provider === 'claude-code' ? handleCommandSelect : undefined}
+        />
+        {provider === 'claude-code' && (
+          <SlashCommandSuggestions
+            provider={provider}
+            hasMessages={false}
+            workspacePath={workspacePath}
+            sessionId={sessionId}
+            onCommandSelect={handleCommandSelect}
+          />
+        )}
+      </div>
     );
   }, [provider, messages.length, workspacePath, sessionId, handleCommandSelect]);
+
+  // When a tip is being shown in the empty panel, hide the generic
+  // "ready to assist with" help block so the tip is the focal point.
+  const activeTipId = useAtomValue(activeTipIdAtom);
+  const hideEmptyHelp = activeTipId !== null && messages.length === 0;
 
   // Scroll-to-teammate: when the atom fires for this session, find the spawn
   // message and scroll the transcript to it.
@@ -1565,6 +2166,150 @@ export const SessionTranscript = forwardRef<SessionTranscriptRef, SessionTranscr
     setScrollToMessage(null);
   }, [scrollToMessage, setScrollToMessage, sessionId, messages]);
 
+  useEffect(() => {
+    if (!import.meta.env.DEV || !sessionData) return;
+
+    const nextState = {
+      messageCount: sessionData.messages?.length ?? 0,
+      messageRef: sessionData.messages,
+      tokenUsageRef: tokenUsage,
+      tokenUsageSummary: JSON.stringify(tokenUsage ?? null),
+      provider,
+      isProcessing,
+      hasPendingInteractivePrompt,
+      aiMode,
+      currentModel,
+      isArchived,
+      pendingReviewFilesRef: pendingReviewFiles,
+      pendingReviewFilesSummary: JSON.stringify(Array.from(pendingReviewFiles).sort()),
+      pendingPromptsCount: pendingPrompts.length,
+      queuedPromptsCount: queuedPrompts.length,
+      todosRef: todos,
+      todosSummary: JSON.stringify(todos),
+      sessionErrorRef: sessionError,
+      promptAdditionsRef: promptAdditions,
+      currentPhase,
+      appStartTime,
+      scrollToTeammateTarget: scrollToTeammate ? `${scrollToTeammate.sessionId}:${scrollToTeammate.agentId}` : null,
+      scrollToMessageTarget: scrollToMessage ? `${scrollToMessage.sessionId}:${scrollToMessage.timestamp}` : null,
+      sessionStatus: sessionData.metadata?.sessionStatus,
+      metadataTeammatesRef: metadataTeammates,
+      metadataTeammatesSummary: summarizeTeammates(metadataTeammates),
+      additionalTeammatesRef: additionalTeammates,
+      additionalTeammatesSummary: summarizeTeammates(additionalTeammates),
+      mergedTeammatesRef: transcriptTeammates,
+      mergedTeammatesSummary: summarizeTeammates(transcriptTeammates),
+      updatedAt: sessionData.updatedAt,
+    };
+
+    const previous = previousRenderRef.current;
+    if (!previous) {
+      emitSessionRenderTrace('initial', {
+        sessionId,
+        messageCount: nextState.messageCount,
+        tokenUsage: nextState.tokenUsageSummary,
+        provider: nextState.provider,
+        isProcessing: nextState.isProcessing,
+        hasPendingInteractivePrompt: nextState.hasPendingInteractivePrompt,
+        aiMode: nextState.aiMode,
+        currentModel: nextState.currentModel,
+        isArchived: nextState.isArchived,
+        pendingReviewFiles: nextState.pendingReviewFilesSummary,
+        pendingPromptsCount: nextState.pendingPromptsCount,
+        queuedPromptsCount: nextState.queuedPromptsCount,
+        todos: nextState.todosSummary,
+        hasSessionError: Boolean(nextState.sessionErrorRef),
+        hasPromptAdditions: Boolean(nextState.promptAdditionsRef),
+        currentPhase: nextState.currentPhase,
+        appStartTime: nextState.appStartTime,
+        scrollToTeammateTarget: nextState.scrollToTeammateTarget,
+        scrollToMessageTarget: nextState.scrollToMessageTarget,
+        sessionStatus: nextState.sessionStatus,
+        metadataTeammates: nextState.metadataTeammatesSummary,
+        additionalTeammates: nextState.additionalTeammatesSummary,
+        mergedTeammates: nextState.mergedTeammatesSummary,
+        updatedAt: nextState.updatedAt,
+      });
+    } else {
+      const reasons: string[] = [];
+      if (previous.messageRef !== nextState.messageRef) reasons.push(`messages-ref ${previous.messageCount}->${nextState.messageCount}`);
+      if (previous.tokenUsageRef !== nextState.tokenUsageRef) reasons.push(`tokenUsage ${previous.tokenUsageSummary}->${nextState.tokenUsageSummary}`);
+      if (previous.provider !== nextState.provider) reasons.push(`provider ${String(previous.provider)}->${String(nextState.provider)}`);
+      if (previous.isProcessing !== nextState.isProcessing) reasons.push(`isProcessing ${String(previous.isProcessing)}->${String(nextState.isProcessing)}`);
+      if (previous.hasPendingInteractivePrompt !== nextState.hasPendingInteractivePrompt) reasons.push(`pendingInteractivePrompt ${String(previous.hasPendingInteractivePrompt)}->${String(nextState.hasPendingInteractivePrompt)}`);
+      if (previous.aiMode !== nextState.aiMode) reasons.push(`aiMode ${String(previous.aiMode)}->${String(nextState.aiMode)}`);
+      if (previous.currentModel !== nextState.currentModel) reasons.push(`currentModel ${String(previous.currentModel)}->${String(nextState.currentModel)}`);
+      if (previous.isArchived !== nextState.isArchived) reasons.push(`isArchived ${String(previous.isArchived)}->${String(nextState.isArchived)}`);
+      if (previous.pendingReviewFilesRef !== nextState.pendingReviewFilesRef) reasons.push(`pendingReviewFiles ${previous.pendingReviewFilesSummary}->${nextState.pendingReviewFilesSummary}`);
+      if (previous.pendingPromptsCount !== nextState.pendingPromptsCount) reasons.push(`pendingPrompts ${previous.pendingPromptsCount}->${nextState.pendingPromptsCount}`);
+      if (previous.queuedPromptsCount !== nextState.queuedPromptsCount) reasons.push(`queuedPrompts ${previous.queuedPromptsCount}->${nextState.queuedPromptsCount}`);
+      if (previous.todosRef !== nextState.todosRef) reasons.push(`todos ${previous.todosSummary}->${nextState.todosSummary}`);
+      if (previous.sessionErrorRef !== nextState.sessionErrorRef) reasons.push(`sessionError ${String(Boolean(previous.sessionErrorRef))}->${String(Boolean(nextState.sessionErrorRef))}`);
+      if (previous.promptAdditionsRef !== nextState.promptAdditionsRef) reasons.push(`promptAdditions ${String(Boolean(previous.promptAdditionsRef))}->${String(Boolean(nextState.promptAdditionsRef))}`);
+      if (previous.currentPhase !== nextState.currentPhase) reasons.push(`currentPhase ${String(previous.currentPhase)}->${String(nextState.currentPhase)}`);
+      if (previous.appStartTime !== nextState.appStartTime) reasons.push(`appStartTime ${String(previous.appStartTime)}->${String(nextState.appStartTime)}`);
+      if (previous.scrollToTeammateTarget !== nextState.scrollToTeammateTarget) reasons.push(`scrollToTeammate ${String(previous.scrollToTeammateTarget)}->${String(nextState.scrollToTeammateTarget)}`);
+      if (previous.scrollToMessageTarget !== nextState.scrollToMessageTarget) reasons.push(`scrollToMessage ${String(previous.scrollToMessageTarget)}->${String(nextState.scrollToMessageTarget)}`);
+      if (previous.sessionStatus !== nextState.sessionStatus) reasons.push(`sessionStatus ${String(previous.sessionStatus)}->${String(nextState.sessionStatus)}`);
+      if (previous.metadataTeammatesRef !== nextState.metadataTeammatesRef) reasons.push(`metadata-teammates ${previous.metadataTeammatesSummary}->${nextState.metadataTeammatesSummary}`);
+      if (previous.additionalTeammatesRef !== nextState.additionalTeammatesRef) reasons.push(`additional-teammates ${previous.additionalTeammatesSummary}->${nextState.additionalTeammatesSummary}`);
+      if (previous.mergedTeammatesRef !== nextState.mergedTeammatesRef) reasons.push(`merged-teammates ${previous.mergedTeammatesSummary}->${nextState.mergedTeammatesSummary}`);
+      if (previous.updatedAt !== nextState.updatedAt) reasons.push(`updatedAt ${String(previous.updatedAt)}->${String(nextState.updatedAt)}`);
+      emitSessionRenderTrace('render', {
+        sessionId,
+        reasons,
+        messageCount: nextState.messageCount,
+        tokenUsage: nextState.tokenUsageSummary,
+        provider: nextState.provider,
+        isProcessing: nextState.isProcessing,
+        hasPendingInteractivePrompt: nextState.hasPendingInteractivePrompt,
+        aiMode: nextState.aiMode,
+        currentModel: nextState.currentModel,
+        isArchived: nextState.isArchived,
+        pendingReviewFiles: nextState.pendingReviewFilesSummary,
+        pendingPromptsCount: nextState.pendingPromptsCount,
+        queuedPromptsCount: nextState.queuedPromptsCount,
+        todos: nextState.todosSummary,
+        hasSessionError: Boolean(nextState.sessionErrorRef),
+        hasPromptAdditions: Boolean(nextState.promptAdditionsRef),
+        currentPhase: nextState.currentPhase,
+        appStartTime: nextState.appStartTime,
+        scrollToTeammateTarget: nextState.scrollToTeammateTarget,
+        scrollToMessageTarget: nextState.scrollToMessageTarget,
+        sessionStatus: nextState.sessionStatus,
+        metadataTeammates: nextState.metadataTeammatesSummary,
+        additionalTeammates: nextState.additionalTeammatesSummary,
+        mergedTeammates: nextState.mergedTeammatesSummary,
+        updatedAt: nextState.updatedAt,
+      });
+    }
+
+    previousRenderRef.current = nextState;
+  }, [
+    sessionId,
+    sessionData,
+    tokenUsage,
+    provider,
+    isProcessing,
+    hasPendingInteractivePrompt,
+    aiMode,
+    currentModel,
+    isArchived,
+    pendingReviewFiles,
+    pendingPrompts,
+    queuedPrompts,
+    todos,
+    sessionError,
+    promptAdditions,
+    currentPhase,
+    appStartTime,
+    scrollToTeammate,
+    scrollToMessage,
+    metadataTeammates,
+    additionalTeammates,
+    transcriptTeammates,
+  ]);
+
   // Loading state
   if (!sessionData) {
     return (
@@ -1583,22 +2328,40 @@ export const SessionTranscript = forwardRef<SessionTranscriptRef, SessionTranscr
     );
   }
 
-  const transcriptTeammates = [
-    ...(((sessionData.metadata?.currentTeammates as Array<{
-      agentId: string;
-      status: 'running' | 'completed' | 'errored' | 'idle';
-    }> | undefined) ?? [])),
-    ...(additionalTeammates ?? []),
-  ];
-
   return (
     <div
       style={{ display: 'flex', flexDirection: 'column', flex: 1, overflow: 'hidden', minHeight: 0 }}
       data-session-id={sessionId}
     >
-      {/* Main transcript area - hidden when collapsed */}
+      {/* NIM-852: install notice at the top of the transcript when the genuine
+          `claude` CLI isn't installed. Shown in every layout (outside the
+          collapse gate); the raw-terminal drawer below is replaced with the
+          panel variant. */}
+      {provider === 'claude-code-cli' && claudeCliInstalled === false && (
+        <ClaudeCliNotInstalledNotice variant="banner" />
+      )}
+
+      {/* Main transcript area - hidden when collapsed.
+          claude-code-cli (NIM-806, Phase 3 / B3): the rich transcript renders
+          HERE too — proxy-observed assistant turns + user prompts flow into
+          `sessionMessagesAtom` and durable-prompt widgets render inline (the
+          synthetic interactive-prompt rows project the same way the SDK path's
+          tool_use blocks do). The genuine TUI sits in the collapsible drawer
+          below. */}
       {!collapseTranscript && (
-        <div style={{ flex: 1, overflow: 'hidden', minHeight: 0 }}>
+        <div
+          style={{
+            flex: 1,
+            overflow: 'hidden',
+            // NIM-824: when the CLI drawer is expanded below, keep a usable
+            // transcript floor — the drawer's fixed-height band used to
+            // flex-starve the transcript to ~0px in small Split-mode layouts.
+            minHeight:
+              provider === 'claude-code-cli' && cliSessionCommitted && cliTerminalExpanded
+                ? 120
+                : 0,
+          }}
+        >
           <AgentTranscriptPanel
             ref={transcriptPanelRef}
             sessionId={sessionId}
@@ -1612,13 +2375,14 @@ export const SessionTranscript = forwardRef<SessionTranscriptRef, SessionTranscr
             showFloatingActions={mode === 'agent'}
             workspacePath={workspacePath}
             initialSettings={{
-              showToolCalls: true,
+              showToolCalls: chatShowToolCalls,
               compactMode: false,
               collapseTools: false,
               showThinking: true,
               showSessionInit: false
             }}
             renderEmptyExtra={renderEmptyExtra}
+            hideEmptyHelp={hideEmptyHelp}
             isArchived={isArchived}
             onCloseAndArchive={handleCloseAndArchive}
             onUnarchive={handleUnarchive}
@@ -1639,11 +2403,125 @@ export const SessionTranscript = forwardRef<SessionTranscriptRef, SessionTranscr
             currentTeammates={transcriptTeammates}
             waitingForNoun={waitingForNoun}
             appStartTime={appStartTime ?? undefined}
-            getToolCallDiffs={getToolCallDiffs}
+            renderEmbeddedFile={renderEmbeddedFile}
+            canEmbedFile={canEmbedFile}
             currentPhase={currentPhase}
             phaseColumns={SESSION_PHASE_COLUMNS}
             onSetPhase={handleSetPhase}
           />
+        </div>
+      )}
+
+      {/* claude-code-cli (NIM-806, Phase 3): collapsible "raw terminal" drawer
+          hosting the genuine interactive TUI. It stays mounted whether expanded
+          or collapsed (so the PTY survives a collapse) — only its height toggles.
+          Default expanded so the strip's IntersectionObserver fires and the CLI
+          spawns; TerminalPanel latches, so collapsing afterward keeps it alive.
+          The input box still routes keystrokes to this PTY.
+          Gated on cliSessionCommitted: a brand-new empty CLI session defers the
+          spawn (and keeps the model picker visible) until the user sends the
+          first prompt, so they can still switch provider beforehand.
+          NOT gated on collapseTranscript (NIM-824): Files layout mode collapses
+          the transcript but must keep the terminal reachable — previously the
+          whole drawer unmounted and there was no way to get to the TUI. */}
+      {provider === 'claude-code-cli' && cliSessionCommitted && claudeCliInstalled === false && (
+        // NIM-852: not installed — render the panel notice in place of the drawer
+        // so the terminal strip never mounts (no spawn / `command not found`).
+        <div
+          className="claude-cli-terminal-drawer claude-cli-terminal-drawer--not-installed"
+          style={{
+            display: 'flex',
+            flexDirection: 'column',
+            flex: '0 0 auto',
+            minHeight: 120,
+            borderTop: '1px solid var(--nim-border)',
+          }}
+        >
+          <ClaudeCliNotInstalledNotice variant="panel" />
+        </div>
+      )}
+      {provider === 'claude-code-cli' && cliSessionCommitted && claudeCliInstalled !== false && (
+        <div
+          ref={cliTerminalDrawerRef}
+          className="claude-cli-terminal-drawer"
+          style={{
+            position: 'relative',
+            display: 'flex',
+            flexDirection: 'column',
+            borderTop: '1px solid var(--nim-border)',
+            // Expanded: resizable, persisted px height — but shrinkable and
+            // capped (NIM-824) so a small session area can't be fully consumed
+            // by the drawer (it flex-starved the transcript to ~0px in Split
+            // mode). Collapsed: just the header bar.
+            flex: cliTerminalExpanded ? `0 1 ${cliTerminalHeight}px` : '0 0 auto',
+            maxHeight: cliTerminalExpanded ? `min(${cliTerminalHeight}px, 70%)` : undefined,
+            minHeight: 0,
+            overflow: 'hidden',
+          }}
+        >
+          {/* Vertical resize handle (NIM-812). Sits on the top border; drag up to
+              grow. Only interactive while expanded. */}
+          {cliTerminalExpanded && (
+            <div
+              className="claude-cli-terminal-drawer-resize-handle"
+              onMouseDown={handleCliTerminalResizeMouseDown}
+              style={{
+                position: 'absolute',
+                top: 0,
+                left: 0,
+                right: 0,
+                height: 4,
+                cursor: 'ns-resize',
+                zIndex: 10,
+                background: cliTerminalResizing ? 'var(--nim-primary)' : 'transparent',
+              }}
+            />
+          )}
+          <button
+            type="button"
+            className="claude-cli-terminal-drawer-toggle"
+            onClick={handleToggleCliTerminal}
+            style={{
+              display: 'flex',
+              alignItems: 'center',
+              gap: 6,
+              padding: '4px 8px',
+              background: 'var(--nim-bg-secondary)',
+              border: 'none',
+              borderBottom: cliTerminalExpanded ? '1px solid var(--nim-border)' : 'none',
+              color: 'var(--nim-text-muted)',
+              fontSize: 11,
+              cursor: 'pointer',
+              textAlign: 'left',
+              flex: '0 0 auto',
+            }}
+            title={cliTerminalExpanded ? 'Collapse raw terminal' : 'Expand raw terminal'}
+          >
+            <span style={{ transform: cliTerminalExpanded ? 'rotate(90deg)' : 'none', transition: 'transform 0.1s' }}>
+              ▶
+            </span>
+            <span>Raw terminal</span>
+          </button>
+          {/* Keep the strip mounted always (PTY lifecycle); hide only its body when
+              collapsed. The strip observes the always-on-screen drawer root
+              (cliTerminalDrawerRef), so the CLI still spawns while collapsed. */}
+          <div
+            style={{
+              flex: 1,
+              minHeight: 0,
+              overflow: 'hidden',
+              display: cliTerminalExpanded ? 'flex' : 'none',
+              flexDirection: 'column',
+            }}
+          >
+            <ClaudeCliTerminalStrip
+              sessionId={sessionId}
+              workspacePath={workspacePath}
+              model={currentModel ?? undefined}
+              focusNonce={cliTerminalFocusNonce}
+              observeRef={cliTerminalDrawerRef}
+            />
+          </div>
         </div>
       )}
 
@@ -1671,25 +2549,24 @@ export const SessionTranscript = forwardRef<SessionTranscriptRef, SessionTranscr
         queue={queuedPrompts}
         onCancel={handleCancelQueuedPrompt}
         onEdit={handleEditQueuedPrompt}
-        onSendNow={isLoading ? handleSendNowQueuedPrompt : undefined}
+        onSendNow={isLoading && !isClaudeCliTerminalSession(provider) ? handleSendNowQueuedPrompt : undefined}
       />
 
       {/* Note: All interactive prompts (ToolPermission, ExitPlanMode, AskUserQuestion) use inline widgets in transcript */}
 
-      {/* Input area */}
-      <AIInput
+      {/* Input area — wrapped so the draftInput subscription doesn't
+          re-render the entire SessionTranscript on every keystroke. */}
+      <SessionAIInput
         ref={inputRef}
         testId={mode === 'chat' ? 'files-mode-chat-input' : 'agent-mode-chat-input'}
-        value={draftInput}
-        onChange={handleInputChange}
         onSend={handleSend}
         onCancel={handleCancel}
         isLoading={isLoading}
         workspacePath={workspacePath}
         sessionId={sessionId}
-        attachments={enableAttachments ? draftAttachments : undefined}
-        onAttachmentAdd={enableAttachments ? handleAttachmentAdd : undefined}
-        onAttachmentRemove={enableAttachments ? handleAttachmentRemove : undefined}
+        enableAttachments={enableAttachments}
+        onAttachmentAdd={handleAttachmentAdd}
+        onAttachmentRemove={handleAttachmentRemove}
         enableSlashCommands={enableSlashCommands}
         onNavigateHistory={enableHistoryNavigation ? handleNavigateHistory : undefined}
         placeholder={
@@ -1699,21 +2576,34 @@ export const SessionTranscript = forwardRef<SessionTranscriptRef, SessionTranscr
               ? "Type your message... (Enter to send, Shift+Enter for new line, @ for files, @@ for sessions, / for commands)"
               : "Type your message... (Enter to send, Shift+Enter for new line, @ for files, @@ for sessions, / for commands)"
         }
-        mode={aiMode}
+        mode={aiMode as AIMode}
         onModeChange={handleAIModeChange}
         currentModel={currentModel}
+        // claude-code-cli (NIM-806): the genuine CLI supports `/model <alias>`
+        // as a direct setter, so the picker now RETUNES a committed CLI session
+        // (handleModelChange routes through `claude-cli:set-model` → PTY).
+        // Switching is idle-only: while a turn is running the picker goes
+        // read-only — injecting `/model` mid-turn would rely on the TUI's
+        // queued-input behavior, which is unverified under programmatic writes.
+        // Provider switching for a committed session stays blocked via
+        // sessionHasMessages. The effort selector is still hidden outright (the
+        // CLI has no effort flag). ModeTag is already gated to `claude-code` in
+        // AIInput.
         onModelChange={handleModelChange}
+        readOnlyModel={isClaudeCliTerminalSession(provider) && cliSessionCommitted && isLoading}
+        readOnlyModelTitle="Wait for the current turn to finish before switching models"
         sessionHasMessages={sessionHasMessages}
         currentProvider={provider ?? null}
         effortLevel={effortLevel}
         onEffortLevelChange={handleEffortLevelChange}
-        showEffortLevel={showEffortLevel}
+        showEffortLevel={isClaudeCliTerminalSession(provider) && cliSessionCommitted ? false : showEffortLevel}
         tokenUsage={tokenUsage}
         provider={provider}
         onQueue={handleQueue}
         queueCount={queuedPrompts.length}
         currentFilePath={currentFilePath}
         lastUserMessageTimestamp={lastUserMessageTimestamp}
+        onLaunchActionInNewSession={handleLaunchActionInNewSession}
       />
     </div>
   );

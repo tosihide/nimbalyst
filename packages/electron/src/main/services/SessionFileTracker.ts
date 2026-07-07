@@ -17,7 +17,9 @@ import { logger } from '../utils/logger';
 import { startFileWatcher } from '../file/FileWatcher';
 import { addGitignoreBypass } from '../file/WorkspaceEventBus';
 import { documentServices } from '../window/WindowManager';
+import { sessionEditQuota } from './SessionEditQuota';
 import { extractFilePath } from './ai/tools/extractFilePath';
+import { notifySessionFilesUpdated } from './sessionFilesNotify';
 
 /**
  * Extract file mentions from user messages
@@ -118,7 +120,21 @@ function extractEditMetadata(toolName: string, args: any, result: any, filePath?
       metadata.bashCommand = args.command.slice(0, 200); // Store first 200 chars
     }
   } else if (toolName === 'file_change') {
-    metadata.operation = 'edit';
+    // Honor the per-change `kind` field so new-file creations and deletes
+    // route to the correct renderer branch (NewFilePreview vs DiffViewer).
+    // Codex's FileChangeItem carries `changes: [{ path, kind: 'add'|'update'|'delete' }]`.
+    const changes = Array.isArray(args?.changes) ? args.changes : null;
+    const matchingChange = changes && filePath
+      ? changes.find((c: any) => c?.path === filePath) ?? changes[0]
+      : changes?.[0];
+    const kind = typeof matchingChange?.kind === 'string' ? matchingChange.kind : null;
+    if (kind === 'add' || kind === 'create' || kind === 'new') {
+      metadata.operation = 'create';
+    } else if (kind === 'delete') {
+      metadata.operation = 'delete';
+    } else {
+      metadata.operation = 'edit';
+    }
   }
 
   // Try to extract line counts from result
@@ -332,6 +348,13 @@ export class SessionFileTracker {
         }
       }
 
+      // Hard cap per session: once a session has touched 500 distinct files
+      // as `edited`, suppress further attribution. Read/referenced links are
+      // cheap and not part of the saturation problem, so they're not capped.
+      if (linkType === 'edited' && !(await sessionEditQuota.tryReserve(sessionId, filePath))) {
+        return;
+      }
+
       // Register gitignore bypass for edited files so watcher events fire
       if (linkType === 'edited') {
         addGitignoreBypass(workspaceId, filePath);
@@ -371,7 +394,7 @@ export class SessionFileTracker {
             console.error(`[SessionFileTracker] Failed to refresh metadata for ${filePath}:`, refreshError);
           }
         } else {
-          console.warn(`[SessionFileTracker] No document service found for workspace: ${workspaceId}`);
+          // console.warn(`[SessionFileTracker] No document service found for workspace: ${workspaceId}`);
         }
       } else if (linkType === 'read') {
         metadata = extractReadMetadata(toolName, args, result);
@@ -392,6 +415,13 @@ export class SessionFileTracker {
       if (linkType === 'edited') {
         const dedupeKey = this.makeEditDedupeKey(sessionId, filePath, toolUseId);
         this.recentEdits.set(dedupeKey, Date.now());
+
+        // NIM-816: invalidate the IPC cache and ping the renderer from the
+        // write boundary itself, so EVERY entrypoint that feeds the tracker
+        // (SDK streaming loop, CLI observation path) keeps the
+        // FilesEditedSidebar live. The CLI path has no streaming-handler
+        // broadcast of its own; without this its first edit never showed.
+        notifySessionFilesUpdated(sessionId);
       }
 
       logger.main.debug(`[SessionFileTracker] Tracked ${linkType} link: ${filePath}`);

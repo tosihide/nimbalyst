@@ -3,6 +3,7 @@
  * Main thread wrapper that communicates with PGLite running in a worker
  */
 
+import * as fs from 'fs';
 import { Worker } from 'worker_threads';
 import { app, dialog } from 'electron';
 import path from 'path';
@@ -10,13 +11,59 @@ import { getPackageRoot } from '../utils/appPaths';
 import { logger } from '../utils/logger';
 import { v4 as uuidv4 } from 'uuid';
 import { AnalyticsService } from '../services/analytics/AnalyticsService';
+import type { SQLiteDatabase } from './sqlite/SQLiteDatabase';
 import { DatabaseBackupService } from '../services/database/DatabaseBackupService';
+import { deserializeWorkerError } from './workerErrorSerialization';
 
 /**
  * Error that has already been shown to the user via a dialog.
  * Callers should skip redundant error UI when catching this.
  */
 export class HandledError extends Error {}
+
+/**
+ * Normalize a caller-supplied timeout to a sane bound for queryReadOnly.
+ * Floors at 1ms; defaults to 5000; ceiling is 30000 to prevent runaway
+ * extension queries from holding the worker indefinitely.
+ */
+export function clampReadOnlyTimeout(timeoutMs: number): number {
+  if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) return 5000;
+  return Math.min(Math.floor(timeoutMs), 30000);
+}
+
+/**
+ * Wrap a promise with a JS-level timeout. On timeout, rejects with a PG-shaped
+ * "canceling statement due to statement timeout" message so the error surface
+ * matches what callers will eventually see when this targets a backend that
+ * actually enforces statement_timeout. The wrapped promise is not cancellable;
+ * it continues running and its result is dropped.
+ */
+export function raceWithTimeout<T>(work: Promise<T>, timeoutMs: number): Promise<T> {
+  let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
+  const timeoutPromise = new Promise<never>((_, reject) => {
+    timeoutHandle = setTimeout(() => {
+      reject(new Error(`canceling statement due to statement timeout (${timeoutMs}ms)`));
+    }, timeoutMs);
+  });
+  return Promise.race([work, timeoutPromise]).finally(() => {
+    if (timeoutHandle) clearTimeout(timeoutHandle);
+  }) as Promise<T>;
+}
+
+/**
+ * Extended timeout for the worker `init` message. The init path runs
+ * PGLite WAL recovery after an unclean shutdown plus schema migration
+ * and, if corruption is detected, the auto-recovery flow. The default
+ * 30s sendMessage timeout was tripping on the first relaunch after a
+ * force-close on slower machines (see #238) even though the second
+ * relaunch consistently succeeded - the recovery had simply not
+ * finished within 30s. 120s covers the observed recovery window
+ * while still surfacing a genuinely-deadlocked init within 2 minutes
+ * rather than waiting forever.
+ *
+ * Exported so unit tests can pin the value if reasoning ever shifts.
+ */
+export const INIT_TIMEOUT_MS = 120_000;
 
 // Helper to categorize database errors
 function categorizeDBError(error: any): string {
@@ -240,14 +287,16 @@ export class PGLiteDatabaseWorker {
    */
   private async recreateWorkerAndReinit(): Promise<void> {
     this.createWorker();
-    await this.sendMessage('init');
+    // Use the same extended timeout as the cold-start path - recreate
+    // is invoked from the backup-restore recovery flow, where the just-
+    // restored DB also needs to replay WAL on first open. See #238.
+    await this.sendMessage('init', undefined, INIT_TIMEOUT_MS);
   }
 
   /**
    * Delete the database directory for a fresh start
    */
   private async deleteDatabaseDirectory(): Promise<void> {
-    const fs = await import('fs');
     const dataDir = path.join(app.getPath('userData'), 'pglite-db');
     if (fs.existsSync(dataDir)) {
       fs.rmSync(dataDir, { recursive: true, force: true });
@@ -331,7 +380,7 @@ export class PGLiteDatabaseWorker {
           }
           pending.resolve(response.data);
         } else {
-          pending.reject(new Error(response.error || 'Unknown error'));
+          pending.reject(deserializeWorkerError(response.errorData, response.error));
         }
       }
     });
@@ -368,8 +417,23 @@ export class PGLiteDatabaseWorker {
       // Create the worker
       this.createWorker();
 
-      // Initialize database in worker
-      const initResult = await this.sendMessage('init');
+      // Initialize database in worker.
+      //
+      // The init path is heavier than other ops: it may run PGLite's WAL
+      // recovery after an unclean shutdown, replay the schema migration
+      // path, and (if corruption is detected) run the auto-recovery flow
+      // below. With the default 30s sendMessage timeout, the FIRST relaunch
+      // after a force-close was hitting "Request init timed out" while the
+      // worker was still mid-recovery; a SECOND relaunch then succeeded
+      // because recovery had already completed in the background. See #238
+      // (shayliraz reported the exact two-relaunch pattern on Windows 11).
+      //
+      // 120s covers the recovery window we have signal for. If init is
+      // genuinely deadlocked (worker bug) we still surface the failure
+      // within 2 minutes rather than waiting forever; the user-facing
+      // modal copy then matches reality. The constant lives at module
+      // scope so it can be referenced from `recreateWorkerAndReinit` too.
+      const initResult = await this.sendMessage('init', undefined, INIT_TIMEOUT_MS);
 
       // Check if database was recovered from corruption
       if (initResult.recovered) {
@@ -512,6 +576,75 @@ export class PGLiteDatabaseWorker {
     } catch (error: any) {
       logger.main.error('[PGLite Worker] Failed to initialize:', error);
       this.initPromise = null;
+
+      // Check for the AMBIGUOUS branch FIRST (its error message also contains
+      // the string "DATABASE_LOCKED" so the simpler check below would match
+      // it otherwise). The ambiguous branch fires when worker.js could not
+      // signal the lock holder via `kill(0)` (EPERM) AND the lock timestamp
+      // is fresh enough that we cannot rule out a real sibling instance.
+      // Per @ghinkle's review on the closed PR #316: ask the user instead of
+      // guessing. See #272 for the original Windows-pid-reuse hazard.
+      if (error?.code === 'DATABASE_LOCKED_AMBIGUOUS') {
+        if (process.env.PLAYWRIGHT === '1') {
+          // Tests should never hit this; if they do, surface the ambiguity
+          // rather than silently force-unlocking which could mask a real
+          // dual-instance race in test setup.
+          console.error('FATAL: Ambiguous database-lock state in Playwright. Refusing to force-unlock.');
+          process.exit(1);
+        }
+        const lockPid = (error as any).lockPid;
+        const lockTimestamp = (error as any).lockTimestamp;
+        const lockHostname = (error as any).lockHostname;
+        const lockFilePath = (error as any).lockFilePath as string | undefined;
+        const response = await dialog.showMessageBox({
+          type: 'question',
+          title: 'Nimbalyst - Database Locked (Ambiguous)',
+          message: 'Cannot tell whether another Nimbalyst is already running.',
+          detail:
+            `Nimbalyst found a database lock from a few seconds ago and cannot confirm whether ` +
+            `the process holding it (PID ${lockPid}, host ${lockHostname}, acquired ${lockTimestamp}) ` +
+            `is still alive. Two scenarios are equally likely:\n\n` +
+            `  1. Another Nimbalyst window is open under a different user account or privilege level. ` +
+            `Opening anyway will run two instances against the same database and may corrupt data.\n\n` +
+            `  2. A previous Nimbalyst crashed less than a minute ago and the OS has already reused ` +
+            `the original PID for a system process. In this case the lock is safe to clear.\n\n` +
+            `If unsure, choose Cancel and look for another Nimbalyst window before retrying.`,
+          buttons: ['Cancel', 'Open Anyway (clear lock)'],
+          defaultId: 0,
+          cancelId: 0,
+        }).catch(() => ({ response: 0 } as Electron.MessageBoxReturnValue));
+
+        if (response.response === 1 && lockFilePath) {
+          this.analytics.sendEvent('database_lock_ambiguous_force_unlock', { lockPid });
+          try {
+            fs.unlinkSync(lockFilePath);
+            logger.main.info(`[PGLite Worker] User chose to force-unlock; removed ${lockFilePath}. Retrying init.`);
+            // Recreate worker + retry init. INIT_TIMEOUT_MS covers the
+            // post-force-unlock recovery path (#238 lesson).
+            await this.recreateWorkerAndReinit();
+            this.initialized = true;
+            return;
+          } catch (unlockErr) {
+            logger.main.error('[PGLite Worker] Force-unlock failed:', unlockErr);
+            this.showErrorAndQuit(
+              'Database Locked',
+              'Could not clear the database lock.',
+              `Removing the lock file failed: ${this.formatError(unlockErr)}\n\n` +
+              `If another Nimbalyst window is open, close it manually before retrying.`
+            );
+            throw new HandledError('DATABASE_LOCKED_AMBIGUOUS_UNLOCK_FAILED');
+          }
+        }
+
+        // User cancelled - quit cleanly without removing the lock.
+        this.analytics.sendEvent('database_lock_ambiguous_cancel', { lockPid });
+        this.showErrorAndQuit(
+          'Database Locked',
+          'Nimbalyst cannot start while the database lock state is uncertain.',
+          'Close any other Nimbalyst windows you have open and try again. If you are sure no other Nimbalyst is running, restart this machine to clear any stale system locks.'
+        );
+        throw new HandledError('DATABASE_LOCKED_AMBIGUOUS');
+      }
 
       // Check for database locked error (another instance running)
       if (error?.message?.includes('DATABASE_LOCKED') || error?.message?.includes('locked by another process')) {
@@ -674,6 +807,7 @@ export class PGLiteDatabaseWorker {
     }
     const startTime = performance.now();
     const tableName = this.extractTableName(sql);
+    const operation = this.classifySqlOperation(sql);
     try {
       const result = await this.sendMessage('query', { sql, params });
       const duration = performance.now() - startTime;
@@ -681,7 +815,7 @@ export class PGLiteDatabaseWorker {
       this.lastExecMs = undefined;
 
       // Record stats with worker execution time for blocked calculation
-      this.stats.record(tableName, 'read', duration, execMs);
+      this.stats.record(tableName, operation, duration, execMs);
 
       // Log slow queries
       if (duration >= PGLiteDatabaseWorker.SLOW_QUERY_THRESHOLD_MS) {
@@ -698,10 +832,10 @@ export class PGLiteDatabaseWorker {
       const execMs = this.lastExecMs;
       this.lastExecMs = undefined;
       // Record stats even for failures
-      this.stats.record(tableName, 'read', duration, execMs);
+      this.stats.record(tableName, operation, duration, execMs);
       // Track database error
       this.analytics.sendEvent('database_error', {
-        operation: 'read',
+        operation,
         errorType: categorizeDBError(error),
         tableName
       });
@@ -709,6 +843,62 @@ export class PGLiteDatabaseWorker {
       if (duration >= PGLiteDatabaseWorker.SLOW_QUERY_THRESHOLD_MS) {
         logger.main.warn(`[PGLite] Slow query failed (${duration.toFixed(0)}ms): table=${tableName}`);
       }
+      throw error;
+    }
+  }
+
+  /**
+   * Run a read-only query inside a `READ ONLY` transaction with a bounded
+   * statement_timeout. PG planner rejects DML/DDL inside a read-only txn;
+   * `statement_timeout` is applied via `SET LOCAL` so it reverts at COMMIT
+   * and never pollutes subsequent queries on the same PGLite session.
+   *
+   * Note on timeouts: `statement_timeout` is a no-op in PGLite today (single-
+   * thread WASM, no signal-based cancel) -- the SET is still issued so that
+   * when this code path eventually targets native SQLite/Postgres the limit
+   * works, but for now the caller-visible bound is enforced by a JS-level
+   * Promise.race in this wrapper. The actual query keeps running on the
+   * worker until PGLite finishes it; the worker is briefly hogged but other
+   * callers' messages queue normally.
+   *
+   * Used by the extension `host.data.query` IPC to expose raw SELECT access
+   * to built-in extensions without giving them write capability.
+   *
+   * @param sql - User-supplied SQL (single statement or CTE)
+   * @param params - Parameterized values
+   * @param timeoutMs - Per-query timeout in ms (default 5000, capped at 30000 in worker)
+   */
+  async queryReadOnly<T = any>(
+    sql: string,
+    params?: any[],
+    timeoutMs: number = 5000
+  ): Promise<{ rows: T[] }> {
+    if (!this.initialized) {
+      throw new Error('Database not initialized. Call initialize() first.');
+    }
+    const startTime = performance.now();
+    const tableName = this.extractTableName(sql);
+    const effectiveTimeout = clampReadOnlyTimeout(timeoutMs);
+
+    try {
+      const result = await raceWithTimeout(
+        this.sendMessage('queryReadOnly', { sql, params, timeoutMs: effectiveTimeout }),
+        effectiveTimeout
+      ) as { rows: T[] };
+      const duration = performance.now() - startTime;
+      const execMs = this.lastExecMs;
+      this.lastExecMs = undefined;
+      this.stats.record(tableName, 'read', duration, execMs);
+      if (duration >= PGLiteDatabaseWorker.SLOW_QUERY_THRESHOLD_MS) {
+        const truncatedSql = sql.length > 200 ? sql.substring(0, 400) + '...' : sql;
+        logger.main.warn(`[PGLite] Slow extension queryReadOnly (${duration.toFixed(0)}ms): table=${tableName}, sql="${truncatedSql}"`);
+      }
+      return result;
+    } catch (error) {
+      const duration = performance.now() - startTime;
+      const execMs = this.lastExecMs;
+      this.lastExecMs = undefined;
+      this.stats.record(tableName, 'read', duration, execMs);
       throw error;
     }
   }
@@ -780,6 +970,18 @@ export class PGLiteDatabaseWorker {
       if (match) return match[1];
     }
     return 'unknown';
+  }
+
+  /**
+   * Classify SQL as a read or write for stats reporting.
+   * Parameterized DML goes through query(), so infer from the leading verb.
+   */
+  private classifySqlOperation(sql: string): 'read' | 'write' {
+    const normalized = sql.replace(/^\s+/, '');
+    if (/^(INSERT|UPDATE|DELETE|ALTER|CREATE|DROP|TRUNCATE|BEGIN|COMMIT|ROLLBACK)\b/i.test(normalized)) {
+      return 'write';
+    }
+    return 'read';
   }
 
   /**
@@ -948,5 +1150,140 @@ export class PGLiteDatabaseWorker {
   }
 }
 
-// Export singleton instance
-export const database = new PGLiteDatabaseWorker();
+export type DatabaseEngine = 'pglite' | 'sqlite';
+
+export interface AppDatabaseBackupService {
+  createBackup(): Promise<{ success: boolean; error?: string }>;
+  getBackupStatus?(): unknown;
+  cleanupOldCorruptedBackups?(): Promise<void>;
+}
+
+export interface AppDatabase {
+  initialize(): Promise<void>;
+  isInitialized(): boolean;
+  query<T = any>(sql: string, params?: any[]): Promise<{ rows: T[] }>;
+  queryReadOnly<T = any>(sql: string, params?: any[], timeoutMs?: number): Promise<{ rows: T[] }>;
+  exec(sql: string, timeoutMs?: number): Promise<void>;
+  close(): Promise<void>;
+  getStats(): Promise<any>;
+  getDB(): any;
+  verifyBackup(backupPath: string): Promise<{
+    valid: boolean;
+    error?: string;
+    hasData?: boolean;
+    sessionCount?: number;
+    historyCount?: number;
+  }>;
+  setBackupService(backupService: AppDatabaseBackupService): void;
+  createBackup(): Promise<{ success: boolean; error?: string }>;
+  getBackupService(): AppDatabaseBackupService | null;
+  showRecoveryDialog?(): Promise<void>;
+}
+
+class ActiveDatabaseFacade implements AppDatabase {
+  private active: AppDatabase;
+  private engine: DatabaseEngine;
+
+  constructor(initial: AppDatabase, engine: DatabaseEngine) {
+    this.active = initial;
+    this.engine = engine;
+  }
+
+  useDatabase(databaseImpl: AppDatabase, engine: DatabaseEngine): void {
+    this.active = databaseImpl;
+    this.engine = engine;
+  }
+
+  getEngine(): DatabaseEngine {
+    return this.engine;
+  }
+
+  getActiveDatabase(): AppDatabase {
+    return this.active;
+  }
+
+  /**
+   * Returns the active SQLite backend when SQLite is the live engine.
+   *
+   * In production this is now a `SQLiteDatabaseProxy` (worker-hosted) rather
+   * than an in-process `SQLiteDatabase`. The two share the same public shape
+   * for `query/exec/queryReadOnly/getStats/...`, but proxy-only methods
+   * (`pragmaRead`, `dashboardTableStats`, `getSlowQueries`, `getPerformance`,
+   * `walCheckpoint`) only exist on the proxy. Callers that need those should
+   * accept the proxy type directly. The return type is loosely typed as the
+   * SQLiteDatabase interface so existing call sites keep compiling; the
+   * dashboard / performance handlers cast to the proxy.
+   */
+  getActiveSQLiteDatabase(): SQLiteDatabase | null {
+    return this.engine === 'sqlite' ? (this.active as unknown as SQLiteDatabase) : null;
+  }
+
+  initialize(): Promise<void> {
+    return this.active.initialize();
+  }
+
+  isInitialized(): boolean {
+    return this.active.isInitialized();
+  }
+
+  query<T = any>(sql: string, params?: any[]): Promise<{ rows: T[] }> {
+    return this.active.query<T>(sql, params);
+  }
+
+  queryReadOnly<T = any>(sql: string, params?: any[], timeoutMs?: number): Promise<{ rows: T[] }> {
+    return this.active.queryReadOnly<T>(sql, params, timeoutMs);
+  }
+
+  exec(sql: string, timeoutMs?: number): Promise<void> {
+    return this.active.exec(sql, timeoutMs);
+  }
+
+  close(): Promise<void> {
+    return this.active.close();
+  }
+
+  getStats(): Promise<any> {
+    return this.active.getStats();
+  }
+
+  getDB(): any {
+    return this.active.getDB();
+  }
+
+  verifyBackup(backupPath: string): Promise<{
+    valid: boolean;
+    error?: string;
+    hasData?: boolean;
+    sessionCount?: number;
+    historyCount?: number;
+  }> {
+    return this.active.verifyBackup(backupPath);
+  }
+
+  setBackupService(backupService: AppDatabaseBackupService): void {
+    this.active.setBackupService(backupService);
+  }
+
+  createBackup(): Promise<{ success: boolean; error?: string }> {
+    return this.active.createBackup();
+  }
+
+  getBackupService(): AppDatabaseBackupService | null {
+    return this.active.getBackupService();
+  }
+
+  async showRecoveryDialog(): Promise<void> {
+    if (typeof this.active.showRecoveryDialog === 'function') {
+      await this.active.showRecoveryDialog();
+    }
+  }
+}
+
+// Legacy worker remains available for migration / rollback flows even when the
+// active app backend has been switched to SQLite.
+export const legacyPgliteDatabase = new PGLiteDatabaseWorker();
+
+// Export singleton facade instance under the historical import path so the
+// rest of the main process can route through the selected backend without a
+// large import rewrite.
+export const database = new ActiveDatabaseFacade(legacyPgliteDatabase, 'pglite');

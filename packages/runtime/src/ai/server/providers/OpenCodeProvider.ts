@@ -28,6 +28,7 @@ import {
 } from '../types';
 import { OpenCodeSDKProtocol } from '../protocols/OpenCodeSDKProtocol';
 import { McpConfigService } from '../services/McpConfigService';
+import { getMcpConfigService, isInternalMcpServerEnabled } from '../services/mcpServerConfig';
 import { MCPServerConfig } from '../../../types/MCPServerConfig';
 import { safeJSONSerialize } from '../../../utils/serialization';
 import { AgentProtocolTranscriptAdapter } from './agentProtocol/AgentProtocolTranscriptAdapter';
@@ -76,12 +77,8 @@ export class OpenCodeProvider extends BaseAgentProvider {
     isResumedSession: boolean;
   } | null = null;
 
-  // Shared MCP server ports (injected from electron main process)
-  private static mcpServerPort: number | null = null;
-  private static sessionNamingServerPort: number | null = null;
-  private static extensionDevServerPort: number | null = null;
-  private static superLoopProgressServerPort: number | null = null;
-  private static sessionContextServerPort: number | null = null;
+  // Internal MCP-server enablement (ports, kill-switches, extension/tracker
+  // loaders, auth token) lives in the shared `mcpServerConfig` registry now.
 
   // MCP config loader (injected from electron main process)
   private static mcpConfigLoader: ((workspacePath?: string) => Promise<Record<string, MCPServerConfig>>) | null = null;
@@ -103,15 +100,9 @@ export class OpenCodeProvider extends BaseAgentProvider {
     // Initialize protocol (or use injected for testing)
     this.protocol = deps?.protocol || new OpenCodeSDKProtocol();
 
-    // Initialize MCP config service
-    this.mcpConfigService = new McpConfigService({
-      mcpServerPort: OpenCodeProvider.mcpServerPort,
-      sessionNamingServerPort: OpenCodeProvider.sessionNamingServerPort,
-      extensionDevServerPort: OpenCodeProvider.extensionDevServerPort,
-      superLoopProgressServerPort: OpenCodeProvider.superLoopProgressServerPort,
-      sessionContextServerPort: OpenCodeProvider.sessionContextServerPort,
+    // Initialize MCP config service from the shared registry + provider loaders.
+    this.mcpConfigService = getMcpConfigService({
       mcpConfigLoader: OpenCodeProvider.mcpConfigLoader,
-      extensionPluginsLoader: null,
       claudeSettingsEnvLoader: null,
       shellEnvironmentLoader: OpenCodeProvider.shellEnvironmentLoader,
     });
@@ -125,27 +116,9 @@ export class OpenCodeProvider extends BaseAgentProvider {
     return 'opencode';
   }
 
-  // Static injection setters (called from electron main process at startup)
-  public static setMcpServerPort(port: number | null): void {
-    OpenCodeProvider.mcpServerPort = port;
-  }
-
-  public static setSessionNamingServerPort(port: number | null): void {
-    OpenCodeProvider.sessionNamingServerPort = port;
-  }
-
-  public static setExtensionDevServerPort(port: number | null): void {
-    OpenCodeProvider.extensionDevServerPort = port;
-  }
-
-  public static setSuperLoopProgressServerPort(port: number | null): void {
-    OpenCodeProvider.superLoopProgressServerPort = port;
-  }
-
-  public static setSessionContextServerPort(port: number | null): void {
-    OpenCodeProvider.sessionContextServerPort = port;
-  }
-
+  // Static injection setters (called from electron main process at startup).
+  // Internal MCP-server ports / kill-switches / loaders / auth token are
+  // configured once via `configureMcpServers` (shared registry).
   public static setMcpConfigLoader(loader: ((workspacePath?: string) => Promise<Record<string, MCPServerConfig>>) | null): void {
     OpenCodeProvider.mcpConfigLoader = loader;
   }
@@ -212,7 +185,19 @@ export class OpenCodeProvider extends BaseAgentProvider {
     }));
 
     const config = await OpenCodeProvider.configLoader?.().catch(() => null);
-    if (!config?.provider) {
+    if (!config) {
+      // No file found or unreadable. Surface this in the log so the user can
+      // tell the difference between "I have no providers configured" and
+      // "Nimbalyst can't find the file you wrote". See #284.
+      if (OpenCodeProvider.configLoader) {
+        // eslint-disable-next-line no-console -- runtime package logger is renderer-only
+        console.warn(
+          '[OpenCode] configLoader returned null. opencode.json was not found or could not be parsed. Configured providers will not appear in the model picker.'
+        );
+      }
+      return presets;
+    }
+    if (!config.provider) {
       return presets;
     }
 
@@ -267,7 +252,7 @@ export class OpenCodeProvider extends BaseAgentProvider {
    */
   protected buildSystemPrompt(_documentContext?: DocumentContext): string {
     return buildClaudeCodeSystemPrompt({
-      hasSessionNaming: !!OpenCodeProvider.sessionNamingServerPort,
+      hasSessionNaming: isInternalMcpServerEnabled(),
       toolReferenceStyle: 'opencode' as any,
     });
   }

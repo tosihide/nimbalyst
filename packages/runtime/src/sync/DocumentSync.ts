@@ -32,6 +32,8 @@ import type {
   DocAwarenessBroadcastMessage,
   DocUpdateAckMessage,
 } from './documentSyncTypes';
+import { appendSyncClientParams } from './syncClientInfo';
+import { encodeDocumentRoomId, isValidCollabDocumentId } from './collabDocumentId';
 
 // ============================================================================
 // Base64 / Encryption Utilities
@@ -112,6 +114,30 @@ const AWARENESS_THROTTLE_MS = 500;
 const AWARENESS_STALE_TIMEOUT_MS = 30_000;
 
 /**
+ * Compaction thresholds.
+ *
+ * The server stores every encrypted Yjs update forever unless a client sends
+ * `docCompact`. Without compaction, initial sync downloads the full update
+ * history every time, so heavy docs (and any non-markdown collab doc that
+ * generates many small ops, e.g. Excalidraw drags) become slow to open.
+ *
+ * Triggers (whichever fires first while we are the elector):
+ *   1. >= COMPACTION_UPDATE_THRESHOLD updates since last snapshot
+ *   2. >= COMPACTION_TIME_MIN_UPDATES updates AND
+ *      >= COMPACTION_TIME_THRESHOLD_MS since last attempt
+ *
+ * Election: lowest userId (string compare) among the local user and all remote
+ * users we currently see in awareness. If a remote client hasn't broadcast
+ * awareness yet, we may briefly think we are elector when we aren't -- the
+ * server accepts the second snapshot harmlessly (older snapshot row is
+ * dropped by `DELETE FROM snapshots WHERE replaces_up_to < ?`).
+ */
+const COMPACTION_UPDATE_THRESHOLD = 200;
+const COMPACTION_TIME_THRESHOLD_MS = 5 * 60 * 1000;
+const COMPACTION_TIME_MIN_UPDATES = 20;
+const COMPACTION_CHECK_INTERVAL_MS = 60 * 1000;
+
+/**
  * A buffered remote update: the raw Yjs update bytes plus metadata.
  * Used by the review gate to track which remote changes are unreviewed.
  */
@@ -133,6 +159,10 @@ export class DocumentSyncProvider {
   private status: DocumentSyncStatus = 'disconnected';
   private lastSeq = 0;
   private synced = false;
+  // Last-writer attribution from the server (who/when last edited the content).
+  // Populated from docSyncResponse; used by the overwrite confirm before a push.
+  private lastWriterUserId: string | null = null;
+  private lastUpdatedAt: number | null = null;
   private updateObserverDispose: (() => void) | null = null;
   private awarenessStates: Map<string, AwarenessState> = new Map();
   private awarenessTimestamps: Map<string, number> = new Map();
@@ -159,15 +189,33 @@ export class DocumentSyncProvider {
   private reconnectAttempt = 0;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private suppressReconnect = false;
+  /**
+   * NIM-949: set when the server rejected the ws upgrade with an auth-style
+   * status (proxy forwards a close reason of `auth-rejected:<status>`). The next
+   * connect() then requests a freshly-exchanged JWT instead of replaying the
+   * cached (wrong-org / expired) token that just got rejected.
+   */
+  private forceJwtRefreshNextConnect = false;
   private queuedPendingUpdate: Uint8Array | null = null;
   private inflightPendingUpdate: Uint8Array | null = null;
   private pendingPersistTimer: ReturnType<typeof setTimeout> | null = null;
   private replayAckTimer: ReturnType<typeof setTimeout> | null = null;
   private replayingClientUpdateId: string | null = null;
   private surfaceReplayStatus = false;
+  private pendingWriteWaiters: Set<() => void> = new Set();
   private static readonly RECONNECT_BASE_MS = 1000;
   private static readonly RECONNECT_MAX_MS = 30_000;
   private static readonly REPLAY_ACK_TIMEOUT_MS = 10_000;
+
+  // Compaction state
+  /**
+   * Server sequence covered by the latest snapshot we know about. Updated
+   * when (a) we apply a server snapshot during sync, and (b) we send our
+   * own `docCompact`. Used to compute how many updates have accumulated.
+   */
+  private lastSnapshotSeq = 0;
+  private lastCompactionAttemptAt = 0;
+  private compactionTimer: ReturnType<typeof setInterval> | null = null;
 
   constructor(config: DocumentSyncConfig) {
     this.config = config;
@@ -208,15 +256,28 @@ export class DocumentSyncProvider {
     this.setStatus('connecting');
 
     const { serverUrl, orgId, documentId } = this.config;
-    const roomId = `org:${orgId}:doc:${documentId}`;
+
+    // The documentId goes into the URL path. UUID/hex ids are already URL-safe;
+    // legacy filename-shaped ids (spaces, '%', '.') are not, so we URL-encode
+    // the segment -- the server decodes it back before addressing the DO. Warn
+    // once so legacy ids stay visible without blocking the connection.
+    if (!isValidCollabDocumentId(documentId)) {
+      console.warn(
+        `[DocumentSync] documentId ${JSON.stringify(documentId)} is not a plain ` +
+          'URL-safe id (likely a legacy filename); connecting with it URL-encoded.'
+      );
+    }
+    const roomId = encodeDocumentRoomId(orgId, documentId);
 
     let url: string;
     try {
       if (this.config.buildUrl) {
         url = this.config.buildUrl(roomId);
       } else {
-        const jwt = await this.config.getJwt();
-        url = `${serverUrl}/sync/${roomId}?token=${encodeURIComponent(jwt)}`;
+        const forceRefresh = this.forceJwtRefreshNextConnect;
+        this.forceJwtRefreshNextConnect = false;
+        const jwt = await this.config.getJwt(forceRefresh ? { forceRefresh: true } : undefined);
+        url = appendSyncClientParams(`${serverUrl}/sync/${roomId}?token=${encodeURIComponent(jwt)}`);
       }
     } catch (err) {
       console.error('[DocumentSync] Failed to build URL:', err);
@@ -239,6 +300,7 @@ export class DocumentSyncProvider {
     this.connecting = false;
 
     ws.addEventListener('open', () => {
+      if (this.ws !== ws) return;
       console.log('[DocumentSync] WebSocket open');
       this.suppressReconnect = false;
       this.reconnectAttempt = 0;
@@ -248,15 +310,27 @@ export class DocumentSyncProvider {
     });
 
     ws.addEventListener('message', (event) => {
+      if (this.ws !== ws) return;
       this.handleMessage(event);
     });
 
     ws.addEventListener('close', (event) => {
+      // Stale close from a socket we already replaced (e.g. via reconnectNow)
+      // must not call handleDisconnect() -- that would null out `this.ws` and
+      // clobber the new socket.
+      if (this.ws !== ws) return;
       console.log('[DocumentSync] WebSocket closed, code:', event.code, 'reason:', event.reason);
+      // NIM-949: the proxy encodes an auth-style upgrade rejection as
+      // `auth-rejected:<status>`. Force a fresh JWT exchange on the next attempt
+      // so we don't re-present the same rejected (wrong-org / expired) token.
+      if (typeof event.reason === 'string' && event.reason.startsWith('auth-rejected')) {
+        this.forceJwtRefreshNextConnect = true;
+      }
       this.handleDisconnect();
     });
 
     ws.addEventListener('error', (event) => {
+      if (this.ws !== ws) return;
       console.error('[DocumentSync] WebSocket error:', event);
       this.handleDisconnect();
     });
@@ -273,6 +347,7 @@ export class DocumentSyncProvider {
     this.requeueInflightPendingUpdate();
     this.stopAwarenessCleanup();
     this.clearAwarenessThrottle();
+    this.stopCompactionTimer();
     if (this.ws) {
       this.ws.close();
       this.ws = null;
@@ -307,6 +382,20 @@ export class DocumentSyncProvider {
     return this.ydoc;
   }
 
+  /**
+   * The room-authed userId of whoever last applied a content update, or null if
+   * the doc has no updates yet / the server hasn't reported it. Populated from
+   * the server's docSyncResponse. Reflects the last *content* edit.
+   */
+  getLastWriterUserId(): string | null {
+    return this.lastWriterUserId;
+  }
+
+  /** When the last content update was applied (server clock, ms), or null. */
+  getLastUpdatedAt(): number | null {
+    return this.lastUpdatedAt;
+  }
+
   /** Check if connected and synced. */
   isConnected(): boolean {
     return this.status === 'connected';
@@ -328,11 +417,125 @@ export class DocumentSyncProvider {
   }
 
   /**
+   * Wait until all local writes have either been acknowledged or timed out.
+   * Returns false when the timeout elapses first.
+   */
+  async waitForPendingWrites(timeoutMs = 5_000): Promise<boolean> {
+    if (!this.hasUnsettledPendingWrites()) {
+      return true;
+    }
+
+    return new Promise<boolean>((resolve) => {
+      let settled = false;
+
+      const cleanup = () => {
+        this.pendingWriteWaiters.delete(waiter);
+        clearTimeout(timeout);
+      };
+
+      const waiter = () => {
+        if (settled || this.hasUnsettledPendingWrites()) return;
+        settled = true;
+        cleanup();
+        resolve(true);
+      };
+
+      const timeout = setTimeout(() => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        resolve(false);
+      }, timeoutMs);
+
+      this.pendingWriteWaiters.add(waiter);
+      waiter();
+    });
+  }
+
+  /**
    * Set room-level metadata on the server (e.g., custom TTL).
    * Only allowlisted keys are accepted server-side.
    */
   setRoomMetadata(entries: Record<string, string>): void {
     this.send({ type: 'docSetMetadata', entries });
+  }
+
+  /** Epic H2: true when the server holds the team DEK (no client crypto). */
+  private get serverManaged(): boolean {
+    return this.config.keyCustody === 'server-managed';
+  }
+
+  /**
+   * Ordered candidate keys for decrypting a legacy-e2e (non-empty-iv) row in
+   * server-managed mode. Tries the multi-epoch list first (NIM-959), then the
+   * singular legacy key, then the document key as a last resort. Duplicates are
+   * harmless (a wrong key just throws and we move on), so no dedup is needed.
+   */
+  private get legacyCandidateKeys(): CryptoKey[] {
+    const keys: CryptoKey[] = [];
+    if (this.config.legacyDocumentKeys) keys.push(...this.config.legacyDocumentKeys);
+    if (this.config.legacyDocumentKey) keys.push(this.config.legacyDocumentKey);
+    if (this.config.documentKey) keys.push(this.config.documentKey);
+    return keys;
+  }
+
+  /**
+   * Encrypt bytes for the wire. Legacy: AES-256-GCM with the document key.
+   * Server-managed: pass-through (base64 raw bytes, empty-string iv sentinel) —
+   * the server encrypts at rest with the team DEK.
+   */
+  private async encryptForWire(data: Uint8Array): Promise<{ encrypted: string; iv: string }> {
+    if (this.serverManaged) {
+      return { encrypted: uint8ArrayToBase64(data), iv: '' };
+    }
+    return encryptBinary(data, this.config.documentKey!);
+  }
+
+  /**
+   * Decrypt bytes from the wire.
+   *
+   * Server-managed mode is mixed during/after migration:
+   *   - Rows the server decrypted with the team DEK arrive as PLAINTEXT with an
+   *     empty-iv sentinel ('') -> just base64-decode.
+   *   - PRE-MIGRATION (legacy-e2e) rows are passed through UNCHANGED: AES
+   *     ciphertext with their original (non-empty) iv. These must be AES-
+   *     decrypted with the legacy org key, or they decode to garbage and Yjs
+   *     throws. We fall back to `legacyDocumentKey` (or `documentKey`) for them.
+   */
+  private async decryptFromWire(encrypted: string, iv: string): Promise<Uint8Array> {
+    if (this.serverManaged) {
+      // Empty iv sentinel => server already decrypted (plaintext passthrough).
+      if (!iv) {
+        return base64ToUint8Array(encrypted);
+      }
+      // Non-empty iv => legacy ciphertext that survived the migration. The row
+      // may have been written under any past org-key epoch (the team could have
+      // rotated while still legacy-e2e), so try EVERY candidate epoch in turn --
+      // current cached key, the singular legacy key, and all archived epochs --
+      // until one AES-decrypts. If none match, surface an error so the per-
+      // payload catch skips just this row rather than blanking the doc (NIM-959).
+      const legacyKeys = this.legacyCandidateKeys;
+      if (legacyKeys.length === 0) {
+        throw new Error('legacy-e2e row in server-managed doc but no legacy org key available');
+      }
+      let lastErr: unknown;
+      for (const key of legacyKeys) {
+        try {
+          return await decryptBinary(encrypted, iv, key);
+        } catch (err) {
+          lastErr = err;
+        }
+      }
+      throw lastErr instanceof Error
+        ? lastErr
+        : new Error('legacy-e2e row did not match any candidate org-key epoch');
+    }
+    return decryptBinary(encrypted, iv, this.config.documentKey!);
+  }
+
+  /** Org key fingerprint to attach to a write; null/undefined in server-managed. */
+  private get wireOrgKeyFingerprint(): string | undefined {
+    return this.serverManaged ? undefined : this.config.orgKeyFingerprint;
   }
 
   /**
@@ -343,7 +546,7 @@ export class DocumentSyncProvider {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
 
     const jsonBytes = new TextEncoder().encode(JSON.stringify(state));
-    const { encrypted, iv } = await encryptBinary(jsonBytes, this.config.documentKey);
+    const { encrypted, iv } = await this.encryptForWire(jsonBytes);
 
     this.send({
       type: 'docAwareness',
@@ -411,6 +614,23 @@ export class DocumentSyncProvider {
    */
   getAwarenessStates(): Map<string, AwarenessState> {
     return new Map(this.awarenessStates);
+  }
+
+  /**
+   * Force the provider to treat the current Y.Doc as local state that should
+   * be persisted upstream.
+   *
+   * Used by custom-editor collaboration bootstrap after a first-open seed from
+   * in-memory share payloads. This avoids depending on observer/replay timing
+   * when the seed happens after the initial empty sync completes.
+   */
+  async flushLocalState(): Promise<void> {
+    const update = Y.encodeStateAsUpdate(this.ydoc);
+    if (update.length <= 2) return;
+    this.enqueuePendingLocalUpdate(update);
+    if (this.ws && this.ws.readyState === WebSocket.OPEN && this.synced) {
+      await this.replayPendingUpdate();
+    }
   }
 
   // --------------------------------------------------------------------------
@@ -558,6 +778,12 @@ export class DocumentSyncProvider {
             senderUserId: msg.senderUserId,
           });
           break;
+        case 'docRoomMoved':
+          // Epic H3 P1: the room was relocated to another org. Stop (the old
+          // room is frozen) and let the host re-resolve + reconnect.
+          this.disconnect();
+          this.config.onRoomMoved?.({ destOrgId: msg.destOrgId });
+          break;
         case 'error':
           console.error('[DocumentSync] Server error:', msg.code, msg.message);
           break;
@@ -578,6 +804,15 @@ export class DocumentSyncProvider {
   }
 
   private async handleSyncResponse(msg: DocSyncResponseMessage): Promise<void> {
+    // Capture last-writer attribution (sent on every sync response; the value
+    // reflects the latest content update, so it's stable across pagination).
+    if (msg.lastWriterUserId !== undefined) {
+      this.lastWriterUserId = msg.lastWriterUserId;
+    }
+    if (msg.lastUpdatedAt !== undefined) {
+      this.lastUpdatedAt = msg.lastUpdatedAt;
+    }
+
     // Apply snapshot if present (covers the entire doc state up to replacesUpTo).
     // If the snapshot can't be decrypted (stale key epoch, corruption), skip it
     // and continue with the incremental updates -- a single broken payload
@@ -586,37 +821,35 @@ export class DocumentSyncProvider {
     // authoritative update up to the server.
     if (msg.snapshot) {
       try {
-        const stateBytes = await decryptBinary(
+        const stateBytes = await this.decryptFromWire(
           msg.snapshot.encryptedState,
           msg.snapshot.iv,
-          this.config.documentKey
         );
         Y.applyUpdate(this.ydoc, stateBytes, SNAPSHOT_ORIGIN);
       } catch (err) {
-        if (err instanceof DOMException && err.name === 'OperationError') {
-          console.warn('[DocumentSync] Skipping undecryptable snapshot (likely stale key epoch); sync will continue.');
-        } else {
-          throw err;
-        }
+        // Any per-payload failure -- stale key epoch (OperationError), an
+        // un-migrated legacy-e2e row with no legacy key, or corrupt bytes that
+        // make Y.applyUpdate throw (TypeError/RangeError) -- must skip only THIS
+        // payload, never abort the whole sync. One bad row must not blank the
+        // entire document body. See NIM-878.
+        console.warn('[DocumentSync] Skipping undecodable snapshot; sync will continue:', err instanceof Error ? err.message : err);
       }
       this.lastSeq = Math.max(this.lastSeq, msg.snapshot.replacesUpTo);
+      this.lastSnapshotSeq = Math.max(this.lastSnapshotSeq, msg.snapshot.replacesUpTo);
     }
 
     // Apply incremental updates, per-update tolerant of decryption failures.
     for (const update of msg.updates) {
       try {
-        const updateBytes = await decryptBinary(
+        const updateBytes = await this.decryptFromWire(
           update.encryptedUpdate,
           update.iv,
-          this.config.documentKey
         );
         Y.applyUpdate(this.ydoc, updateBytes, REMOTE_ORIGIN);
       } catch (err) {
-        if (err instanceof DOMException && err.name === 'OperationError') {
-          console.warn(`[DocumentSync] Skipping undecryptable update at seq ${update.sequence} (likely stale key epoch).`);
-        } else {
-          throw err;
-        }
+        // Skip only this update (stale key epoch, un-migrated legacy row, or
+        // corrupt bytes); never abort the whole sync. See NIM-878.
+        console.warn(`[DocumentSync] Skipping undecodable update at seq ${update.sequence}:`, err instanceof Error ? err.message : err);
       }
       this.lastSeq = Math.max(this.lastSeq, update.sequence);
     }
@@ -656,6 +889,8 @@ export class DocumentSyncProvider {
         // a previous connection failed before the update could be sent.
         await this.pushLocalState(msg);
       }
+
+      this.startCompactionTimer();
     }
 
   }
@@ -668,21 +903,19 @@ export class DocumentSyncProvider {
 
     let updateBytes: Uint8Array;
     try {
-      updateBytes = await decryptBinary(
+      updateBytes = await this.decryptFromWire(
         msg.encryptedUpdate,
         msg.iv,
-        this.config.documentKey
       );
+      Y.applyUpdate(this.ydoc, updateBytes, REMOTE_ORIGIN);
     } catch (err) {
-      if (err instanceof DOMException && err.name === 'OperationError') {
-        console.warn(`[DocumentSync] Skipping undecryptable broadcast at seq ${msg.sequence} (likely stale key epoch).`);
-        this.lastSeq = Math.max(this.lastSeq, msg.sequence);
-        return;
-      }
-      throw err;
+      // Skip only this broadcast (stale key epoch, un-migrated legacy row, or
+      // corrupt bytes that make Y.applyUpdate throw); never abort sync. The
+      // applyUpdate is INSIDE the try so garbage bytes can't escape. See NIM-878.
+      console.warn(`[DocumentSync] Skipping undecodable broadcast at seq ${msg.sequence}:`, err instanceof Error ? err.message : err);
+      this.lastSeq = Math.max(this.lastSeq, msg.sequence);
+      return;
     }
-
-    Y.applyUpdate(this.ydoc, updateBytes, REMOTE_ORIGIN);
     this.lastSeq = Math.max(this.lastSeq, msg.sequence);
 
     // Buffer the update for the review gate
@@ -705,10 +938,9 @@ export class DocumentSyncProvider {
     if (msg.fromUserId === this.config.userId) return;
 
     try {
-      const stateBytes = await decryptBinary(
+      const stateBytes = await this.decryptFromWire(
         msg.encryptedState,
         msg.iv,
-        this.config.documentKey
       );
       const state: AwarenessState = JSON.parse(
         new TextDecoder().decode(stateBytes)
@@ -836,10 +1068,7 @@ export class DocumentSyncProvider {
       this.inflightPendingUpdate = pendingUpdate;
       this.queuedPendingUpdate = null;
       this.surfaceReplayStatus = this.status !== 'connected';
-      const { encrypted, iv } = await encryptBinary(
-        pendingUpdate,
-        this.config.documentKey
-      );
+      const { encrypted, iv } = await this.encryptForWire(pendingUpdate);
       this.replayingClientUpdateId = clientUpdateId;
       if (this.surfaceReplayStatus) {
         this.setStatus('replaying');
@@ -859,7 +1088,7 @@ export class DocumentSyncProvider {
         encryptedUpdate: encrypted,
         iv,
         clientUpdateId,
-        orgKeyFingerprint: this.config.orgKeyFingerprint,
+        orgKeyFingerprint: this.wireOrgKeyFingerprint,
       });
       this.scheduleReplayAckTimeout(clientUpdateId);
     } catch (err) {
@@ -932,6 +1161,7 @@ export class DocumentSyncProvider {
     this.requeueInflightPendingUpdate();
     this.stopAwarenessCleanup();
     this.clearAwarenessThrottle();
+    this.stopCompactionTimer();
     // Clear awareness states on disconnect
     this.awarenessStates.clear();
     this.awarenessTimestamps.clear();
@@ -952,6 +1182,20 @@ export class DocumentSyncProvider {
     return !!(this.queuedPendingUpdate || this.inflightPendingUpdate);
   }
 
+  private hasUnsettledPendingWrites(): boolean {
+    return !!(
+      this.queuedPendingUpdate ||
+      this.inflightPendingUpdate ||
+      this.replayingClientUpdateId
+    );
+  }
+
+  private notifyPendingWriteWaiters(): void {
+    for (const waiter of Array.from(this.pendingWriteWaiters)) {
+      waiter();
+    }
+  }
+
   private getMergedPendingUpdate(): Uint8Array | null {
     if (this.queuedPendingUpdate && this.inflightPendingUpdate) {
       return Y.mergeUpdates([
@@ -966,6 +1210,7 @@ export class DocumentSyncProvider {
     this.clearReplayAckTimer();
     if (!this.inflightPendingUpdate) {
       this.surfaceReplayStatus = false;
+      this.notifyPendingWriteWaiters();
       return;
     }
     this.queuedPendingUpdate = this.queuedPendingUpdate
@@ -975,6 +1220,7 @@ export class DocumentSyncProvider {
     this.replayingClientUpdateId = null;
     this.surfaceReplayStatus = false;
     this.schedulePendingPersist();
+    this.notifyPendingWriteWaiters();
   }
 
   private finishReplayingPendingUpdate(): void {
@@ -983,6 +1229,7 @@ export class DocumentSyncProvider {
     this.replayingClientUpdateId = null;
     this.surfaceReplayStatus = false;
     this.schedulePendingPersist();
+    this.notifyPendingWriteWaiters();
     if (this.synced && this.queuedPendingUpdate) {
       void this.replayPendingUpdate();
       return;
@@ -1024,16 +1271,26 @@ export class DocumentSyncProvider {
   /**
    * Immediately reconnect, cancelling any pending backoff and resetting attempts.
    * Called externally when the network has been confirmed available (e.g. after
-   * the CollabV3 index has reached `synced`). Falls back to normal backoff on failure.
+   * the CollabV3 index has reached `synced`). This intentionally tears down any
+   * existing socket first: after sleep/wake a WebSocket can remain "open" while
+   * the underlying transport is dead, and a forced reconnect is cheaper than
+   * waiting for that zombie socket to notice.
+   *
+   * Falls back to normal backoff on failure.
    */
   reconnectNow(): void {
     if (this.destroyed) return;
-    if (this.ws && this.synced) return; // already connected and caught up
+
+    // A previous reconnectNow() already started a fresh handshake that hasn't
+    // resolved yet. Don't tear it down -- post-wake the broker fires several
+    // network-available events in a ~20s burst and we'd otherwise churn through
+    // half-finished sockets.
+    if (this.ws && this.ws.readyState === WebSocket.CONNECTING) return;
 
     this.cancelReconnect();
     this.reconnectAttempt = 0;
 
-    // Tear down any half-open WS so connect() creates a fresh one.
+    // Tear down any existing WS so connect() creates a fresh one.
     if (this.ws) {
       try {
         this.ws.close();
@@ -1135,6 +1392,94 @@ export class DocumentSyncProvider {
 
   private notifyReviewStateChange(): void {
     this.config.onReviewStateChange?.(this.getReviewGateState());
+  }
+
+  // --------------------------------------------------------------------------
+  // Compaction
+  // --------------------------------------------------------------------------
+
+  private startCompactionTimer(): void {
+    if (this.compactionTimer) return;
+    // First eligibility window doesn't fire immediately -- give awareness from
+    // other clients time to flow so the election picks a stable elector.
+    this.lastCompactionAttemptAt = Date.now();
+    this.compactionTimer = setInterval(() => {
+      void this.maybeCompact();
+    }, COMPACTION_CHECK_INTERVAL_MS);
+  }
+
+  private stopCompactionTimer(): void {
+    if (this.compactionTimer) {
+      clearInterval(this.compactionTimer);
+      this.compactionTimer = null;
+    }
+  }
+
+  /**
+   * Lowest userId wins. Awareness misses (a connected user who hasn't sent
+   * awareness yet) can briefly cause both candidates to elect themselves;
+   * the server tolerates duplicate snapshots (older row is dropped by
+   * `DELETE FROM snapshots WHERE replaces_up_to < ?`).
+   */
+  private amCompactionElector(): boolean {
+    let lowest = this.config.userId;
+    for (const remoteUserId of this.awarenessStates.keys()) {
+      if (remoteUserId < lowest) lowest = remoteUserId;
+    }
+    return lowest === this.config.userId;
+  }
+
+  private async maybeCompact(): Promise<void> {
+    if (this.destroyed) return;
+    if (!this.synced) return;
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+    // Skip while we have unacked local writes -- otherwise the snapshot would
+    // include local state beyond `replacesUpTo`, and that state would also
+    // appear in the subsequent update once acked, doubling the payload (benign
+    // for CRDTs but wasteful).
+    if (this.queuedPendingUpdate || this.inflightPendingUpdate) return;
+    if (this.replayingClientUpdateId) return;
+
+    const updatesSinceSnapshot = this.lastSeq - this.lastSnapshotSeq;
+    if (updatesSinceSnapshot <= 0) return;
+
+    const now = Date.now();
+    const timeSinceLastAttempt = now - this.lastCompactionAttemptAt;
+    const updateThresholdReached =
+      updatesSinceSnapshot >= COMPACTION_UPDATE_THRESHOLD;
+    const timeThresholdReached =
+      updatesSinceSnapshot >= COMPACTION_TIME_MIN_UPDATES &&
+      timeSinceLastAttempt >= COMPACTION_TIME_THRESHOLD_MS;
+
+    if (!updateThresholdReached && !timeThresholdReached) return;
+
+    if (!this.amCompactionElector()) return;
+
+    await this.sendCompactionSnapshot();
+  }
+
+  private async sendCompactionSnapshot(): Promise<void> {
+    const currentSeq = this.lastSeq;
+    const stateBytes = Y.encodeStateAsUpdate(this.ydoc);
+
+    try {
+      const { encrypted, iv } = await this.encryptForWire(stateBytes);
+      this.send({
+        type: 'docCompact',
+        encryptedState: encrypted,
+        iv,
+        replacesUpTo: currentSeq,
+        orgKeyFingerprint: this.wireOrgKeyFingerprint,
+      });
+      this.lastSnapshotSeq = currentSeq;
+      this.lastCompactionAttemptAt = Date.now();
+      console.log(
+        `[DocumentSync] Sent docCompact: replacesUpTo=${currentSeq}, snapshotBytes=${stateBytes.byteLength}`
+      );
+    } catch (err) {
+      // Optimistic: leave lastSnapshotSeq untouched so the next check retries.
+      console.warn('[DocumentSync] Failed to send compaction snapshot:', err);
+    }
   }
 }
 

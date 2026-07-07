@@ -1,12 +1,8 @@
 import React, { useState, useEffect, useCallback } from 'react';
-import { useAtomValue, useSetAtom } from 'jotai';
 import { ProviderConfig, Model } from '../../Settings/SettingsView';
 import {ClaudeForWindowsInstallation} from "../../../../main/services/CLIManager.ts";
 import {usePostHog} from "posthog-js/react";
-import {
-  claudeUsageIndicatorEnabledAtom,
-  setClaudeUsageIndicatorEnabledAtom,
-} from '../../../store/atoms/claudeUsageAtoms';
+import { useSetting, useSetSetting } from '../../../hooks/useSetting';
 import { SettingsToggle, ToggleSwitch } from '../SettingsToggle';
 
 // Built-in SDK version (injected at build time via electron.vite.config.ts define)
@@ -75,8 +71,8 @@ export function ClaudeCodePanel({
   const [editingValue, setEditingValue] = useState('');
 
   // Usage indicator setting
-  const usageIndicatorEnabled = useAtomValue(claudeUsageIndicatorEnabledAtom);
-  const setUsageIndicatorEnabled = useSetAtom(setClaudeUsageIndicatorEnabledAtom);
+  const usageIndicatorEnabled = useSetting('ai.showUsageIndicator');
+  const setUsageIndicatorEnabled = useSetSetting('ai.showUsageIndicator');
 
   // Custom Claude executable path. In project scope, `customClaudeCodePath` reflects the
   // workspace override (empty string when no override is set, inheriting the global value);
@@ -91,11 +87,7 @@ export function ClaudeCodePanel({
   // Plan tracking toggle - stores plans in nimbalyst-local/plans/ with tracking frontmatter
   const [planTrackingEnabled, setPlanTrackingEnabledState] = useState(true);
 
-  // Detect Windows platform using navigator.platform (client-side, no IPC needed)
-  const isWindowsPlatform = navigator.platform === 'Win32';
-
-  // Detect macOS platform (usage indicator only available on macOS)
-  const isMacOS = navigator.platform.toLowerCase().includes('mac');
+  const isWindowsPlatform = process.platform === 'win32';
 
   // Load environment variables
   const loadEnvVars = useCallback(async () => {
@@ -255,8 +247,9 @@ export function ClaudeCodePanel({
           throw new Error(saveResult?.error || 'Failed to save project override');
         }
       } else {
-        // Send only the changed field -- ai:saveSettings handles partial updates
-        await window.electronAPI.aiSaveSettings({ customClaudeCodePath: newPath });
+        // Per-key write via SettingsService -- structurally cannot clobber
+        // sibling AI settings the way the old aiSaveSettings blob path could.
+        await window.electronAPI.settingsSet('ai.customClaudeCodePath', newPath);
         setGlobalCustomClaudeCodePath(newPath);
       }
     } catch (error) {
@@ -338,16 +331,15 @@ export function ClaudeCodePanel({
         }}
       />
 
-      {/* Usage Indicator Toggle - macOS only */}
-      {isMacOS && (
-        <SettingsToggle
-          variant="enable"
-          name="Show Usage Indicator"
-          description="Display API usage limits in the navigation gutter"
-          checked={usageIndicatorEnabled}
-          onChange={setUsageIndicatorEnabled}
-        />
-      )}
+      {/* Usage Indicator Toggle */}
+      <SettingsToggle
+        variant="enable"
+        name="Show Usage Indicator"
+        description="Display API usage limits in the navigation gutter"
+        checked={usageIndicatorEnabled}
+        onChange={setUsageIndicatorEnabled}
+        testId="claude-agent-usage-indicator-toggle"
+      />
 
       {/* Custom Claude Installation */}
       <div className="provider-enable flex flex-col gap-2 py-4 mb-4 border-b border-[var(--nim-border)]">
@@ -620,11 +612,16 @@ export function ClaudeCodePanel({
             </p>
           </div>
 
+          {/* Environment Variables are user-level only (~/.claude/settings.json applies
+              to every workspace). Hiding this section in the Project tab prevents users
+              from believing they're setting a per-project value when they're really
+              changing global state. See issue #185. */}
+          {scope === 'user' && (
           <div className="provider-panel-section py-4 mb-4 border-b border-[var(--nim-border)] last:border-b-0 last:mb-0 last:pb-0">
             <h4 className="provider-panel-section-title text-base font-semibold mb-3 text-[var(--nim-text)]">Environment Variables</h4>
             <p className="text-xs leading-relaxed text-[var(--nim-text-muted)] mb-3">
               Configure environment variables that will be set for all Claude Code sessions.
-              These are stored in <code className="text-xs bg-[var(--nim-bg-tertiary)] px-1 py-0.5 rounded">~/.claude/settings.json</code>.
+              These are stored in <code className="text-xs bg-[var(--nim-bg-tertiary)] px-1 py-0.5 rounded">~/.claude/settings.json</code> and apply to every project.
             </p>
 
             {isLoadingEnv ? (
@@ -739,6 +736,7 @@ export function ClaudeCodePanel({
               </>
             )}
           </div>
+          )}
         </>
       )}
     </div>

@@ -47,6 +47,12 @@ public final class SyncManager: ObservableObject {
     /// Called when settings are synced from the desktop (e.g., OpenAI API key, voice mode config).
     public var onSettingsSynced: ((SyncedSettings) -> Void)?
 
+    /// Called when the desktop confirms a create-session request succeeded.
+    /// Parameters: (requestId, sessionId). The `requestId` lets the caller match
+    /// the response to a request it originated (this broadcast reaches every
+    /// paired device), so only the requesting device navigates to the new session.
+    public var onSessionCreated: ((String, String) -> Void)?
+
     /// Called with diagnostic info when session message sync completes (success or failure).
     /// Parameters: (sessionId, diagnostic).
     ///
@@ -319,6 +325,8 @@ public final class SyncManager: ObservableObject {
             // Response to our worktree creation request - the worktree session
             // will appear via indexBroadcast, so no special handling needed
             break
+        case "voiceToolResponseBroadcast":
+            handleVoiceToolResponse(data)
         case "error":
             handleServerError(data)
         default:
@@ -441,6 +449,9 @@ public final class SyncManager: ObservableObject {
 
         do {
             try database.upsertProject(project)
+            // Server's sessionCount includes archived sessions; recompute locally
+            // so the displayed count matches what SessionListView actually shows.
+            try database.refreshSessionCount(forProject: projectId)
         } catch {
             logger.error("Failed to upsert project: \(error.localizedDescription)")
         }
@@ -607,6 +618,9 @@ public final class SyncManager: ObservableObject {
 
         do {
             try database.upsertProject(project)
+            // Server's sessionCount includes archived sessions; recompute locally
+            // so the displayed count matches what SessionListView actually shows.
+            try database.refreshSessionCount(forProject: projectId)
         } catch {
             logger.error("Failed to upsert project: \(error.localizedDescription)")
         }
@@ -780,11 +794,108 @@ public final class SyncManager: ObservableObject {
             return
         }
         if broadcast.response.success {
-            logger.info("Session created: \(broadcast.response.sessionId ?? "unknown")")
+            let sessionId = broadcast.response.sessionId ?? "unknown"
+            logger.info("Session created: \(sessionId)")
+            if let sessionId = broadcast.response.sessionId {
+                onSessionCreated?(broadcast.response.requestId, sessionId)
+            }
         } else {
             logger.error("Session creation failed: \(broadcast.response.error ?? "unknown error")")
         }
-        // TODO: Notify UI of create session result
+    }
+
+    // MARK: - Voice Tool Proxy (mobile -> desktop)
+
+    /// Result of a proxied voice tool call.
+    public struct VoiceToolCallResult {
+        public let success: Bool
+        public let result: String?
+        public let error: String?
+    }
+
+    /// Continuations awaiting a desktop voice-tool response, keyed by requestId.
+    private var pendingVoiceToolCalls: [String: CheckedContinuation<VoiceToolCallResult, Never>] = [:]
+
+    /// Voice-tool request timeout. The memory engine lives on the desktop; if no
+    /// desktop is connected the request never gets answered, so we resolve
+    /// gracefully after this window.
+    private static let voiceToolTimeoutNs: UInt64 = 30_000_000_000 // 30s
+
+    /// Run a desktop-hosted voice tool (e.g. project-memory lookup) by proxying
+    /// it over the sync channel. Returns the tool result, or a graceful failure
+    /// if the desktop is unavailable / doesn't respond in time.
+    public func callVoiceTool(toolName: String, argsJson: String, projectId: String) async -> VoiceToolCallResult {
+        let encryptedProjectId: String
+        let toolNameEnc: (encrypted: String, iv: String)
+        let argsEnc: (encrypted: String, iv: String)
+        do {
+            encryptedProjectId = try crypto.encryptProjectId(projectId)
+            toolNameEnc = try crypto.encrypt(plaintext: toolName)
+            argsEnc = try crypto.encrypt(plaintext: argsJson)
+        } catch {
+            return VoiceToolCallResult(success: false, result: nil, error: "Failed to encrypt voice tool request")
+        }
+
+        let requestId = UUID().uuidString
+        let message = VoiceToolRequestMessage(
+            request: EncryptedVoiceToolRequest(
+                requestId: requestId,
+                encryptedProjectId: encryptedProjectId,
+                projectIdIv: CryptoManager.projectIdIvBase64,
+                encryptedToolName: toolNameEnc.encrypted,
+                toolNameIv: toolNameEnc.iv,
+                encryptedArgs: argsEnc.encrypted,
+                argsIv: argsEnc.iv,
+                timestamp: Int(Date().timeIntervalSince1970 * 1000)
+            )
+        )
+
+        guard let data = try? JSONEncoder().encode(message),
+              let json = String(data: data, encoding: .utf8) else {
+            return VoiceToolCallResult(success: false, result: nil, error: "Failed to encode voice tool request")
+        }
+
+        return await withCheckedContinuation { continuation in
+            pendingVoiceToolCalls[requestId] = continuation
+            indexClient.sendRaw(json)
+
+            // Timeout fallback (desktop offline / slow).
+            Task { [weak self] in
+                try? await Task.sleep(nanoseconds: SyncManager.voiceToolTimeoutNs)
+                guard let self else { return }
+                if let pending = self.pendingVoiceToolCalls.removeValue(forKey: requestId) {
+                    pending.resume(returning: VoiceToolCallResult(
+                        success: false,
+                        result: nil,
+                        error: "Project memory is unavailable because your desktop isn't connected."
+                    ))
+                }
+            }
+        }
+    }
+
+    private func handleVoiceToolResponse(_ data: Data) {
+        guard let broadcast = try? decoder.decode(VoiceToolResponseBroadcast.self, from: data) else {
+            logger.error("Failed to decode voiceToolResponseBroadcast")
+            return
+        }
+        let resp = broadcast.response
+        guard let continuation = pendingVoiceToolCalls.removeValue(forKey: resp.requestId) else {
+            return // already resolved by timeout, or not ours
+        }
+        var resultText: String?
+        if let enc = resp.encryptedResult, let iv = resp.resultIv {
+            resultText = crypto.decryptOrNil(encryptedBase64: enc, ivBase64: iv)
+        }
+        var errorText: String?
+        if let enc = resp.encryptedError, let iv = resp.errorIv {
+            errorText = crypto.decryptOrNil(encryptedBase64: enc, ivBase64: iv)
+        }
+        continuation.resume(returning: VoiceToolCallResult(
+            success: resp.success,
+            result: resultText,
+            error: errorText
+        ))
     }
 
     // MARK: - Device Presence
@@ -851,15 +962,20 @@ public final class SyncManager: ObservableObject {
         }
 
         #if os(iOS)
-        // Store voice mode settings if present
-        if let voiceMode = settings.voiceMode {
+        // Store voice mode settings if present. preferredAgentLanguage is a
+        // top-level field, so persist it even when voiceMode itself is absent --
+        // it pins the voice agent's spoken language to the desktop default.
+        if settings.voiceMode != nil || settings.preferredAgentLanguage != nil {
             var currentSettings = VoiceModeSettings.load()
-            if let voice = voiceMode.voice {
-                currentSettings.voice = voice
+            if let voiceMode = settings.voiceMode {
+                if let voice = voiceMode.voice {
+                    currentSettings.voice = voice
+                }
+                if let delay = voiceMode.submitDelayMs {
+                    currentSettings.promptConfirmationDelay = TimeInterval(delay) / 1000.0
+                }
             }
-            if let delay = voiceMode.submitDelayMs {
-                currentSettings.promptConfirmationDelay = TimeInterval(delay) / 1000.0
-            }
+            currentSettings.language = settings.preferredAgentLanguage
             currentSettings.save()
         }
         #endif
@@ -874,6 +990,12 @@ public final class SyncManager: ObservableObject {
             desktopDefaultModel = defaultModel
             logger.info("Desktop default model: \(defaultModel)")
         }
+
+        // Persist the meta-agent alpha gate from desktop and notify gated UI.
+        let metaAgentEnabled = settings.metaAgentEnabled ?? false
+        FeaturePreferences.setMetaAgentEnabled(metaAgentEnabled)
+        NotificationCenter.default.post(name: .init("MetaAgentEnabledSynced"), object: nil)
+        logger.info("Meta Agent alpha gate from desktop: \(metaAgentEnabled)")
 
         onSettingsSynced?(settings)
     }
@@ -1590,14 +1712,19 @@ public final class SyncManager: ObservableObject {
     }
 
     /// Request the desktop to create a new session in a project.
+    /// Returns the generated `requestId` so the caller can correlate the
+    /// asynchronous `createSessionResponseBroadcast` back to this request (e.g.
+    /// to navigate only the device that asked for the new session).
+    @discardableResult
     public func createSession(
         projectId: String,
         initialPrompt: String? = nil,
         sessionType: String? = nil,
         parentSessionId: String? = nil,
         provider: String? = nil,
-        model: String? = nil
-    ) throws {
+        model: String? = nil,
+        agentRole: String? = nil
+    ) throws -> String {
         let encryptedProjectId = try crypto.encryptProjectId(projectId)
 
         var encryptedPrompt: String?
@@ -1608,9 +1735,10 @@ public final class SyncManager: ObservableObject {
             promptIv = result.iv
         }
 
+        let requestId = UUID().uuidString
         let request = CreateSessionRequestMessage(
             request: EncryptedCreateSessionRequest(
-                requestId: UUID().uuidString,
+                requestId: requestId,
                 encryptedProjectId: encryptedProjectId,
                 projectIdIv: CryptoManager.projectIdIvBase64,
                 encryptedInitialPrompt: encryptedPrompt,
@@ -1619,6 +1747,7 @@ public final class SyncManager: ObservableObject {
                 parentSessionId: parentSessionId,
                 provider: provider,
                 model: model,
+                agentRole: agentRole,
                 timestamp: Int(Date().timeIntervalSince1970 * 1000)
             )
         )
@@ -1627,6 +1756,7 @@ public final class SyncManager: ObservableObject {
            let json = String(data: data, encoding: .utf8) {
             indexClient.sendRaw(json)
         }
+        return requestId
     }
 
     /// Request the desktop to create a new git worktree.

@@ -1,8 +1,23 @@
 /**
- * OpenAI Codex SDK Protocol Adapter
+ * OpenAI Codex SDK Protocol Adapter (LEGACY -- retained as escape hatch)
  *
  * Wraps the @openai/codex-sdk to provide a normalized protocol interface
- * for the OpenAICodexProvider.
+ * for the OpenAICodexProvider via `codex exec --experimental-json`.
+ *
+ * **Status**: this is no longer the default codex transport. The default is
+ * now `CodexAppServerProtocol`, which drives `codex app-server --listen stdio://`
+ * directly via JSON-RPC v2. The app-server transport's notifications include
+ * the full unified-diff text per fileChange item, eliminating the apply_patch
+ * race the SDK transport has when capturing pre-edit baselines.
+ *
+ * This file remains in the tree because:
+ *   1. legacy sessions persist their raw events in the SDK shape and need
+ *      this parser path (via the dispatcher) to render correctly
+ *   2. it is the documented escape hatch via the
+ *      `aiProviders.openai-codex.transport = 'sdk'` setting
+ *
+ * Do not remove without first migrating both points above. See
+ * `nimbalyst-local/plans/codex-app-server-protocol-migration.md` for context.
  *
  * This adapter isolates all SDK-specific details:
  * - Client initialization
@@ -11,6 +26,8 @@
  * - Event parsing and conversion
  */
 
+import { buildDocumentAttachmentPromptText } from '../providers/codex/documentAttachmentPrompt';
+import { describeCodexConfigError } from './codexConfigError';
 import {
   AgentProtocol,
   ProtocolSession,
@@ -167,7 +184,7 @@ export class CodexSDKProtocol implements AgentProtocol {
     const rawOptions = session.raw?.options as { abortSignal?: AbortSignal } | undefined;
 
     // Build the prompt (system prompt is now in thread options as developer_instructions)
-    const input = this.buildInput(message);
+    const input = await this.buildInput(message);
 
     // Track cumulative text for delta extraction
     let lastCumulativeText = '';
@@ -297,9 +314,10 @@ export class CodexSDKProtocol implements AgentProtocol {
         (session.raw?.options as { abortSignal?: AbortSignal })?.abortSignal?.aborted || /abort|cancel/i.test(errorMessage);
 
       if (!isAbort) {
+        const configHint = describeCodexConfigError(errorMessage);
         yield {
           type: 'error',
-          error: errorMessage,
+          error: configHint ? `${errorMessage}\n\n${configHint}` : errorMessage,
         };
       }
     }
@@ -394,13 +412,31 @@ export class CodexSDKProtocol implements AgentProtocol {
 
     // Extract systemPrompt from raw options and pass it as developer_instructions
     // This is the proper Codex SDK way to add custom instructions
-    const { systemPrompt, codexConfigOverrides: _codexConfigOverrides, effortLevel: _effortLevel, ...otherRawOptions } = options.raw || {};
+    const {
+      systemPrompt,
+      codexConfigOverrides: _codexConfigOverrides,
+      effortLevel: _effortLevel,
+      additionalDirectories: rawAdditionalDirectories,
+      ...otherRawOptions
+    } = options.raw || {};
+
+    // Sibling worktrees and the parent project root the agent is allowed to
+    // write to, in addition to workingDirectory. The Codex SDK forwards this
+    // to the CLI as repeated --add-dir flags. Sandboxed in workspace-write
+    // mode the CLI rejects all writes outside these roots. Issue #37 problem
+    // 1: orchestrator sessions could not edit sibling worktrees.
+    const additionalDirectories = Array.isArray(rawAdditionalDirectories)
+      ? (rawAdditionalDirectories as unknown[]).filter(
+          (entry): entry is string => typeof entry === 'string' && entry.length > 0,
+        )
+      : [];
 
     return {
       ...baseOptions,
       ...(systemPrompt ? { developer_instructions: systemPrompt } : {}),
       ...(options.allowedTools ? { allowedTools: options.allowedTools } : {}),
       ...(options.disallowedTools ? { disallowedTools: options.disallowedTools } : {}),
+      ...(additionalDirectories.length > 0 ? { additionalDirectories } : {}),
       ...otherRawOptions,
     };
   }
@@ -419,20 +455,41 @@ export class CodexSDKProtocol implements AgentProtocol {
    * NOTE: System prompts are now passed via developer_instructions in thread options,
    * not injected into the user message. This is the proper Codex SDK approach.
    */
-  private buildInput(message: ProtocolMessage): CodexInput {
-    const imageAttachments = (message.attachments || [])
-      .filter((attachment) => attachment.type === 'image' && attachment.filepath);
+  private async buildInput(message: ProtocolMessage): Promise<CodexInput> {
+    const attachments = message.attachments || [];
+    const hasStructuredAttachments = attachments.some(
+      (attachment) => (attachment.type === 'image' || attachment.type === 'document') && attachment.filepath
+    );
 
-    if (imageAttachments.length === 0) {
+    if (!hasStructuredAttachments) {
       return message.content;
     }
 
-    return [
+    const input: Array<{ type: 'text'; text: string } | { type: 'local_image'; path: string }> = [
       { type: 'text', text: message.content },
-      ...imageAttachments.map((attachment) => ({
-        type: 'local_image' as const,
-        path: attachment.filepath,
-      })),
     ];
+
+    for (const attachment of attachments) {
+      if (!attachment.filepath) {
+        continue;
+      }
+
+      if (attachment.type === 'document') {
+        input.push({
+          type: 'text',
+          text: await buildDocumentAttachmentPromptText(attachment),
+        });
+        continue;
+      }
+
+      if (attachment.type === 'image') {
+        input.push({
+          type: 'local_image',
+          path: attachment.filepath,
+        });
+      }
+    }
+
+    return input;
   }
 }

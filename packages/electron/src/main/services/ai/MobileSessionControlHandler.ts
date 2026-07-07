@@ -12,6 +12,14 @@ import type { BrowserWindow } from 'electron';
 import { logger } from '../../utils/logger';
 import type { PermissionScope } from '@nimbalyst/runtime';
 import { TrayManager } from '../../tray/TrayManager';
+import { resolveRequestUserInputPromptTargets } from '../../mcp/tools/codexToolCallResolver';
+import {
+  getGitCommitProposalResponseChannel,
+  resolveGitCommitProposalPromptId,
+} from './gitCommitProposalPromptUtils';
+import { buildToolPermissionResponseRecord } from './claudeCliToolPermission';
+import { getGitSubprocessEnv } from '../gitEnv';
+import { findWindowByWorkspace } from '../../window/WindowManager';
 
 const log = logger.ai;
 
@@ -45,10 +53,20 @@ interface PromptPayload {
  * Unified prompt response payload.
  * All interactive prompts use this structure.
  */
-interface PromptResponsePayload {
-  promptType: 'ask_user_question' | 'exit_plan_mode' | 'tool_permission' | 'git_commit';
+export interface PromptResponsePayload {
+  promptType: 'ask_user_question' | 'exit_plan_mode' | 'tool_permission' | 'git_commit' | 'request_user_input';
   promptId: string;
-  response: AskUserQuestionResponse | ExitPlanModeResponse | ToolPermissionResponse | GitCommitResponse;
+  response:
+    | AskUserQuestionResponse
+    | ExitPlanModeResponse
+    | ToolPermissionResponse
+    | GitCommitResponse
+    | RequestUserInputResponse;
+}
+
+interface RequestUserInputResponse {
+  answers: Record<string, unknown>;
+  cancelled?: boolean;
 }
 
 interface AskUserQuestionResponse {
@@ -74,12 +92,33 @@ interface GitCommitResponse {
 }
 
 /**
+ * Callbacks the mobile control handler needs from AIService. Passed in so
+ * this module stays free of a circular dependency on AIService.
+ */
+export interface MobileSessionControlCallbacks {
+  /**
+   * Trigger queue processing for a session. Used by `case 'prompt'` so when
+   * iOS delivers a prompt while the desktop session is idle (or busy), the
+   * desktop reliably picks it up from the queued_prompts DB.
+   */
+  triggerQueuedPromptProcessing(sessionId: string, workspacePath: string): Promise<boolean>;
+
+  /**
+   * Reset any prompts stuck in 'executing' back to 'pending' for the given
+   * session. Used by `case 'cancel'` so a queued prompt in-flight when
+   * mobile cancels isn't left permanently wedged.
+   */
+  rollbackExecutingPrompts(sessionId: string): Promise<number>;
+}
+
+/**
  * Initialize the mobile session control handler.
  * Listens for control messages from the sync layer and dispatches to appropriate handlers.
  */
 export function initMobileSessionControlHandler(
   syncProvider: SyncProvider,
-  findWindowByWorkspace: (workspacePath: string) => BrowserWindow | null | undefined
+  findWindowByWorkspace: (workspacePath: string) => BrowserWindow | null | undefined,
+  callbacks: MobileSessionControlCallbacks
 ): () => void {
   if (!syncProvider.onSessionControlMessage) {
     log.warn('Sync provider does not support session control messages');
@@ -87,7 +126,7 @@ export function initMobileSessionControlHandler(
   }
 
   const cleanup = syncProvider.onSessionControlMessage((message) => {
-    handleControlMessage(message, findWindowByWorkspace);
+    handleControlMessage(message, findWindowByWorkspace, callbacks);
   });
 
   // log.info('Mobile session control handler initialized');
@@ -100,13 +139,14 @@ export function initMobileSessionControlHandler(
  */
 function handleControlMessage(
   message: SessionControlMessage,
-  findWindowByWorkspace: (workspacePath: string) => BrowserWindow | null | undefined
+  findWindowByWorkspace: (workspacePath: string) => BrowserWindow | null | undefined,
+  callbacks: MobileSessionControlCallbacks
 ): void {
   log.info('Received control message:', message.type, 'for session:', message.sessionId);
 
   switch (message.type) {
     case 'cancel':
-      handleCancel(message.sessionId);
+      void handleCancel(message.sessionId, callbacks);
       break;
 
     // Legacy handler - kept for backwards compatibility with older mobile versions
@@ -134,9 +174,12 @@ function handleControlMessage(
     }
 
     case 'prompt': {
-      // Prompts are handled via the queuedPrompts system, not control messages
-      // This is here for future expansion if needed
-      log.warn('Received prompt control message - prompts should use queuedPrompts system');
+      // iOS has already written the prompt into queued_prompts via sync.
+      // The control message is the trigger: nudge the desktop to start
+      // processing so iOS sees the prompt actually run (otherwise the
+      // queue auto-trigger only fires on isLoading transitions, which
+      // can race or miss the idle case entirely).
+      void handlePromptTrigger(message.sessionId, callbacks);
       break;
     }
 
@@ -150,6 +193,40 @@ function handleControlMessage(
     default:
       log.warn('Unknown control message type:', message.type);
   }
+}
+
+/**
+ * Look up the session's workspacePath and ask AIService to drain the queue.
+ */
+async function handlePromptTrigger(
+  sessionId: string,
+  callbacks: MobileSessionControlCallbacks
+): Promise<void> {
+  try {
+    const { AISessionsRepository } = await import('@nimbalyst/runtime/storage/repositories/AISessionsRepository');
+    const session = await AISessionsRepository.get(sessionId);
+    if (!session?.workspacePath) {
+      log.warn('Received prompt control message for unknown session:', sessionId);
+      return;
+    }
+    log.info('Triggering queue processing from mobile prompt control:', sessionId);
+    await callbacks.triggerQueuedPromptProcessing(sessionId, session.workspacePath);
+  } catch (err) {
+    log.error('Failed to handle mobile prompt control message:', err);
+  }
+}
+
+/**
+ * Resolve an interactive prompt programmatically (e.g. from the voice agent),
+ * reusing the exact same resolution path mobile uses for `prompt_response`
+ * session-control messages. The provider/MCP-waiter/DB-poll fallbacks and the
+ * renderer notifications are all handled by `handlePromptResponse`.
+ */
+export function resolveVoicePromptResponse(
+  sessionId: string,
+  payload: PromptResponsePayload,
+): void {
+  handlePromptResponse(sessionId, payload, findWindowByWorkspace);
 }
 
 /**
@@ -208,18 +285,146 @@ function handlePromptResponse(
       break;
     }
 
+    case 'request_user_input': {
+      const response = payload.response as RequestUserInputResponse;
+      handleRequestUserInputResponse(sessionId, payload.promptId, response);
+      break;
+    }
+
     default:
       log.warn('Unknown prompt type:', payload.promptType);
   }
 }
 
 /**
+ * Handle RequestUserInput response from mobile.
+ *
+ * The desktop MCP handler is waiting on a session-scoped IPC channel + a
+ * DB-polling fallback. We try the IPC channel first (matches the MCP server's
+ * fast path) and write a `request_user_input_response` row to the DB so the
+ * polling fallback resolves even if no IPC waiter is registered (e.g., the
+ * MCP transport dropped or the desktop wasn't open when the prompt was
+ * created). Then notify all windows to clear the pending UI.
+ */
+function handleRequestUserInputResponse(
+  sessionId: string,
+  promptId: string,
+  response: RequestUserInputResponse,
+): void {
+  log.info(
+    `[Mobile] RequestUserInput response: promptId=${promptId}, sessionId=${sessionId}, cancelled=${response.cancelled === true}`,
+  );
+
+  const { ipcMain } = require('electron');
+  const { waiterPromptIds: promptIdAliases, rawPromptId } =
+    resolveRequestUserInputPromptTargets(promptId);
+
+  import('../../mcp/tools/interactiveToolHandlers').then(({
+    getRequestUserInputResponseChannel,
+    getRequestUserInputFallbackResponseChannel,
+  }) => {
+    let hasWaiter = false;
+    for (const promptIdAlias of promptIdAliases) {
+      const channel = getRequestUserInputResponseChannel(sessionId, promptIdAlias);
+      if (ipcMain.listenerCount(channel) > 0) {
+        hasWaiter = true;
+        log.info(`[Mobile] Emitting on RequestUserInput channel: ${channel}`);
+        ipcMain.emit(channel, {}, {
+          answers: response.cancelled ? {} : (response.answers ?? {}),
+          cancelled: response.cancelled === true,
+          respondedBy: 'mobile',
+        });
+      }
+    }
+    const fallbackChannel = getRequestUserInputFallbackResponseChannel(sessionId);
+    if (!hasWaiter && ipcMain.listenerCount(fallbackChannel) > 0) {
+      hasWaiter = true;
+      log.info(`[Mobile] Emitting on RequestUserInput fallback channel: ${fallbackChannel}`);
+      ipcMain.emit(fallbackChannel, {}, {
+        promptId,
+        ...(rawPromptId ? { rawPromptId } : {}),
+        answers: response.cancelled ? {} : (response.answers ?? {}),
+        cancelled: response.cancelled === true,
+        respondedBy: 'mobile',
+      });
+    }
+    if (!hasWaiter) {
+      log.info(`[Mobile] No MCP waiter for RequestUserInput on ${promptIdAliases.join(', ')} -- relying on DB poll`);
+    }
+  }).catch((err) => {
+    log.warn('[Mobile] Failed to import interactiveToolHandlers:', err);
+  });
+
+  // DB fallback: write a response row so the MCP server's polling loop resolves.
+  import('@nimbalyst/runtime/storage/repositories/AgentMessagesRepository').then(({ AgentMessagesRepository }) => {
+    AgentMessagesRepository.create({
+      sessionId,
+      source: 'claude-code',
+      direction: 'output' as const,
+      createdAt: new Date(),
+      content: JSON.stringify({
+        type: 'request_user_input_response',
+        promptId,
+        ...(rawPromptId ? { rawPromptId } : {}),
+        answers: response.cancelled ? {} : (response.answers ?? {}),
+        cancelled: response.cancelled === true,
+        respondedBy: 'mobile',
+        respondedAt: Date.now(),
+      }),
+    }).catch((err) => {
+      log.warn(`[Mobile] Failed to persist RequestUserInput response: ${err}`);
+    });
+  });
+
+  // Notify all windows to clear the pending UI.
+  notifyAllWindows('ai:requestUserInputResolved', { sessionId, promptId });
+  TrayManager.getInstance().onPromptResolved(sessionId);
+}
+
+/**
  * Handle a cancel command
  */
-function handleCancel(sessionId: string): void {
-  const provider = ProviderFactory.getProvider('claude-code', sessionId);
+async function handleCancel(
+  sessionId: string,
+  callbacks: MobileSessionControlCallbacks
+): Promise<void> {
+  // Defensive cleanup (provider-agnostic): if a queued prompt was in-flight when
+  // mobile cancelled, the DB row would otherwise stay 'executing' and be invisible
+  // to listPending. Rollback so the queue isn't wedged after this cancel.
+  const rollbackQueuedPrompts = async () => {
+    try {
+      const rolledBack = await callbacks.rollbackExecutingPrompts(sessionId);
+      if (rolledBack > 0) {
+        log.info(`Mobile cancel: rolled back ${rolledBack} executing prompt(s) for session ${sessionId}`);
+      }
+    } catch (rollbackErr) {
+      log.error('Mobile cancel: rollbackExecutingPrompts failed:', rollbackErr);
+    }
+  };
+
+  // claude-code-cli is an external CLI process with NO in-process provider —
+  // abort it by sending Ctrl-C to the terminal PTY, mirroring the desktop
+  // `ai:cancelRequest` handler (AIService.ts).
+  const { AISessionsRepository } = await import('@nimbalyst/runtime/storage/repositories/AISessionsRepository');
+  const session = await AISessionsRepository.get(sessionId);
+  if (session?.provider === 'claude-code-cli') {
+    const { getTerminalSessionManager } = await import('../TerminalSessionManager');
+    const terminalManager = getTerminalSessionManager();
+    if (!terminalManager.isTerminalActive(sessionId)) {
+      log.warn('Mobile cancel: no active claude-code-cli terminal for session:', sessionId);
+      return;
+    }
+    await rollbackQueuedPrompts();
+    terminalManager.writeToTerminal(sessionId, '\x03');
+    log.info('Mobile cancel: sent Ctrl+C to CLI session', sessionId);
+    notifyAllWindows('ai:sessionCancelled', { sessionId });
+    return;
+  }
+
+  const provider = ProviderFactory.getProvider((session?.provider as Parameters<typeof ProviderFactory.getProvider>[0]) || 'claude-code', sessionId);
   if (provider && 'abort' in provider) {
     log.info('Aborting session:', sessionId);
+    await rollbackQueuedPrompts();
     (provider as { abort: () => void }).abort();
 
     // Notify renderer to update UI
@@ -419,6 +624,41 @@ function handleToolPermissionResponse(
     log.warn('No provider found or provider does not support tool permission for session:', sessionId);
   }
 
+  import('electron').then(({ ipcMain }) => {
+    const channel = `tool-permission-response:${sessionId}:${promptId}`;
+    const hasMcpWaiter = ipcMain.listenerCount(channel) > 0;
+    if (hasMcpWaiter) {
+      log.info(`[Mobile] Emitting ToolPermission response on MCP channel: ${channel}`);
+      ipcMain.emit(channel, {}, {
+        requestId: promptId,
+        sessionId,
+        decision: response.decision,
+        scope: response.scope,
+        respondedBy: 'mobile',
+      });
+    }
+  }).catch((err) => {
+    log.warn(`[Mobile] Failed to emit ToolPermission response over IPC: ${err}`);
+  });
+
+  import('@nimbalyst/runtime/storage/repositories/AgentMessagesRepository').then(({ AgentMessagesRepository }) => {
+    AgentMessagesRepository.create({
+      sessionId,
+      source: 'nimbalyst',
+      direction: 'output' as const,
+      createdAt: new Date(),
+      content: JSON.stringify(buildToolPermissionResponseRecord({
+        requestId: promptId,
+        answer: response,
+        respondedBy: 'mobile',
+      })),
+    }).catch((err) => {
+      log.warn(`[Mobile] Failed to persist ToolPermission response to database: ${err}`);
+    });
+  }).catch((err) => {
+    log.warn(`[Mobile] Failed to load AgentMessagesRepository for ToolPermission response: ${err}`);
+  });
+
   // Notify renderer to update the UI
   notifyAllWindows('ai:toolPermissionResponse', {
     sessionId,
@@ -427,6 +667,8 @@ function handleToolPermissionResponse(
     scope: response.scope,
     answeredBy: 'mobile',
   });
+  notifyAllWindows('ai:toolPermissionResolved', { sessionId, requestId: promptId });
+  TrayManager.getInstance().onPromptResolved(sessionId);
 }
 
 /**
@@ -440,20 +682,46 @@ async function handleGitCommitResponse(
   findWindowByWorkspace: (workspacePath: string) => BrowserWindow | null | undefined
 ): Promise<void> {
   log.info('Handling GitCommit response:', promptId, 'action:', response.action);
+  const canonicalPromptId = await resolveGitCommitProposalPromptId(sessionId, promptId);
 
   // Helper to emit the proposal response to unblock the MCP tool
   const emitProposalResponse = async (result: {
-    action: 'committed' | 'cancelled';
+    action: 'committed' | 'cancelled' | 'error';
     commitHash?: string;
+    commitDate?: string;
     error?: string;
     filesCommitted?: string[];
     commitMessage?: string;
   }) => {
     const { ipcMain } = await import('electron');
-    const responseChannel = `git-commit-proposal-response:${sessionId || 'unknown'}:${promptId}`;
+    const responseChannel = getGitCommitProposalResponseChannel(sessionId, canonicalPromptId);
     ipcMain.emit(responseChannel, null, result);
+
+    import('@nimbalyst/runtime/storage/repositories/AgentMessagesRepository').then(({ AgentMessagesRepository }) => {
+      AgentMessagesRepository.create({
+        sessionId,
+        source: 'nimbalyst',
+        direction: 'output' as const,
+        createdAt: new Date(),
+        content: JSON.stringify({
+          type: 'git_commit_proposal_response',
+          proposalId: canonicalPromptId,
+          action: result.action,
+          commitHash: result.commitHash,
+          commitDate: result.commitDate,
+          error: result.error,
+          filesCommitted: result.filesCommitted,
+          commitMessage: result.commitMessage,
+          respondedBy: 'mobile',
+          respondedAt: Date.now(),
+        }),
+      }).catch((err) => {
+        log.warn(`[Mobile] Failed to persist GitCommit response: ${err}`);
+      });
+    });
+
     // Notify renderer to clear the pending interactive prompt indicator
-    notifyAllWindows('ai:gitCommitProposalResolved', { sessionId, proposalId: promptId });
+    notifyAllWindows('ai:gitCommitProposalResolved', { sessionId, proposalId: canonicalPromptId });
     TrayManager.getInstance().onPromptResolved(sessionId);
   };
 
@@ -465,7 +733,7 @@ async function handleGitCommitResponse(
   // For 'committed' action, we need to execute the git commit on desktop
   if (!response.files || !response.message) {
     log.error('GitCommit response missing files or message');
-    await emitProposalResponse({ action: 'cancelled', error: 'Missing files or message' });
+    await emitProposalResponse({ action: 'error', error: 'Missing files or message' });
     return;
   }
 
@@ -475,59 +743,34 @@ async function handleGitCommitResponse(
     const session = await AISessionsRepository.get(sessionId);
     if (!session) {
       log.error('GitCommit: session not found:', sessionId);
-      await emitProposalResponse({ action: 'cancelled', error: 'Session not found' });
+      await emitProposalResponse({ action: 'error', error: 'Session not found' });
       return;
     }
 
     const workspacePath = session.workspacePath;
     if (!workspacePath) {
       log.error('GitCommit: no workspace path for session:', sessionId);
-      await emitProposalResponse({ action: 'cancelled', error: 'No workspace path' });
+      await emitProposalResponse({ action: 'error', error: 'No workspace path' });
       return;
     }
 
-    // Execute the git commit
-    const simpleGit = (await import('simple-git')).default;
-    const { gitOperationLock } = await import('../../services/GitOperationLock');
-
-    const commitResult = await gitOperationLock.withLock(workspacePath, 'git:commit', async () => {
-      const git = simpleGit(workspacePath);
-
-      // Stage the files
-      log.info(`[GitCommit mobile] Staging ${response.files!.length} files in ${workspacePath}`);
-
-      // Reset staging area, then add only selected files
-      try {
-        await git.reset(['HEAD']);
-      } catch {
-        // May fail in fresh repo with no commits - that's OK
-      }
-      await git.add(response.files!);
-
-      // Commit
-      const result = await git.commit(response.message!);
-      return result;
-    });
-
-    if (commitResult.commit) {
-      log.info(`[GitCommit mobile] Successfully committed: ${commitResult.commit}`);
-      await emitProposalResponse({
-        action: 'committed',
-        commitHash: commitResult.commit,
-        filesCommitted: response.files,
-        commitMessage: response.message,
-      });
-    } else {
-      log.warn('[GitCommit mobile] Commit returned empty hash');
-      await emitProposalResponse({
-        action: 'cancelled',
-        error: 'No changes were committed',
-      });
-    }
+    const {
+      createGitCommitProposalResponse,
+      executeGitCommit,
+    } = await import('../../services/GitCommitService');
+    const commitResult = await executeGitCommit(
+      workspacePath,
+      response.message,
+      response.files,
+      { logContext: '[GitCommit mobile]', env: getGitSubprocessEnv() }
+    );
+    await emitProposalResponse(
+      createGitCommitProposalResponse(commitResult, response.files, response.message)
+    );
   } catch (error) {
     log.error('[GitCommit mobile] Failed to execute commit:', error);
     await emitProposalResponse({
-      action: 'cancelled',
+      action: 'error',
       error: error instanceof Error ? error.message : String(error),
     });
   }

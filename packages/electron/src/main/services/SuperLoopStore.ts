@@ -75,8 +75,8 @@ function rowToSuperLoop(row: SuperLoopRow): SuperLoop {
     completionReason: row.completion_reason ?? undefined,
     isArchived: row.is_archived ?? false,
     isPinned: row.is_pinned ?? false,
-    createdAt: toMillis(row.created_at),
-    updatedAt: toMillis(row.updated_at),
+    createdAt: toMillis(row.created_at)!,
+    updatedAt: toMillis(row.updated_at)!,
   };
 }
 
@@ -91,8 +91,8 @@ function rowToSuperIteration(row: SuperIterationRow): SuperIteration {
     iterationNumber: row.iteration_number,
     status: row.status as SuperIterationStatus,
     exitReason: row.exit_reason ?? undefined,
-    createdAt: toMillis(row.created_at),
-    completedAt: row.completed_at ? toMillis(row.completed_at) : undefined,
+    createdAt: toMillis(row.created_at)!,
+    completedAt: toMillis(row.completed_at) ?? undefined,
   };
 }
 
@@ -178,7 +178,7 @@ export function createSuperLoopStore(db: PGliteLike, ensureDbReady?: EnsureReady
     async getLoopByWorktreeId(worktreeId: string): Promise<SuperLoop | null> {
       await ensureReady();
 
-      logger.debug('Getting super loop by worktree', { worktreeId });
+      // logger.debug('Getting super loop by worktree', { worktreeId });
 
       const { rows } = await db.query<SuperLoopRow>(
         `SELECT * FROM super_loops WHERE worktree_id = $1 ORDER BY created_at DESC LIMIT 1`,
@@ -205,6 +205,8 @@ export function createSuperLoopStore(db: PGliteLike, ensureDbReady?: EnsureReady
         `SELECT rl.* FROM super_loops rl
          JOIN worktrees w ON rl.worktree_id = w.id
          WHERE w.workspace_id = $1
+           AND (rl.is_archived = FALSE OR rl.is_archived IS NULL)
+           AND (w.is_archived = FALSE OR w.is_archived IS NULL)
          ORDER BY rl.created_at DESC`,
         [workspaceId]
       );

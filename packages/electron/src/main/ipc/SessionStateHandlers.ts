@@ -8,6 +8,14 @@ import { BrowserWindow } from 'electron';
 import { getSessionStateManager } from '@nimbalyst/runtime/ai/server/SessionStateManager';
 import type { SessionStateEvent } from '@nimbalyst/runtime/ai/server/types/SessionState';
 import { safeHandle, safeOn } from '../utils/ipcRegistry';
+import { database } from '../database/PGLiteDatabaseWorker';
+import {
+  resolveOwnedWorkspacePath,
+  sessionEventMatchesWorkspace,
+} from '../../shared/sessionWorkspaceRouting';
+import { parseJsonObjectColumn } from '../utils/jsonColumn';
+import { setSessionPendingPrompt } from '../services/ai/pendingPromptPersistence';
+import { clearStalePendingPromptOnTerminal } from '../services/ai/pendingPromptTerminalClear';
 
 // Track if handlers are registered to prevent double registration
 let handlersRegistered = false;
@@ -17,6 +25,59 @@ const windowSubscriptions = new Map<number, () => void>();
 
 // Track sync subscription cleanup
 let syncSubscriptionCleanup: (() => void) | null = null;
+const sessionWorkspaceCache = new Map<string, string | null>();
+
+async function getCanonicalWorkspacePathForSession(sessionId: string): Promise<string | null> {
+  if (sessionWorkspaceCache.has(sessionId)) {
+    return sessionWorkspaceCache.get(sessionId) ?? null;
+  }
+
+  try {
+    const { rows } = await database.query<{ workspace_id: string | null }>(
+      `SELECT workspace_id
+       FROM ai_sessions
+       WHERE id = $1
+       LIMIT 1`,
+      [sessionId]
+    );
+    const workspacePath = rows[0]?.workspace_id ?? null;
+    // Only cache a RESOLVED (non-null) path. A null here usually means the
+    // session row was not committed yet when the first event fired (common for
+    // meta-agent child sessions created mid-run). Caching null would PERMANENTLY
+    // drop every later event for this session, because the workspace filter
+    // never matches null -- which pinned child spinners on "Thinking..." forever
+    // and left the meta-agent's aggregate stuck. Leaving null uncached lets the
+    // next event re-resolve once the row is committed.
+    if (workspacePath !== null) {
+      sessionWorkspaceCache.set(sessionId, workspacePath);
+    }
+    return workspacePath;
+  } catch (error) {
+    console.error('[SessionStateHandlers] Failed to resolve canonical workspace path:', error);
+    return null;
+  }
+}
+
+/**
+ * Read the authoritative persisted `hasPendingPrompt` bit for a session.
+ * Returns null when the row is missing or unreadable so callers can no-op
+ * instead of churning a write. Parses the metadata column with the
+ * backend-divergent helper (SQLite hands back a raw JSON string).
+ */
+async function readPersistedHasPendingPrompt(sessionId: string): Promise<boolean | null> {
+  try {
+    const { rows } = await database.query<{ metadata: unknown }>(
+      `SELECT metadata FROM ai_sessions WHERE id = $1 LIMIT 1`,
+      [sessionId]
+    );
+    if (rows.length === 0) return null;
+    const metadata = parseJsonObjectColumn(rows[0].metadata);
+    return metadata.hasPendingPrompt === true;
+  } catch (error) {
+    console.error('[SessionStateHandlers] Failed to read hasPendingPrompt:', error);
+    return null;
+  }
+}
 
 export async function registerSessionStateHandlers() {
   if (handlersRegistered) {
@@ -32,13 +93,43 @@ export async function registerSessionStateHandlers() {
   // Subscribe to state changes and sync to mobile
   setupSyncSubscription(stateManager);
 
-  // Get active session IDs
-  safeHandle('ai-session-state:get-active', async (_event) => {
+  // NIM-871: when a turn reaches a terminal state, clear any stale persisted
+  // pending-prompt bit. An interactive prompt that was abandoned (e.g. the user
+  // submitted a new prompt instead of answering the widget) otherwise leaves
+  // `metadata.hasPendingPrompt` set, and the session-list loader re-seeds the
+  // "awaiting user input" indicator from it on every refresh — stuck forever.
+  // Single subscription (not per-window) so it fires once per transition; the
+  // read-guard inside avoids a metadata write on every prompt-free turn end.
+  stateManager.subscribe((event: SessionStateEvent) => {
+    void clearStalePendingPromptOnTerminal(event, {
+      readHasPendingPrompt: readPersistedHasPendingPrompt,
+      clearPendingPrompt: (sessionId) => setSessionPendingPrompt(sessionId, false),
+      onError: (err) =>
+        console.error('[SessionStateHandlers] Failed to clear stale pending prompt on terminal event:', err),
+    });
+  });
+
+  // Get tracked session IDs (bare map membership; may include idle sessions).
+  // NOT a "running" signal — see getTrackedSessionIds / NIM-846. Most callers
+  // want ai-session-state:get-running instead.
+  safeHandle('ai-session-state:get-tracked', async (_event) => {
     try {
-      const activeIds = stateManager.getActiveSessionIds();
-      return { success: true, sessionIds: activeIds };
+      const trackedIds = stateManager.getTrackedSessionIds();
+      return { success: true, sessionIds: trackedIds };
     } catch (error) {
-      console.error('[SessionStateHandlers] Error getting active sessions:', error);
+      console.error('[SessionStateHandlers] Error getting tracked sessions:', error);
+      return { success: false, error: String(error), sessionIds: [] };
+    }
+  });
+
+  // Get session IDs whose turn is actually in progress (running / streaming).
+  // This is the canonical "is it running?" query (NIM-846).
+  safeHandle('ai-session-state:get-running', async (_event) => {
+    try {
+      const sessionIds = stateManager.getRunningSessionIds();
+      return { success: true, sessionIds };
+    } catch (error) {
+      console.error('[SessionStateHandlers] Error getting running sessions:', error);
       return { success: false, error: String(error), sessionIds: [] };
     }
   });
@@ -66,7 +157,7 @@ export async function registerSessionStateHandlers() {
   });
 
   // Subscribe to state changes
-  safeHandle('ai-session-state:subscribe', async (event, workspacePath?: string) => {
+  safeHandle('ai-session-state:subscribe', async (event, workspacePath?: string | string[]) => {
     try {
       const window = BrowserWindow.fromWebContents(event.sender);
       if (!window) {
@@ -81,20 +172,75 @@ export async function registerSessionStateHandlers() {
         existingUnsubscribe();
       }
 
+      // Normalize the filter to a Set of allowed workspace paths. Multi-project
+      // rail windows host several projects at once and must keep receiving
+      // lifecycle events for each one, otherwise the UI gets stuck on
+      // "Thinking…" when a session in an inactive project completes.
+      const allowedPaths = Array.isArray(workspacePath)
+        ? new Set(workspacePath.filter((p): p is string => typeof p === 'string' && p.length > 0))
+        : workspacePath
+          ? new Set([workspacePath])
+          : null;
+
       // Create new subscription
       const unsubscribe = stateManager.subscribe((stateEvent: SessionStateEvent) => {
-        // Workspace-scoped subscription: only send events for the window's workspace.
-        // This prevents foreign session lifecycle events from triggering cross-workspace reloads.
-        if (workspacePath) {
-          if (!stateEvent.workspacePath || stateEvent.workspacePath !== workspacePath) {
-            return;
-          }
-        }
+        void (async () => {
+          let sessionWorkspacePath: string | null = null;
 
-        // Send event to renderer
-        if (!window.isDestroyed()) {
-          window.webContents.send('ai-session-state:event', stateEvent);
-        }
+          // Workspace-scoped subscription: only send events for workspaces this
+          // window cares about. Pass an empty/undefined filter to receive events
+          // for all workspaces. Multi-project rail windows host several projects
+          // at once, so `allowedPaths` may contain multiple entries; an event
+          // matches if it routes to ANY of them. Worktree sessions emit events
+          // from the worktree path while their canonical workspace_id is the
+          // parent project, so we resolve the session's canonical workspace
+          // first and let `sessionEventMatchesWorkspace` consider both.
+          if (allowedPaths) {
+            sessionWorkspacePath = await getCanonicalWorkspacePathForSession(stateEvent.sessionId);
+            let matched = false;
+            for (const subscribed of allowedPaths) {
+              if (sessionEventMatchesWorkspace({
+                subscribedWorkspacePath: subscribed,
+                eventWorkspacePath: stateEvent.workspacePath,
+                sessionWorkspacePath,
+              })) {
+                matched = true;
+                break;
+              }
+            }
+            const isTerminal =
+              stateEvent.type === 'session:completed' ||
+              stateEvent.type === 'session:error' ||
+              stateEvent.type === 'session:interrupted';
+            if (!matched) {
+              // A workspace-filter miss on a NON-terminal event is dropped as
+              // before (those drive workspace-scoped state and need a real path).
+              // But a TERMINAL event is forwarded anyway: the renderer's terminal
+              // clear is keyed only by sessionId (workspace-agnostic), so
+              // over-delivering it is harmless, while dropping it pins the
+              // session's spinner (and a parent meta-agent header) on "Thinking..."
+              // - common for a worktree-resident meta-agent child whose canonical
+              // workspace_id has not committed or does not match this window.
+              if (!isTerminal) return;
+              console.warn(
+                `[SessionStateHandlers] forwarding unmatched terminal ${stateEvent.type} for session ` +
+                `${stateEvent.sessionId} (sessionWorkspacePath=${sessionWorkspacePath ?? 'null'}, ` +
+                `eventWorkspacePath=${stateEvent.workspacePath ?? 'null'}) to avoid a stuck spinner`,
+              );
+            }
+          }
+
+          // Send event to renderer with the canonical workspace path when known.
+          if (!window.isDestroyed()) {
+            window.webContents.send('ai-session-state:event', {
+              ...stateEvent,
+              workspacePath: resolveOwnedWorkspacePath({
+                eventWorkspacePath: stateEvent.workspacePath,
+                sessionWorkspacePath,
+              }) ?? stateEvent.workspacePath,
+            });
+          }
+        })();
       });
 
       // Store unsubscribe function
@@ -192,36 +338,59 @@ export async function registerSessionStateHandlers() {
 }
 
 /**
+ * Push a session lifecycle event's execution state (isExecuting) to the mobile
+ * sync channel. The sync provider is resolved per-event by the caller rather
+ * than captured once, so this works regardless of whether sync was ready when
+ * the subscription was registered, and survives provider swaps from
+ * `reinitializeSyncWithNewConfig`.
+ *
+ * NIM-945: when sync is not yet ready (provider null), we skip just this event
+ * and leave the subscription live — a stale "isExecuting=true" on mobile is
+ * otherwise never cleared, pinning the mobile spinner on "Thinking..." forever.
+ */
+export function pushExecutionStateToMobile(
+  event: SessionStateEvent,
+  syncProvider: import('@nimbalyst/runtime/sync').SyncProvider | null,
+): void {
+  if (
+    event.type !== 'session:started' &&
+    event.type !== 'session:completed' &&
+    event.type !== 'session:interrupted'
+  ) {
+    return;
+  }
+  if (!syncProvider) {
+    // Sync not enabled/ready yet for this event; the subscription stays live so
+    // future lifecycle events still reach mobile once the provider exists.
+    return;
+  }
+
+  const isExecuting = event.type === 'session:started';
+  const sessionId = event.sessionId;
+
+  console.log(`[SessionStateHandlers] Syncing execution state to mobile: sessionId=${sessionId} isExecuting=${isExecuting}`);
+
+  syncProvider.pushChange(sessionId, {
+    type: 'metadata_updated',
+    metadata: {
+      isExecuting,
+      updatedAt: Date.now(),
+    },
+  });
+}
+
+/**
  * Setup sync subscription to push execution state changes to mobile
  */
 function setupSyncSubscription(stateManager: ReturnType<typeof getSessionStateManager>): void {
-  // Lazy load sync manager to avoid circular dependencies
+  // Lazy load sync manager to avoid circular dependencies.
+  // The subscription is ALWAYS registered (even if sync is not yet ready) and
+  // resolves the provider per-event via getSyncProvider() — see NIM-945.
   import('../services/SyncManager').then(({ getSyncProvider }) => {
-    const syncProvider = getSyncProvider();
-    if (!syncProvider) {
-      console.log('[SessionStateHandlers] Sync not enabled, skipping execution state sync');
-      return;
-    }
-
     console.log('[SessionStateHandlers] Setting up execution state sync to mobile');
 
     const unsubscribe = stateManager.subscribe((event: SessionStateEvent) => {
-      // Sync execution state changes to mobile
-      if (event.type === 'session:started' || event.type === 'session:completed' || event.type === 'session:interrupted') {
-        const isExecuting = event.type === 'session:started';
-        const sessionId = event.sessionId;
-
-        console.log('[SessionStateHandlers] Syncing execution state:', { sessionId, isExecuting });
-
-        // Push metadata update with isExecuting state
-        syncProvider.pushChange(sessionId, {
-          type: 'metadata_updated',
-          metadata: {
-            isExecuting,
-            updatedAt: Date.now(),
-          },
-        });
-      }
+      pushExecutionStateToMobile(event, getSyncProvider());
     });
 
     syncSubscriptionCleanup = unsubscribe;
@@ -235,16 +404,7 @@ function setupSyncSubscription(stateManager: ReturnType<typeof getSessionStateMa
  * Used by the quit handler to show a confirmation dialog.
  */
 export function hasActiveStreamingSessions(): boolean {
-  const stateManager = getSessionStateManager();
-  const activeIds = stateManager.getActiveSessionIds();
-
-  for (const sessionId of activeIds) {
-    const state = stateManager.getSessionState(sessionId);
-    if (state && (state.status === 'running' || state.isStreaming)) {
-      return true;
-    }
-  }
-  return false;
+  return getSessionStateManager().getRunningSessionIds().length > 0;
 }
 
 /**

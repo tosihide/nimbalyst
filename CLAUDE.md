@@ -1,368 +1,240 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+Guidance for Claude Code (claude.ai/code) when working in this repository.
 
-## CRITICAL: Use @floating-ui/react for All Popover/Tooltip/Menu Positioning
+## Critical Rules (read first)
 
-See [floating-ui.md](./.claude/rules/floating-ui.md) for full guidance. Never manually calculate `position: fixed` coordinates — always use `@floating-ui/react` with `FloatingPortal`.
+### Keep Commit Messages and CHANGELOG Entries Short
 
-## CRITICAL: No Dynamic Imports in Electron Main Process
+**One-sentence commit subject. One-sentence CHANGELOG bullet.** Commit bodies may include short bullets for distinct key changes — one line each, no prose paragraphs, no root-cause explanations unless the diff truly can't explain itself. Match the existing voice in `[Unreleased]` and recent `git log --oneline`. If your draft is longer than the surrounding entries, cut it before submitting.
 
-**NEVER convert static imports to dynamic \****`await import()`**\*\* unless absolutely necessary** (confirmed circular reference) AND the user has approved it.
+**One feature = one CHANGELOG bullet, no matter how many commits built it.** A multi-commit feature (e.g. a whole panel landed over a dozen PRs) gets a single user-facing line, not one bullet per commit. Do NOT append a new bullet for every follow-up commit to the same feature — edit the existing bullet instead. The `[Unreleased]` section must read like a short release summary, not a commit log.
 
-Dynamic imports in the Electron main process cause `__ELECTRON_LOG__` double-registration crashes and other side-effect timing issues. All MCP servers and services in `index.ts` use **static top-level imports** - follow this pattern.
+**Never put internal scaffolding in the CHANGELOG.** No table/column names, IPC channel names, service/store class names, env-var plumbing, migration registration, poll intervals, or "internal scaffolding for the upcoming X" bullets. The changelog answers "what can I now do / what's fixed" for a user — if a line names a symbol or a file, it's wrong. Internal-only changes (typecheck, tests, refactors, doc/agent tweaks, lint, dep bumps with no behavior change) get NO entry.
 
-- `httpServer`, `SessionNamingService`, `sessionContextServer` - all use static top-level imports
-- Dynamic `await import('./mcp/sessionContextServer')` caused server startup failure - fixed by switching to static import
+**At release time, condense — don't ship the dev-time bullets verbatim.** `[Unreleased]` accumulates verbose per-commit bullets during development. Before tagging, collapse them: merge a feature's scattered bullets into one line, drop scaffolding, squash near-duplicates. If the release notes are longer than the equivalent section in a recent shipped version, cut harder.
 
-## CRITICAL: CollabV3 Data Isolation -- DOs for Customer Data, D1 for Entity Management Only
+### Use @floating-ui/react for All Popover/Tooltip/Menu Positioning
 
-**Never store customer, org, or team-sensitive data in the D1 shared database.** D1 is a multi-tenant SQL database where every Worker request can query any row. Customer data (team metadata, member roles, key envelopes, tracker items, documents, sessions) must live in Durable Objects where each entity gets its own isolated SQLite instance. D1 is only for cross-entity management lookups (e.g., git remote hash -> org ID mapping). See `packages/collabv3/CLAUDE.md` for the full policy.
+See [floating-ui.md](./.claude/rules/floating-ui.md). Never manually calculate `position: fixed` coordinates — always use `@floating-ui/react` with `FloatingPortal`.
 
-## CRITICAL: Never Use Environment Variables as Implicit API Key Sources
+### No Dynamic Imports in Electron Main Process
 
-**NEVER read API keys from `process.env` as a fallback for provider authentication.** API keys must only come from values the user explicitly configured in Nimbalyst settings (the electron-store `apiKeys` object or project-level overrides).
+**NEVER convert static imports to dynamic `await import()`** unless absolutely necessary (confirmed circular reference) AND the user has approved it. Dynamic imports cause `__ELECTRON_LOG__` double-registration crashes and side-effect timing issues. All MCP servers and services in `index.ts` use static top-level imports. The only allowed exception is `bootstrap.ts` importing `index.ts` (see [MAIN_PROCESS_INIT.md](./packages/electron/MAIN_PROCESS_INIT.md)).
 
-A user had `ANTHROPIC_API_KEY` in a `.env` file for unrelated development. Nimbalyst silently picked it up via `process.env`, auto-persisted it into the settings store, and used it for API calls — billing the user's personal Anthropic account $100+ instead of their Nimbalyst subscription.
+### CollabV3 Data Isolation — DOs for Customer Data, D1 for Entity Management Only
 
-- **No env fallbacks**: `getApiKeyForProvider` must return only from `globalApiKeys[provider]` or project-level overrides — never `process.env.*_API_KEY`
-- **No auto-import**: Never copy env vars into the settings store automatically (the old `initializeApiKeys` pattern)
-- **No implicit enablement**: Provider availability checks must only consider explicitly-stored keys, not env vars
+**Never store customer, org, or team-sensitive data in the D1 shared database.** Customer data (team metadata, member roles, key envelopes, tracker items, documents, sessions) must live in Durable Objects where each entity gets its own isolated SQLite instance. D1 is only for cross-entity management lookups (e.g., git remote hash → org ID mapping). See `packages/collabv3/CLAUDE.md` for the full policy.
 
-If you are tempted to add `|| process.env.SOME_API_KEY` as a convenience fallback, **stop**. The user did not consent to using that key with Nimbalyst.
+### Never Use Environment Variables as Implicit API Key Sources
 
-## CRITICAL: Database Access Rules
+**NEVER read API keys from `process.env` as a fallback for provider authentication.** API keys must come only from values the user explicitly configured in Nimbalyst settings (the electron-store `apiKeys` object or project-level overrides).
 
-**NEVER directly open or query the PGLite database files using Node.js or command-line tools.**
+Past incident: a user had `ANTHROPIC_API_KEY` in a `.env` file for unrelated work. Nimbalyst silently picked it up via `process.env`, auto-persisted it, and billed the user's personal Anthropic account $100+ instead of their Nimbalyst subscription.
 
-The database at `~/Library/Application Support/@nimbalyst/electron/pglite-db` uses PID-based locking and **can only be safely accessed by one process at a time**. Opening it from a second process (like a Node.js script) will:
-- Corrupt the database
-- Require database recovery
-- Potentially lose data
+- No env fallbacks in `getApiKeyForProvider` — only `globalApiKeys[provider]` or project-level overrides
+- No auto-import into the settings store
+- Provider availability checks must only consider explicitly-stored keys
+
+If you are tempted to add `|| process.env.SOME_API_KEY` as a convenience fallback, **stop**.
+
+### Personal JWT vs Team JWT — Never Interchange Them
+
+Stytch B2B gives a user a **different member id per org**. The **personal JWT** (`getPersonalSessionJwt()` / `personalUserId`) is for **personal sync ONLY** (the personal index room + session/prompt/draft/settings sync to the **mobile app**). The **team JWT** (`getSessionJwt()` / `getOrgScopedJwt(orgId)`) authorizes **ALL team collaboration** (tracker rooms, schema sync, document rooms, team room, project-access gate). Conflating them is this codebase's most-repeated sync bug.
+
+Use the branded types in `packages/runtime/src/auth/jwtScopes.ts` so a mix-up is a compile error. When "a second client can't see shared data", first check it's actually authenticated (an expired session is silently logged out → no team JWT). See [jwt-scopes.md](./.claude/rules/jwt-scopes.md) and [SYNC_JWT_MODEL.md](./docs/SYNC_JWT_MODEL.md).
+
+### Database Access Rules
+
+**Nimbalyst currently supports BOTH PGLite and better-sqlite3.** The migration is in progress; both backends are active in the codebase and the user's machine may be running either. Never write code that assumes one backend. Anywhere you touch the database — schema, queries, JSON handling, write paths — read [packages/electron/DATABASE.md](./packages/electron/DATABASE.md) for the divergent behaviors first.
+
+The biggest gotcha: **JSONB sub-extraction (`data->'someKey'`) returns a parsed object on PGLite but a JSON string on SQLite.** Either select the whole `data` column and parse it, or defensively parse the sub-extracted value with the standard `typeof x === 'string' ? JSON.parse(x) : x` idiom. A real bug from this divergence corrupted tracker `labelsMap` rows on 2026-06-02 because `applyRemoteItem` trusted the sub-extraction was already an object.
+
+**NEVER directly open or query the database files using Node.js or command-line tools.** PGLite at `~/Library/Application Support/@nimbalyst/electron/pglite-db` uses PID-based locking; better-sqlite3 takes its own exclusive lock. In both cases, opening from a second process risks corruption.
 
 **ALWAYS use the MCP database query tool instead:**
-- ✅ Use `mcp__nimbalyst-extension-dev__database_query` for all database queries
-- ❌ NEVER use `node -e "const { PGlite } = require(...)"` or similar approaches
-- ❌ NEVER use sqlite CLI or any direct file access
+- Use `mcp__nimbalyst-extension-dev__database_query` for all database queries
+- NEVER use `node -e "const { PGlite } = require(...)"` or sqlite CLI
 
-The MCP tool safely queries the database through the running Nimbalyst process, which already has the exclusive lock.
+**For sync/collab bugs, local PGLite ≠ server collab state.** `tracker_body_cache`, `documents`, and other sync-related tables only reflect the local side. The authoritative state for shared trackers/documents lives in Cloudflare Workers (`packages/collabv3/` DurableObjects) and must be inspected separately via `wrangler tail` against the prod sync worker, or via wrangler-backed E2E tests (`tracker-content-collab.spec.ts` / `tracker-sync-collab.spec.ts` patterns, `RUN_COLLAB_TESTS=1`, `document-sync:open-test` IPC for Stytch bypass). Confirming "the body is in PGLite" is not the same as confirming "the body is on the server." See `feedback_local_state_vs_server_state.md`.
+
+### Always Run Your Own Observation Commands — Don't Push Logs/Curl/Tail to the User
+
+**Never ask the user to run `curl`, `wrangler tail`, `tail -f`, `gh` commands, or paste logs.** The agent has direct tool access to all of these.
+
+- Logs: `mcp__nimbalyst-extension-dev__get_main_process_logs` and `get_renderer_debug_logs`
+- Database: `mcp__nimbalyst-extension-dev__database_query`
+- HTTP: `Bash` with `curl` — the agent runs it
+- Cloudflare workers: `Bash` with `wrangler tail` — the agent runs it (long-running tails can use `run_in_background`)
+- GitHub: `Bash` with `gh`
+- Runtime DOM / renderer state: `mcp__nimbalyst-extension-dev__renderer_eval`
+
+Past incident: session `702519e3` spent 23 turns debugging a Stytch JWKS rotation because the agent kept handing back commands for the user to run. The user finally said "run tail yourself!" and "you curl it!". If you catch yourself drafting "could you run X and paste the output?", stop and run X.
+
+Detailed patterns: [DEBUGGING_LOGS.md](./docs/DEBUGGING_LOGS.md).
+
+### End-to-End Verification Before Declaring Victory
+
+For any bug whose verification requires a `/restart` or a user manually exercising a UI flow, the **first** deliverable is a failing test that the fix must make pass. Never announce "fixed" before observing the bug go from broken to working — either via a test that flips red→green, or via logs showing the failing step now succeeding. See [end-to-end-verification.md](./.claude/rules/end-to-end-verification.md).
+
+Past incident: the 2026-05-20 tracker-body workstream announced "fixed" at least four times before the user finally said "you're killing me." Each announcement was based on "the code path looks right" or "tests pass," neither of which is the same as "the user can open the tracker and see the body."
 
 ## Codebase Overview
 
-Nimbalyst is an extensible, AI-native workspace that supports multiple editor types through a unified extension system. While it originated as a Lexical-based markdown editor, the architecture is evolving toward a fully pluggable model where **all editors** - including the core Lexical editor, Monaco code editor, spreadsheets, diagrams, and custom visual editors - are provided through extensions.
+Nimbalyst is an extensible, AI-native workspace that supports multiple editor types through a unified extension system. While it originated as a Lexical-based markdown editor, the architecture is evolving toward a fully pluggable model where **all editors** — Lexical, Monaco, spreadsheets, diagrams, custom visual editors — are provided through extensions.
 
-This is a monorepo containing multiple packages including the Electron desktop app, runtime services (including the Lexical-based editor), extension SDK, native iOS app, and mobile support via Capacitor (for Android).
+This monorepo contains the Electron desktop app, runtime services (including the Lexical editor), extension SDK, native iOS app, and mobile support via Capacitor.
 
 ## Extension Architecture
 
-Nimbalyst's extension system allows third-party and built-in extensions to provide custom editors, file handlers, and UI components. Extensions are self-contained packages that declare their capabilities via a manifest and communicate with the host application through a well-defined contract.
-
-**Key concepts:**
-- **EditorHost**: The interface editors use to communicate with Nimbalyst (loading/saving content, marking dirty state, handling external file changes)
-- **File type registration**: Extensions declare which file extensions they handle (e.g., `.excalidraw`, `.mockup.html`, `.datamodel`)
-- **Editor types**: Monaco (code), Lexical (rich text), and custom React components for specialized editing experiences
-
-See [EXTENSION_ARCHITECTURE.md](./docs/EXTENSION_ARCHITECTURE.md) for the EditorHost contract, supported editor types, and extension development guidelines.
+See [EXTENSION_ARCHITECTURE.md](./docs/EXTENSION_ARCHITECTURE.md) for the EditorHost contract, supported editor types (Monaco, Lexical, custom React), the manifest format, and extension development guidelines.
 
 ## Monorepo Structure
 
-### Workspaces
 ```
 packages/
   electron/       # Desktop app (Electron)
   runtime/        # Cross-platform runtime services (AI, sync, Lexical editor)
   ios/            # Native iOS app (SwiftUI)
   core/           # Shared utilities
-  collabv3/       # Collaboration server
+  collabv3/       # Collaboration server (Cloudflare Workers)
   extension-sdk/  # Extension development kit
   extensions/     # Built-in extensions
 ```
 
-### Package Management
-- **Install dependencies**: `npm install` at repository root
-- **Uses npm workspaces** (not pnpm)
-- Packages can reference each other via workspace protocol
-- **IMPORTANT: Preserve \****`peer: true`**\*\* flags in package-lock.json** - The lock file contains `peer: true` flags for optional native dependencies (like esbuild platform binaries). Running `npm install` with certain npm versions or configurations can strip these flags, breaking CI. If you see `peer: true` flags disappearing from package-lock.json diffs, investigate before committing.
+- **Install**: `npm install` at repository root
+- **npm workspaces** (not pnpm); packages reference each other via workspace protocol
+- **Preserve `peer: true` flags in package-lock.json** — Some `npm install` configurations strip these flags, breaking CI for optional native dependencies (e.g., esbuild platform binaries). Investigate before committing if you see them disappearing.
 
-### Package-Specific Documentation
-For detailed information about specific packages, see their CLAUDE.md files:
-- `/packages/electron/CLAUDE.md` - Electron desktop app specifics
-- `/packages/runtime/CLAUDE.md` - AI providers, runtime services, and Lexical editor
-- `/packages/ios/CLAUDE.md` - Native iOS app (SwiftUI)
-- `/packages/collabv3/CLAUDE.md` - Sync server (Cloudflare Workers)
+Package-specific docs: `/packages/electron/CLAUDE.md`, `/packages/runtime/CLAUDE.md`, `/packages/ios/CLAUDE.md`, `/packages/collabv3/CLAUDE.md`.
 
 ## Development Commands
 
-### Electron App
-- **Start dev server**: `cd packages/electron && npm run dev`
-- **Build for Mac**: `cd packages/electron && npm run build:mac:local`
-- **Build for Mac (notarized)**: `cd packages/electron && npm run build:mac:notarized`
-- **Main process log file**: `~/Library/Application Support/@nimbalyst/electron/logs/main.log`
+**Electron app:**
+- Start dev: `cd packages/electron && npm run dev` (user runs this — don't do it yourself)
+- Build for Mac: `npm run build:mac:local` or `npm run build:mac:notarized`
+- Main process log: `~/Library/Application Support/@nimbalyst/electron/logs/main.log`
 
-### Testing
-- **Unit tests**: `npm run test:unit` - Uses vitest
-- **Test UI**: `npm run test:unit:ui`
-- **E2E tests**: See [E2E_TESTING.md](./docs/E2E_TESTING.md) for comprehensive documentation
+**Testing:**
+- Unit: `npm run test:unit` (vitest), or `npm run test:unit:ui`
+- E2E: see [E2E_TESTING.md](./docs/E2E_TESTING.md)
 
-### Marketing Screenshots & Videos
-- **Capture all**: `cd packages/electron && npm run marketing:screenshots`
-- **Capture by category**: `cd packages/electron && npm run marketing:screenshots:grep -- "hero-"` (also: `editor-`, `ai-`, `settings-`, `feature-`, `video-`)
-- **Requires dev server running** on port 5273 (`cd packages/electron && npm run dev`)
-- **Output**: `packages/electron/marketing/screenshots/{dark,light}/` (1440x900 PNG) and `packages/electron/marketing/videos/{dark,light}/` (WebM)
-- **Post-process videos**: `bash packages/electron/marketing/process-videos.sh` (converts WebM to MP4/GIF via ffmpeg)
-- See [MARKETING_SCREENSHOTS.md](./docs/MARKETING_SCREENSHOTS.md) for architecture, output inventory, and how to add new screenshots
+**Marketing screenshots & videos:** See [MARKETING_SCREENSHOTS.md](./docs/MARKETING_SCREENSHOTS.md). Quick: `cd packages/electron && npm run marketing:screenshots` (requires dev server on port 5273).
 
-### Running Multiple Dev Instances
+**Multiple dev instances** (for collab/sync testing): `cd packages/electron && npm run dev:user2` uses an isolated `NIMBALYST_USER_DATA_DIR`, `VITE_PORT=5274`, and `--outDir=out2` to prevent file-watcher cross-talk. Worktrees auto-derive a per-worktree userData dir via `crystal-run.sh`.
 
-For testing collaborative features (teams, sync, etc.), you can run multiple isolated Electron instances simultaneously. Each instance needs its own **userData directory** (settings, database, credentials) and **Vite port** to avoid conflicts.
-
-**Second instance on same checkout:**
-```bash
-cd packages/electron && npm run dev:user2
-```
-This uses `NIMBALYST_USER_DATA_DIR` for an isolated userData dir, `VITE_PORT=5274`, and `--outDir=out2` to prevent electron-vite file watcher cross-talk between instances.
-
-**Worktree instance** (via `crystal-run.sh`):
-Worktrees already have separate source/build trees, so no `--outDir` is needed. When `WORKTREE_MODE=true`, `crystal-run.sh` automatically derives a per-worktree userData dir (`electron-wt-<name>`).
-
-**Why separate outDir matters:** Without it, two `electron-vite dev` processes sharing the same `out/main/index.js` cause the file watcher on one instance to restart the other on rebuild. Module-level singletons (like the `electron-store` instances) from one process bleed into the other, cross-pollinating settings, theme, and workspace state.
-
-**Path resolution:** `getPreloadPath()` and `getPackageRoot()` in `src/main/utils/appPaths.ts` correctly resolve preload scripts and worker bundles regardless of which outDir is in use. All window files use these helpers -- do not inline path resolution logic.
-
-### Other Packages
-- **iOS (native)**: `npm run ios:test:swift`, `npm run ios:build:transcript`
-- **Collaboration server**: `npm run collabv2:dev`, `npm run collabv2:deploy`
+**Other packages:** iOS — `npm run ios:test:swift`, `npm run ios:build:transcript`. Collab server — `npm run collabv2:dev`, `npm run collabv2:deploy`.
 
 ## Releases
 
-For detailed release instructions, see [RELEASING.md](./RELEASING.md).
-
-**Quick reference:**
-- Use the `/release [patch|minor|major]` command
-- All release notes go in the `[Unreleased]` section of `CHANGELOG.md`
-- The release script automatically creates versioned entries and annotated git tags
+See [RELEASING.md](./RELEASING.md). Use `/release-alpha [patch|minor|major]`. All release notes go in the `[Unreleased]` section of `CHANGELOG.md`; the script creates versioned entries and annotated git tags.
 
 ## Cross-Cutting Patterns
 
-### Error Handling Philosophy
-
-**CRITICAL: Fail fast, fail loud. Never hide failures.**
-
-1. **Never log-and-continue for required parameters** - throw immediately instead
-2. **Never fall back to default values that mask routing issues** - fail if routing is broken
-3. **Always use stable identifiers for routing** - workspace paths (stable) not window IDs (transient)
-4. **Validate at boundaries** - All IPC handlers and service methods MUST validate required parameters
-
-**Rule of thumb:** If you're adding code to "handle" missing required data, you're probably hiding a bug. Throw instead.
-
-### Workspace State Persistence
-
-**CRITICAL: Use deep merge for all nested workspace state updates.**
-
-The `workspace:update-state` IPC handler uses a **deep merge** function (not shallow `Object.assign`). This allows multiple modules to safely update different fields in nested structures without overwriting each other. No manual read-modify-write needed.
-
-### Naming Conventions
-
-**Use camelCase everywhere except SQL column names and file system paths.**
-
-- **TypeScript/Swift interfaces, fields, variables**: `camelCase` always
-- **Wire protocol (WebSocket/HTTP JSON)**: `camelCase` - no snake_case in JSON payloads
-- **Message type discriminators**: `camelCase` (e.g., `'syncRequest'`, `'appendMessage'`, NOT `'sync_request'`, `'append_message'`)
-- **SQL column names**: `snake_case` (standard SQL convention, stays internal to the database layer)
-- **Row-to-wire mappers**: When reading from SQL, map `snake_case` columns to `camelCase` fields at the boundary (e.g., `{ sessionId: row.session_id }`)
-
-This applies to all packages: collabv3 server, runtime sync client, Electron SyncManager, and iOS SyncProtocol. Never introduce snake_case into wire-format JSON even if it "looks more API-like" - this is a private protocol consumed only by our own TypeScript and Swift clients.
-
-## Documentation Reference
-
-**You MUST read the relevant documentation files when working on or investigating issues in the corresponding areas.**
-
-Read the file **in its entirety** before making changes. These documents contain critical patterns, anti-patterns, and architectural decisions that must be followed. Treat them as authoritative instructions equivalent to anything in this CLAUDE.md file.
-
-| File | Description | Read when... |
-| --- | --- | --- |
-| [EXTENSION_ARCHITECTURE.md](./docs/EXTENSION_ARCHITECTURE.md) | Documents the EditorHost contract that all editors must implement, supported editor types (Monaco, Lexical, custom), and how extensions register capabilities. Includes the extension manifest format and lifecycle hooks. | Working on extensions, creating custom editors, modifying how editors communicate with the host, or adding new editor types to the system. |
-| [IPC_LISTENERS.md](./docs/IPC_LISTENERS.md) | Explains the centralized IPC listener architecture where components NEVER subscribe to IPC events directly. Central listeners in `store/listeners/` update Jotai atoms, and components read from atoms. Includes debouncing patterns. | Adding new IPC events, debugging why events aren't reaching components, fixing race conditions or stale closures in event handling, or seeing MaxListenersExceededWarning errors. |
-| [IPC_GUIDE.md](./docs/IPC_GUIDE.md) | Covers IPC patterns for main/renderer communication including `safeHandle`, `safeOn`, error handling, and how to structure IPC channels. Documents the preload API and type safety patterns. | Writing new IPC handlers in the main process, creating new electronAPI methods, or debugging IPC communication issues between main and renderer. |
-| [EDITOR_STATE.md](./docs/EDITOR_STATE.md) | Explains why "lift state up" is an anti-pattern for editors in this codebase. Editors own their content state via EditorHost, not parent components. Covers Jotai atom families for tab metadata (dirty, processing). | Working on editor components, TabEditor infrastructure, understanding why editor state is structured this way, or fixing state management issues in editors. |
-| [JOTAI.md](./docs/JOTAI.md) | Covers derived atoms for session state, atom families for per-entity state, and persistence patterns. Documents critical anti-patterns like dynamic imports in atoms and async derived atoms that cause state divergence. | Working with Jotai atoms, debugging state divergence between UI and actual state, adding new atoms, or understanding why state updates aren't reflecting in components. |
-| [STATE_PERSISTENCE.md](./docs/STATE_PERSISTENCE.md) | Documents migration safety patterns for persisted state that may be missing fields added after it was saved. Covers `createDefault*()` functions, `??` operator merging, and the checklist for adding new persisted fields. | Adding new fields to any persisted state interface (workspace state, app settings, workstream state), or debugging "Cannot read properties of undefined" errors on app load. |
-| [UI_PATTERNS.md](./docs/UI_PATTERNS.md) | Covers the canonical `--nim-*` CSS variable names and their Tailwind equivalents, container queries (not media queries), Tailwind conditional class patterns using ternaries, and text selection opt-in rules. | Writing UI components, styling with CSS or Tailwind, fixing styling inconsistencies, or adding responsive behavior to panels and components. |
-| [AI_PROVIDER_TYPES.md](./docs/AI_PROVIDER_TYPES.md) | Distinguishes Agent providers (Claude Code with MCP support, file system access) from Chat providers (Claude Chat, OpenAI, LM Studio with direct API calls). Documents model selection rules and provider-specific behaviors. | Working on AI integration, adding new AI providers, modifying how models are selected, or debugging provider-specific issues. |
-| [TRANSCRIPT_ARCHITECTURE.md](./docs/TRANSCRIPT_ARCHITECTURE.md) | Documents the two-tier transcript storage (raw messages -> canonical events), the TranscriptTransformer pipeline, per-provider parsers (ClaudeCodeRawParser, CodexRawParser), CanonicalEventDescriptor types, watermark-based processing, and mobile sync integration. | Working on transcript rendering, adding new parser support, debugging missing/duplicate events, modifying how raw messages are transformed, or understanding the canonical event pipeline. |
-| [CONTEXT_WINDOW_USAGE_TRACKING.md](./docs/CONTEXT_WINDOW_USAGE_TRACKING.md) | Explains how context window fill percentage is extracted from Claude Agent SDK streaming chunks (per-step vs cumulative usage), compaction handling, and subagent isolation. | Working on context usage display, token tracking, ClaudeCodeProvider streaming, or debugging why context percentage is wrong. |
-| [INTERNAL_MCP_SERVERS.md](./docs/INTERNAL_MCP_SERVERS.md) | Documents how to implement MCP servers that run inside Nimbalyst, including the server lifecycle, tool registration, and how to expose functionality to Claude Code sessions. | Adding new MCP server functionality, creating new tools for AI agents, or understanding how existing MCP servers work. |
-| [CUSTOM_TOOL_WIDGETS.md](./docs/CUSTOM_TOOL_WIDGETS.md) | Explains how to create custom React widgets that replace the generic tool call display for specific MCP tools. Covers the widget registry, props interface, and rendering lifecycle. | Creating visual displays for MCP tool results, customizing how specific tools appear in the chat transcript, or debugging widget rendering issues. |
-| [INTERACTIVE_PROMPTS.md](./docs/INTERACTIVE_PROMPTS.md) | Documents the durable prompts architecture for AskUserQuestion, ExitPlanMode, GitCommitProposal, and ToolPermission widgets. These prompts persist across page reloads and have special handling for user responses. | Working on interactive prompt widgets, adding new durable prompt types, or debugging why prompts aren't persisting or responding correctly. |
-| [WORKTREES.md](./docs/WORKTREES.md) | Covers git worktree integration for isolated AI coding sessions. Documents the database schema, IPC channels, branch naming conventions, and how worktrees relate to sessions (one-to-many). | Working on worktree features, session isolation, or understanding how AI sessions connect to git worktrees. |
-| [HELP_WALKTHROUGHS.md](./docs/HELP_WALKTHROUGHS.md) | Documents the HelpContent registry keyed by `data-testid`, HelpTooltip wrapper component, and walkthrough definitions for multi-step guides. Covers both hover tooltips and inline help icons. | Adding help tooltips to UI elements, creating new walkthrough guides, or modifying existing help content. |
-| [WALKTHROUGHS.md](./docs/WALKTHROUGHS.md) | Additional documentation on the walkthrough system including step definitions, positioning, and triggering conditions for multi-step floating guides. | Creating complex multi-step walkthroughs or debugging walkthrough flow issues. |
-| [E2E_TESTING.md](./docs/E2E_TESTING.md) | Covers E2E testing patterns including test structure, selectors, waiting strategies, and common pitfalls. Documents the test utilities and how to handle async operations in tests. Also includes AI agent guidelines for when to run tests in dev containers and how to run targeted tests. | Writing new E2E tests, debugging flaky tests, understanding why tests are failing, or running E2E tests as an AI agent (especially in git worktrees). |
-| [DIALOGS.md](./docs/DIALOGS.md) | Documents the DialogProvider system for modal dialogs including the dialog registry, opening/closing patterns, and how dialogs receive props and return results. | Adding new modal dialogs, modifying existing dialog behavior, or debugging dialog state issues. |
-| [AGENT_PERMISSIONS.md](./docs/AGENT_PERMISSIONS.md) | Covers the tool permission system for AI agents including permission levels, approval flows, and how permissions are persisted and checked at runtime. | Working on agent permissions, adding new permission types, or debugging why tools are being blocked or auto-approved. |
-| [ANALYTICS_GUIDE.md](./docs/ANALYTICS_GUIDE.md) | Documents how to add PostHog analytics events including event naming conventions, property schemas, and best practices. Required reading before using PostHog MCP tools. | Adding new analytics events, modifying existing events, or using the PostHog MCP tools for querying analytics. |
-| [POSTHOG_EVENTS.md](./docs/POSTHOG_EVENTS.md) | Canonical reference listing all PostHog events with their names, file locations, triggers, and properties. Must be kept in sync when adding, modifying, or removing events. | Adding, modifying, or removing any PostHog analytics event. Update this file whenever you change events. |
-| [POSTHOG_MCP_INTEGRATION.md](./docs/POSTHOG_MCP_INTEGRATION.md) | Documents the PostHog MCP server architecture, available tools, and how to query analytics data programmatically from AI sessions. | Using PostHog MCP tools to query analytics, debugging MCP integration issues, or extending PostHog functionality. |
-| [THEMING.md](./packages/electron/docs/THEMING.md) | Documents the theming system including theme definition format, color variables, and how themes are applied across the application. | Working on themes, adding new color schemes, or debugging theme-related styling issues. |
-| [RELEASING.md](./RELEASING.md) | Documents the release process including version bumping, changelog management, git tagging, and the `/release` command. Covers both local and notarized builds. | Preparing a release, understanding the release workflow, or debugging release script issues. |
-| [MARKETING_SCREENSHOTS.md](./docs/MARKETING_SCREENSHOTS.md) | Documents the Playwright-based marketing screenshot and video capture system. Covers the fixture workspace, helper utilities, DOM cursor for video, output file inventory, and how to add new screenshots or video choreography. | Adding new marketing screenshots, modifying video choreography, updating the fixture workspace data, or importing output files into the marketing website. |
-| [FILE_WATCHING_AND_CHANGE_TRACKING.md](./docs/FILE_WATCHING_AND_CHANGE_TRACKING.md) | Documents the file watching infrastructure (ChokidarFileWatcher, OptimizedWorkspaceWatcher, GitRefWatcher, SessionFileWatcher), AI change tracking pipeline (SessionFileTracker, HistoryManager, ToolCallMatcher), IPC event flow, Jotai atoms for file state, and the red/green diff display system (DiffPreview, TextDiffViewer, MonacoDiffViewer, DiffPreviewEditor). | Working on file watchers, AI change detection, diff display, pending review flow, snapshot storage, file change conflict handling, or the FilesEditedSidebar. |
-| [WEEKLY_DASHBOARD.md](./docs/WEEKLY_DASHBOARD.md) | Rules for the PostHog "Weeklys" dashboard. All insights must query `WEEKLY_USERS_BASE_VIEW`, use stacked bar charts summing to 100%, and include all four user segments. Documents the new/returning split convention and example queries. | Adding or modifying insights on the Weeklys PostHog dashboard, or working with the `WEEKLY_USERS_BASE_VIEW` materialized view. |
-| [VOICE_MODE.md](./docs/VOICE_MODE.md) | Documents the dual-agent voice mode architecture: OpenAI Realtime API for speech, coding agent for technical work. Covers the full data flow, IPC channels, Jotai atoms, listen state machine, session persistence, audio pipeline, settings, and MCP tool integration. | Working on voice mode features, modifying the voice agent system prompt, changing audio capture/playback, adding voice agent tools, debugging voice session lifecycle, or understanding how voice connects to coding sessions. |
-
-## AI Features
-
-- **AI Chat Panel**: Multi-provider support (Claude, OpenAI, LM Studio, Claude Code), document-aware, Cmd+Shift+A to toggle
-- **Session Manager**: Global session view (Cmd+Alt+S), search, export, delete
-- **Model Configuration**: Dynamic model selection from provider APIs, no hardcoded models
-- **Git Worktrees**: Isolated AI coding sessions on separate branches via "New Worktree" button
+- **Error handling** — fail fast, validate at boundaries, workspace-scoped IPC takes `workspacePath` explicitly. See [ERROR_HANDLING.md](./docs/ERROR_HANDLING.md).
+- **Naming conventions** — `camelCase` for wire protocol/JSON; `snake_case` only for SQL columns. See [NAMING_CONVENTIONS.md](./docs/NAMING_CONVENTIONS.md).
+- **React DOM markers** — Tailwind utilities don't replace semantic class names. Every meaningful component needs a stable kebab-case class on its root. See [REACT_DOM_MARKERS.md](./docs/REACT_DOM_MARKERS.md).
 
 ## Data Persistence
 
-The Nimbalyst app uses **PGLite** (PostgreSQL in WebAssembly) for all data storage.
+The app uses **PGLite** (PostgreSQL in WebAssembly) for all data storage.
 
-**CRITICAL: Never use localStorage in the renderer process.** Use instead:
-- **app-settings store** for global app settings
-- **workspace-settings store** for per-project state
-- **PGLite database** for complex data like AI sessions and document history
+- **Never use `localStorage` in the renderer.** Use app-settings store (global), workspace-settings store (per-project), or PGLite (complex data like AI sessions/document history).
+- **All database timestamps must use `TIMESTAMPTZ`.** Never create `TIMESTAMP` (without timezone) columns; migrate legacy tables.
 
-**CRITICAL: All database timestamps must use \****`TIMESTAMPTZ`**\*\*.** Never create `TIMESTAMP` (without timezone) columns. If legacy tables exist, add a migration to convert those columns to `TIMESTAMPTZ`.
+See [DATABASE.md](./packages/electron/DATABASE.md) for tables, locations, shutdown rules, and timestamp handling.
 
-For implementation details, see `/packages/electron/CLAUDE.md`.
+## Transcript Storage
 
-## Canonical Transcript Storage
+Two-tier architecture — `ai_agent_messages` (raw append-only log, sole source of truth) → `ai_transcript_events` (canonical, provider-agnostic, derived). The `TranscriptTransformer` is the single writer of canonical events; providers only write raw. See [TRANSCRIPT_ARCHITECTURE.md](./docs/TRANSCRIPT_ARCHITECTURE.md).
 
-The AI transcript system uses a two-tier architecture. See [TRANSCRIPT_ARCHITECTURE.md](./docs/TRANSCRIPT_ARCHITECTURE.md) for the full design.
+## Documentation Reference
 
-- **`ai_agent_messages`** -- Append-only raw source log preserving provider-native payloads. Sole source of truth.
-- **`ai_transcript_events`** -- Canonical, provider-agnostic events derived from raw messages. Used for rendering, search, and sync.
+**Read the relevant doc in its entirety before making changes in that area.** These contain authoritative patterns, anti-patterns, and architectural decisions.
 
-**Key components** (in `packages/runtime/src/ai/server/transcript/`):
-- **TranscriptTransformer** -- Single path from raw messages to canonical events. Batch mode (`ensureUpToDate`) for lazy migration on session load; incremental mode (`processNewMessages`) for real-time processing during streaming.
-- **Per-provider parsers** (`parsers/ClaudeCodeRawParser`, `parsers/CodexRawParser`) -- Parse raw messages into `CanonicalEventDescriptor[]`. Parsers are pure functions; the transformer handles writing.
-- **TranscriptWriter** -- Writes canonical events to DB. Called by the transformer only.
-- **TranscriptProjector** -- Projects canonical events into UI view models.
-- **TranscriptMigrationService** -- High-level API wrapping the transformer for IPC handlers.
+| File | Read when… |
+| --- | --- |
+| [EXTENSION_ARCHITECTURE.md](./docs/EXTENSION_ARCHITECTURE.md) | Working on extensions, creating editors, modifying editor↔host communication, adding new editor types. |
+| [IPC_LISTENERS.md](./docs/IPC_LISTENERS.md) | Adding IPC events, debugging stale closures / race conditions in event handling, or seeing `MaxListenersExceededWarning`. |
+| [IPC_GUIDE.md](./docs/IPC_GUIDE.md) | Writing main-process IPC handlers, adding `electronAPI` methods, or debugging main↔renderer IPC. |
+| [EDITOR_STATE.md](./docs/EDITOR_STATE.md) | Working on editor components or TabEditor infrastructure; debugging editor state. |
+| [JOTAI.md](./docs/JOTAI.md) | Working with Jotai atoms, debugging UI/state divergence, or adding new atoms. |
+| [STATE_PERSISTENCE.md](./docs/STATE_PERSISTENCE.md) | Adding fields to any persisted state, or debugging "Cannot read properties of undefined" on app load. |
+| [UI_PATTERNS.md](./docs/UI_PATTERNS.md) | Writing UI components, styling with CSS/Tailwind, or adding responsive behavior. |
+| [ERROR_HANDLING.md](./docs/ERROR_HANDLING.md) | Writing IPC handlers or service methods that take required parameters or handle workspace state. |
+| [NAMING_CONVENTIONS.md](./docs/NAMING_CONVENTIONS.md) | Designing wire protocols, sync code, or SQL schemas. |
+| [AI_PROVIDER_TYPES.md](./docs/AI_PROVIDER_TYPES.md) | Working on AI integration, adding providers, or modifying model selection. |
+| [TRANSCRIPT_ARCHITECTURE.md](./docs/TRANSCRIPT_ARCHITECTURE.md) | Working on transcript rendering, parsers, the canonical event pipeline, or mobile transcript sync. |
+| [CONTEXT_WINDOW_USAGE_TRACKING.md](./docs/CONTEXT_WINDOW_USAGE_TRACKING.md) | Working on context-usage display, token tracking, or `ClaudeCodeProvider` streaming. |
+| [INTERNAL_MCP_SERVERS.md](./docs/INTERNAL_MCP_SERVERS.md) | Adding MCP server functionality or new tools for AI agents. |
+| [CUSTOM_TOOL_WIDGETS.md](./docs/CUSTOM_TOOL_WIDGETS.md) | Creating visual displays for MCP tool results or customizing tool rendering. |
+| [INTERACTIVE_PROMPTS.md](./docs/INTERACTIVE_PROMPTS.md) | Working on durable prompts (AskUserQuestion, ExitPlanMode, GitCommitProposal, ToolPermission). |
+| [WORKTREES.md](./docs/WORKTREES.md) | Working on worktree features, session isolation, or session↔worktree linkage. |
+| [SESSION_HIERARCHY.md](./docs/SESSION_HIERARCHY.md) | Creating/parenting sessions or debugging session grouping in the left pane. |
+| [HELP_WALKTHROUGHS.md](./docs/HELP_WALKTHROUGHS.md) | Adding help tooltips, creating walkthroughs, or modifying help content. |
+| [REACT_DOM_MARKERS.md](./docs/REACT_DOM_MARKERS.md) | Working on React UI, adding components, or improving testability/devtools navigation. |
+| [WALKTHROUGHS.md](./docs/WALKTHROUGHS.md) | Creating multi-step walkthroughs or debugging walkthrough flow. |
+| [E2E_TESTING.md](./docs/E2E_TESTING.md) | Writing/debugging E2E tests, or running them as an AI agent (especially in worktrees). |
+| [DIALOGS.md](./docs/DIALOGS.md) | Adding or modifying modal dialogs. |
+| [AGENT_PERMISSIONS.md](./docs/AGENT_PERMISSIONS.md) | Working on agent permissions, approval flows, or runtime permission checks. |
+| [ANALYTICS_GUIDE.md](./docs/ANALYTICS_GUIDE.md) | Adding/modifying PostHog events, or using PostHog MCP tools. |
+| [POSTHOG_EVENTS.md](./docs/POSTHOG_EVENTS.md) | Adding, modifying, or removing any PostHog analytics event — keep this in sync. |
+| [POSTHOG_MCP_INTEGRATION.md](./docs/POSTHOG_MCP_INTEGRATION.md) | Using PostHog MCP tools or extending PostHog functionality. |
+| [THEMING.md](./packages/electron/THEMING.md) | Working on themes or color schemes. |
+| [RELEASING.md](./RELEASING.md) | Preparing a release or debugging release scripts. |
+| [MARKETING_SCREENSHOTS.md](./docs/MARKETING_SCREENSHOTS.md) | Adding marketing screenshots/videos or modifying capture choreography. |
+| [FILE_WATCHING_AND_CHANGE_TRACKING.md](./docs/FILE_WATCHING_AND_CHANGE_TRACKING.md) | Working on file watchers, AI change detection, diff display, or the FilesEditedSidebar. |
+| [WEEKLY_DASHBOARD.md](./docs/WEEKLY_DASHBOARD.md) | Adding/modifying insights on the Weeklys PostHog dashboard. |
+| [VOICE_MODE.md](./docs/VOICE_MODE.md) | Working on voice mode, voice-agent prompts, audio pipeline, or session lifecycle. |
+| [TRACKER_WORKFLOWS.md](./docs/TRACKER_WORKFLOWS.md) | Creating decision or bug tracker items as part of a fix or design decision. |
+| [ARCHITECTURE_DIAGRAMS.md](./docs/ARCHITECTURE_DIAGRAMS.md) | Making any architectural decision — create an Excalidraw diagram. |
+| [DEBUGGING_LOGS.md](./docs/DEBUGGING_LOGS.md) | Investigating bugs — use the log access tools, don't ask the user to paste logs. |
+| [SYNC_JWT_MODEL.md](./docs/SYNC_JWT_MODEL.md) | Touching sync/auth — personal vs team JWT scopes, which JWT/identity each room uses, and the branded types that enforce it. |
+| [MAIN_PROCESS_INIT.md](./packages/electron/MAIN_PROCESS_INIT.md) | Working on Electron main-process bootstrap, singleton init, or IPC handler registration. |
+| [DATABASE.md](./packages/electron/DATABASE.md) | Working with PGLite tables, shutdown, or timestamp handling. |
 
-**Rules:**
-- All providers write only to `ai_agent_messages` (raw log) via `logAgentMessage()`; there is no dual-write
-- The transformer is the single writer of canonical events -- no other code path writes to `ai_transcript_events`
-- Watermark-based processing: only raw messages with `id > lastRawMessageId` are transformed
-- Canonical events can be regenerated at any time by bumping `CURRENT_VERSION`
-- Only `user_message`, `assistant_message`, and `system_message` events are searchable
+## AI Features (quick reference)
 
-## Decision Logging
+- **AI Chat Panel**: multi-provider (Claude, OpenAI, LM Studio, Claude Code), document-aware; Cmd+Shift+A
+- **Session Manager**: global view (Cmd+Alt+S); search, export, delete
+- **Model Configuration**: dynamic from provider APIs; no hardcoded models
+- **Git Worktrees**: isolated AI coding sessions via "New Worktree" button
 
-When choosing between alternatives that affect more than the immediate task -- a library, an architecture pattern, an API design, or deciding NOT to do something -- log it as a **decision** tracker item using the `tracker_create` tool.
+## Tracker Workflows
 
-**When to log:**
-- Choosing a library or dependency
-- Picking an architecture pattern over alternatives
-- Designing an API contract or data model
-- Deciding NOT to do something (e.g., "we won't use Redux because...")
-- Any choice where future-you would ask "why did we do it this way?"
-
-**How to log:**
-
-```
-tracker_create({
-  type: "decision",
-  title: "{what you decided}",
-  priority: "medium",  // or "high" for architectural decisions
-  labels: ["{area}"],  // e.g., "extensions", "ai", "sync", "ui"
-  description: `## Context\n{why this came up}\n\n## Alternatives considered\n{what else was on the table}\n\n## Reasoning\n{why this option won}\n\n## Trade-offs accepted\n{what you gave up}`
-})
-```
-
-**Before making a similar decision**, search existing decisions with `tracker_list({ type: "decision", search: "{topic}" })`. Follow prior decisions unless new information invalidates the reasoning -- in which case, log a new decision that supersedes the old one and reference it.
-
-## Bug Tracking
-
-When fixing a bug, **always ensure a tracker bug item exists** before starting the fix. If the user hasn't already pointed you at an existing tracker item, create one immediately using `tracker_create`.
-
-**Workflow:**
-1. **Check for existing bug**: `tracker_list({ type: "bug", search: "{topic}" })` -- if one exists, link to it with `tracker_link_session`
-2. **Create if missing**: If no tracker item exists, create one before writing any fix code
-3. **Keep it updated**: Update the tracker item's status as you progress (`to-do` -> `in-progress` -> `in-review`)
-4. **Link the session**: Always call `tracker_link_session` so the bug and session are cross-referenced
-
-**How to create:**
-
-```
-tracker_create({
-  type: "bug",
-  title: "{concise description of the bug}",
-  priority: "medium",  // or "high"/"critical" based on severity
-  labels: ["{area}"],  // e.g., "ios", "electron", "sync", "ui"
-  description: `## Symptoms\n{what the user sees}\n\n## Expected behavior\n{what should happen}\n\n## Root cause\n{fill in once diagnosed}\n\n## Fix\n{fill in once implemented}`
-})
-```
-
-**As the fix progresses**, update the description with root cause and fix details using `tracker_update`. This creates a durable record of what was wrong and how it was fixed.
-
-## General Development Guidelines
-
-- **Never use emojis** - Not in commits, code, or documentation unless explicitly requested
-- **Never use overly enthusiastic phrases** like "Perfect!", "Terrific!", etc.
-- **Never commit changes unless explicitly asked**
-- **Never commit files under `nimbalyst-local/`** - This directory contains local-only plans, diagrams, and working files that are never checked into git. Do not stage or include them in any commit.
-- **Never provide time or effort estimates**
-- **Don't disable tests without asking first**
-- **Don't run \****`npm run dev`**\*\* yourself** - User always does that
-- **Never release without being explicitly instructed**
-- **Don't git reset or git add -A without asking**
-- **Don't add Co-Authored-By lines to commit messages**
-- **Never restart Nimbalyst without explicit permission** - Always ask before using `restart_nimbalyst`
-- **Never mark work as done/completed without user approval** - When finishing a task, feature, or implementation, set tracker items to a review/validation state (e.g., `in-review`), NOT `done` or `completed`. Set session phase to `validating`, NOT `complete`. Only the user can approve moving work to `done`/`completed`/`complete`. This applies to tracker items, plan statuses, session phases, and any other status field. The agent's job is to implement and present for review -- the user decides when work is actually done.
-
-**Keyboard Shortcuts**: When adding or modifying keyboard shortcuts, update `KeyboardShortcutsDialog.tsx` to keep the Help > Keyboard Shortcuts dialog in sync.
+When choosing between alternatives (libraries, patterns, deciding NOT to do something), log a **decision** tracker item. When fixing a bug, ensure a **bug** tracker item exists before writing fix code. See [TRACKER_WORKFLOWS.md](./docs/TRACKER_WORKFLOWS.md) for the exact `tracker_create` calls and lifecycle.
 
 ## Architecture Diagrams for Decisions
 
-Whenever an architectural change or decision is made -- whether proposed by the human or the AI -- create an Excalidraw diagram to visualize it and show it to the user inline. This applies to decisions like:
-
-- New module boundaries, data flow changes, or service decomposition
-- Changes to IPC channels, state management patterns, or persistence layers
-- New extension points, editor types, or provider integrations
-- Database schema changes or migration strategies
-- Significant refactors that alter how components relate to each other
-
-**How to create the diagram:**
-
-1. Create an `.excalidraw` file in `nimbalyst-local/architecture/` (e.g., `nimbalyst-local/architecture/transcript-refactor.excalidraw`)
-2. Use the Excalidraw MCP tools to build a clear diagram showing the relevant components, their relationships, and data flow. Include:
-   - Named boxes for each component, service, or module involved
-   - Arrows showing data flow, IPC channels, or dependency direction
-   - Labels on arrows describing what flows between components
-   - A title or heading text element describing the decision
-   - Color coding where helpful (e.g., green for new, red for removed, gray for unchanged)
-3. Use `capture_editor_screenshot` to capture the diagram and show it inline in the conversation
-4. Reference the diagram file path so the user can open and edit it later
-
-The goal is that architectural decisions are always visually communicated, never just described in text. Diagrams should be clear enough that someone unfamiliar with the decision can understand the before/after or the proposed structure at a glance.
+Whenever an architectural change is proposed, create an Excalidraw diagram in `nimbalyst-local/architecture/` and share the diagram file/link in the conversation. Use `capture_editor_screenshot` only when visual verification is needed or the user explicitly asks for an inline image. See [ARCHITECTURE_DIAGRAMS.md](./docs/ARCHITECTURE_DIAGRAMS.md).
 
 ## Verifying Development Mode
 
-**IMPORTANT**: Before making code changes to the Nimbalyst codebase, use `mcp__nimbalyst-extension-dev__get_environment_info` to verify that Nimbalyst is running in development mode. If the user is running a packaged build, your code changes will NOT take effect and you should inform them to start the dev server (`npm run dev`).
+Before making code changes, use `mcp__nimbalyst-extension-dev__get_environment_info` to verify Nimbalyst is running in dev mode. If the user is running a packaged build, code changes won't take effect — tell them to start the dev server.
 
 ## Debugging with Log Access Tools
 
-Agents have access to comprehensive logging tools. **Never ask users to copy-paste logs** - use these tools instead:
+See the Critical Rules block above ("Always Run Your Own Observation Commands"). Detailed patterns: [DEBUGGING_LOGS.md](./docs/DEBUGGING_LOGS.md).
 
-1. **get\_main\_process\_logs** - Main process log file (file system, IPC, AI providers)
-2. **get\_renderer\_debug\_logs** - Renderer debug log file (UI errors, React components, console output)
+## General Development Guidelines
 
-**Debugging workflow:**
-1. Check recent renderer logs: `get_renderer_debug_logs(lastLines: 100, logLevel: "error")`
-2. Check main process: `get_main_process_logs(component: "FILE_WATCHER", logLevel: "error")`
-3. Search for specific errors: `get_renderer_debug_logs(searchTerm: "TypeError", lastLines: 200)`
-4. Investigate previous session crash: `get_renderer_debug_logs(session: 1, logLevel: "error")`
+- **Never use emojis** — not in commits, code, or documentation, unless explicitly requested
+- **Never use overly enthusiastic phrases** ("Perfect!", "Terrific!", etc.)
+- **Never commit changes unless explicitly asked**
+- **Never commit files under `nimbalyst-local/`** — gitignored, local-only working files
+- **Never provide time or effort estimates**
+- **Don't disable tests without asking first**
+- **Don't run `npm run dev` yourself** — user does that
+- **Never release without being explicitly instructed**
+- **Don't `git reset` or `git add -A` without asking**
+- **Don't add `Co-Authored-By` lines to commit messages**
+- **Never restart Nimbalyst without explicit permission** — always ask before `restart_nimbalyst`
+- **Never mark work as done/completed without user approval** — set tracker items to a review state (e.g., `in-review`), session phase to `validating`, never `done` / `completed` / `complete`. Only the user can promote to those states.
 
-**When to use each tool:**
-- **get\_main\_process\_logs**: File watcher issues, IPC errors, AI provider failures, database errors (persisted log file)
-- **get\_renderer\_debug\_logs**: UI errors, React component issues, console output, crash investigation (dev mode only, persists across restarts)
+**Keyboard Shortcuts**: when adding or modifying shortcuts, update `KeyboardShortcutsDialog.tsx`.
 
 ## Support
 
-User support documentation is located in the `support/` folder:
-- **force-restore-database-backup.md**: Instructions for manually restoring the database from backup
+User support docs live in `support/`. Notable: `force-restore-database-backup.md` for manual database restore.
+if i ask you to propose a commit, first update the `CHANGELOG.md` (at the repo root) and include it in the commit proposal
+if a commit is intended to fix a github issue, include the issue number and a closing reference in the commit message when appropriate (fixes #123 or closes #123)

@@ -1,5 +1,5 @@
 import { dialog, BrowserWindow, app } from 'electron';
-import { safeHandle, safeOn } from '../utils/ipcRegistry';
+import { safeHandle } from '../utils/ipcRegistry';
 import { readFileSync, existsSync, mkdirSync, writeFileSync } from 'fs';
 import { basename, join, dirname, extname } from 'path';
 import { windowStates, savingWindows, recentlyDeletedFiles, findWindowByFilePath, createWindow, getWindowId, windows, documentServices } from '../window/WindowManager';
@@ -15,6 +15,7 @@ import { isPathInWorkspace, getRelativeWorkspacePath } from '../utils/workspaceD
 import { SessionFileWatcher } from '../file/SessionFileWatcher';
 import { addGitignoreBypass, removeGitignoreBypass } from '../file/WorkspaceEventBus';
 import { pushFileToIndex } from '../services/DocSyncService';
+import { pushNewDocumentToSync } from '../file/WorkspaceWatcher';
 
 // Helper function to get file type from extension
 function getFileType(filePath: string): string {
@@ -57,23 +58,6 @@ function hasFrontmatter(content: string): boolean {
 
 export function registerFileHandlers() {
     const analytics = AnalyticsService.getInstance();
-
-    // Renderer-side telemetry forwarder: the DocumentModel and TabEditor
-    // emit save-blocked-after-delete events through this channel. We funnel
-    // them through the same `file_save_blocked_after_delete` event the
-    // recently-deleted IPC branch uses, with a `layer` discriminator.
-    safeOn('telemetry:file-save-blocked-after-delete', (
-        _event,
-        payload: { layer?: string; filePath?: string; wasAutosave?: boolean },
-    ) => {
-        if (!payload || typeof payload.layer !== 'string') return;
-        const fileType = typeof payload.filePath === 'string' ? getFileType(payload.filePath) : 'other';
-        analytics.sendEvent('file_save_blocked_after_delete', {
-            layer: payload.layer,
-            fileType,
-            wasAutosave: !!payload.wasAutosave,
-        });
-    });
 
     // Generic file dialog for extensions to select files
     // Returns the file path (not content) so extensions can load files themselves
@@ -157,11 +141,6 @@ export function registerFileHandlers() {
             // released the path AND observed a fresh load.
             if (recentlyDeletedFiles.has(filePath)) {
                 console.log('[SAVE] Refusing save to recently-deleted file:', filePath);
-                analytics.sendEvent('file_save_blocked_after_delete', {
-                    layer: 'recently-deleted',
-                    fileType: getFileType(filePath),
-                    wasAutosave: lastKnownContent !== undefined,
-                });
                 // If the file exists on disk (e.g. AI recreated it after the
                 // delete), surface its current contents as a conflict so the
                 // renderer can show a non-blocking banner and preserve the
@@ -192,12 +171,6 @@ export function registerFileHandlers() {
                     const currentDiskContent = readFileSync(filePath, 'utf-8');
                     if (currentDiskContent !== lastKnownContent) {
                         console.log('[SAVE] ⚠ Conflict detected - file changed on disk since last load');
-
-                        // Track conflict detection - no resolution yet (user hasn't chosen)
-                        analytics.sendEvent('file_conflict_detected', {
-                            fileType: getFileType(filePath),
-                            conflictResolution: 'pending'
-                        });
 
                         return {
                             success: false,
@@ -476,6 +449,15 @@ export function registerFileHandlers() {
             // Add to recent files
             if (state.workspacePath) {
                 addWorkspaceRecentFile(state.workspacePath, absolutePath);
+            }
+
+            // Sync the new .md doc to mobile immediately (index + content) rather
+            // than waiting on the file watcher to notice the create. save-file
+            // already pushes to the index; createDocument did neither, so a new
+            // design doc wasn't readable on mobile until a watcher event or restart.
+            if (absolutePath.endsWith('.md') && state.workspacePath) {
+                pushFileToIndex(absolutePath, state.workspacePath).catch(() => {});
+                pushNewDocumentToSync(absolutePath, state.workspacePath);
             }
 
             return {

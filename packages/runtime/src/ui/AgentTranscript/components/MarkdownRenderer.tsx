@@ -1,7 +1,16 @@
-import React, { useState, useRef, useEffect } from 'react';
-import ReactMarkdown from 'react-markdown';
+import React, { useState, useRef, useEffect, useMemo, useCallback } from 'react';
+import ReactMarkdown, { defaultUrlTransform } from 'react-markdown';
+import type { PluggableList } from 'unified';
 import remarkGfm from 'remark-gfm';
 import { Prism as SyntaxHighlighter } from 'react-syntax-highlighter';
+import {
+  useTranscriptMarkdownContributions,
+  useTranscriptMarkdownStyles,
+} from '../contributions';
+import { escapeCurrencyDollars } from '../utils/escapeCurrencyDollars';
+import { rehypeAutolinkFilePaths } from '../markdown/rehypeAutolinkFilePaths';
+import { TrackerReferenceChip } from '../../../plugins/TrackerLinkPlugin';
+import { TRACKER_REFERENCE_URN_SCHEME } from '../../../plugins/TrackerLinkPlugin/TrackerReferenceNode';
 
 // Inject MarkdownRenderer styles once (for syntax highlighting, scrollbar, and overflow wrapper)
 const injectMarkdownRendererStyles = () => {
@@ -113,12 +122,66 @@ if (typeof document !== 'undefined') {
   injectMarkdownRendererStyles();
 }
 
+// Wrap preference for transcript code blocks, persisted across remounts.
+// react-markdown re-renders on every streaming chunk and reconciles by
+// sibling index, not content, so a code block whose position shifts (a new
+// paragraph appears above it, a message appends, etc.) gets unmounted and
+// remounted with fresh local state. That's the "wrap deselects itself"
+// symptom.
+//
+// Identity is keyed by `${messageId}:${nodeOffset}`. The message id is
+// passed in from MessageSegment; node.position.start.offset comes from
+// react-markdown's override API and is the byte offset of the code fence
+// in the original markdown source. Together they're stable from first
+// render through end of stream, which closes the early-streaming hole
+// that a content-prefix key would leave open. Falls back to a counter
+// for callers that don't have a message id (NewFilePreview, tool result
+// renderers, etc.) so the cache still helps in those paths without
+// risking cross-message bleed (counter values are uniquely allocated
+// per mount, so the only carrier of state restoration in the fallback
+// path is the same-instance re-render case).
+const WRAP_PREFERENCE_CAP = 200;
+const wrapPreferenceByKey = new Map<string, boolean>();
+
+function setWrapPreference(key: string, value: boolean) {
+  if (!key) return;
+  if (wrapPreferenceByKey.has(key)) {
+    wrapPreferenceByKey.delete(key);
+  } else if (wrapPreferenceByKey.size >= WRAP_PREFERENCE_CAP) {
+    const firstKey = wrapPreferenceByKey.keys().next().value;
+    if (firstKey !== undefined) wrapPreferenceByKey.delete(firstKey);
+  }
+  wrapPreferenceByKey.set(key, value);
+}
+
+let _wrapFallbackCounter = 0;
+function nextFallbackKey(): string {
+  _wrapFallbackCounter += 1;
+  return `cb:fallback:${_wrapFallbackCounter}`;
+}
+
 // Wrapper for any element that might overflow horizontally.
 // Uses IntersectionObserver to defer scrollWidth measurement until visible,
 // and ResizeObserver to re-check on size changes - avoids forced reflow during
 // initial session load when many code blocks render off-screen.
-const OverflowWrapper: React.FC<{ children: React.ReactNode }> = ({ children }) => {
-  const [wordWrap, setWordWrap] = useState(false);
+const OverflowWrapper: React.FC<{
+  children: React.ReactNode;
+  /** Stable id for wrap-preference persistence across remounts. Compose
+   *  from messageId + AST node offset at the call site. */
+  persistKey?: string;
+}> = ({ children, persistKey }) => {
+  // Freeze the key once per mount so the same wrap-preference slot is used
+  // for the lifetime of this instance. Re-mounts re-evaluate useMemo and
+  // pick up the persisted preference (if any) for the resolved key.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  const wrapKey = useMemo(() => persistKey || nextFallbackKey(), []);
+  const [wordWrap, setWordWrapState] = useState<boolean>(
+    () => wrapPreferenceByKey.get(wrapKey) ?? false
+  );
+  const setWordWrap = useCallback((next: boolean) => {
+    setWordWrapState(next);
+    setWrapPreference(wrapKey, next);
+  }, [wrapKey]);
   const [isOverflowing, setIsOverflowing] = useState(false);
   const contentRef = useRef<HTMLDivElement>(null);
   const hasBeenVisible = useRef(false);
@@ -190,6 +253,10 @@ interface MarkdownRendererProps {
   onOpenFile?: (filePath: string) => void;
   /** Optional: Navigate to a session by ID (for @@session reference links) */
   onOpenSession?: (sessionId: string) => void;
+  /** Optional: Stable identifier (typically the message id) used to scope
+   *  per-block UI preferences (e.g. the OverflowWrapper Wrap toggle) so
+   *  preferences survive react-markdown remounts during streaming. */
+  messageId?: string | number;
 }
 
 function safeDecodeURIComponent(value: string): string {
@@ -227,6 +294,46 @@ function isAbsoluteFilePath(filePath: string): boolean {
 }
 
 /**
+ * Matches a Windows drive-letter absolute path, tolerating a single spurious
+ * leading slash (`/D:/...`) that some link sources prepend. Capture group 1 is
+ * the normalized path without the leading slash (e.g. `D:/work/foo.pas`).
+ */
+const WINDOWS_DRIVE_PATH_RE = /^\/?([A-Za-z]:[\\/].*)$/;
+
+/**
+ * react-markdown's `defaultUrlTransform` treats a Windows drive letter (`D:`)
+ * as a URL scheme. Since `d:` isn't an allowed protocol it blanks the href to
+ * `''`, which made Windows file links render as `<a href="">` and open a blank
+ * window on click (GitHub #744). It likewise blanks our `nimbalyst://` tracker
+ * reference URNs, which made `[NIM-123](nimbalyst://NIM-123)` links fall through
+ * to a blank `<a>` (the tracker-chip check in the `a` renderer never saw the
+ * href) and open an empty window on click. Preserve Windows absolute paths and
+ * tracker reference URNs verbatim, and delegate everything else to the default
+ * so `javascript:`/`data:` links stay sanitized.
+ */
+export function transcriptUrlTransform(url: string): string {
+  if (
+    WINDOWS_DRIVE_PATH_RE.test(url) ||
+    url.startsWith('\\\\') ||
+    url.trim().startsWith(TRACKER_REFERENCE_URN_SCHEME)
+  ) {
+    return url;
+  }
+  return defaultUrlTransform(url);
+}
+
+/**
+ * Returns the tracker reference key for a `nimbalyst://<key>` href, or null.
+ */
+export function parseTrackerReferenceHref(href?: string): string | null {
+  if (!href) return null;
+  const trimmed = href.trim();
+  if (!trimmed.startsWith(TRACKER_REFERENCE_URN_SCHEME)) return null;
+  const key = trimmed.slice(TRACKER_REFERENCE_URN_SCHEME.length);
+  return key.length > 0 ? key : null;
+}
+
+/**
  * Resolve href to an openable local file path when it looks like a filesystem link.
  * Returns null for non-file/external links.
  */
@@ -252,16 +359,37 @@ export function resolveTranscriptFilePathFromHref(href?: string): string | null 
       return null;
     }
   } else {
-    // Keep web links (https:, mailto:, etc.) as external links.
-    if (/^(?:[a-z][a-z0-9+.-]*:|\/\/)/i.test(trimmedHref)) {
-      return null;
+    // A Windows drive-letter absolute path (`D:\...`, `D:/...`, or the
+    // leading-slash-mangled `/D:/...`) superficially looks like a URI with a
+    // `d:` scheme. Detect and normalize it (dropping the spurious leading
+    // slash) before the external-scheme rejection below, otherwise these
+    // links are treated as external URLs and open a blank window (#744).
+    const windowsDrive = trimmedHref.match(WINDOWS_DRIVE_PATH_RE);
+    if (windowsDrive) {
+      candidate = safeDecodeURIComponent(stripQueryAndHash(windowsDrive[1]));
+    } else {
+      // Keep web links (https:, mailto:, etc.) as external links.
+      if (/^(?:[a-z][a-z0-9+.-]*:|\/\/)/i.test(trimmedHref)) {
+        return null;
+      }
+      candidate = safeDecodeURIComponent(stripQueryAndHash(trimmedHref));
     }
-    candidate = safeDecodeURIComponent(stripQueryAndHash(trimmedHref));
   }
 
-  const cleanedPath = stripLineAndColumnSuffix(candidate);
+  let cleanedPath = stripLineAndColumnSuffix(candidate);
   if (!cleanedPath) {
     return null;
+  }
+
+  // Claude Code emits markdown links of the form
+  // `/abs/path/<real absolute path>` (e.g.
+  // `/abs/path/C:/Users/foo/file.ts:42` on Windows or
+  // `/abs/path//Users/foo/file.ts:42` on macOS). The `/abs/path/`
+  // prefix is a Claude Code marker, not a real filesystem segment;
+  // strip it so the rest of the renderer routes the link through
+  // `workspace:open-file` with the actual on-disk path. Fixes #240.
+  if (cleanedPath.startsWith('/abs/path/')) {
+    cleanedPath = cleanedPath.slice('/abs/path/'.length);
   }
 
   return isAbsoluteFilePath(cleanedPath) ? cleanedPath : null;
@@ -272,8 +400,52 @@ export const MarkdownRenderer: React.FC<MarkdownRendererProps> = ({
   isUser = false,
   isSystemMessage = false,
   onOpenFile,
-  onOpenSession
+  onOpenSession,
+  messageId
 }) => {
+  // Stable per-block key for the OverflowWrapper wrap-preference cache.
+  // Combines the message id (so different messages can never share a slot)
+  // with the source-position offset of the code-fence node in the parsed
+  // markdown AST (so different blocks within the same message also don't
+  // share). react-markdown 10 passes the AST node to each override.
+  const codeBlockPersistKey = useCallback((node: unknown): string | undefined => {
+    if (messageId == null) return undefined;
+    const offset = (node as { position?: { start?: { offset?: number } } } | null | undefined)
+      ?.position?.start?.offset;
+    if (typeof offset !== 'number') return undefined;
+    return `cb:${String(messageId)}:${offset}`;
+  }, [messageId]);
+
+  // Extension-contributed markdown plugins/components are merged on top of
+  // the core baseline. The transcript registry handles deduping styles and
+  // keeps the React tree subscribed to extension enable/disable events.
+  const contributions = useTranscriptMarkdownContributions();
+  useTranscriptMarkdownStyles(contributions.styles);
+
+  // Core ships only `remark-gfm` as the baseline; KaTeX, syntax themes, and
+  // any other domain-specific behavior now arrives via the transcript
+  // markdown contribution registry (see
+  // `packages/extensions/math` for the canonical KaTeX contributor).
+  const remarkPlugins = useMemo<PluggableList>(
+    () => [remarkGfm, ...contributions.remarkPlugins] as PluggableList,
+    [contributions.remarkPlugins],
+  );
+  const rehypePlugins = useMemo<PluggableList>(
+    () => [
+      // Autolink bare file paths into clickable file-open links. Only useful
+      // when there is a file-open handler to route the click to.
+      ...(onOpenFile ? [rehypeAutolinkFilePaths] : []),
+      ...contributions.rehypePlugins,
+    ] as PluggableList,
+    [contributions.rehypePlugins, onOpenFile],
+  );
+
+  // Pre-escape currency-pattern dollar signs so `remark-math` does not
+  // collapse `$7M ... $40M`-style text as inline LaTeX in the transcript.
+  // Mirrors the pandoc rules from the Lexical-editor fix in commit baf60b4e9.
+  // See nimbalyst/nimbalyst#462.
+  const processedContent = useMemo(() => escapeCurrencyDollars(content), [content]);
+
   return (
     <div
       className={`markdown-content text-[0.9375rem] leading-relaxed max-w-full overflow-x-hidden break-words [&>*:first-child]:mt-0 [&>*:last-child]:mb-0 ${isUser ? 'font-medium' : 'font-normal'} ${isSystemMessage ? 'opacity-85 font-mono text-[0.95em]' : ''}`}
@@ -282,7 +454,9 @@ export const MarkdownRenderer: React.FC<MarkdownRendererProps> = ({
       }}
     >
       <ReactMarkdown
-        remarkPlugins={[remarkGfm]}
+        remarkPlugins={remarkPlugins}
+        rehypePlugins={rehypePlugins}
+        urlTransform={transcriptUrlTransform}
         components={{
           // Code blocks with syntax highlighting
           code({ node, inline, className, children, ...props }: any) {
@@ -341,7 +515,9 @@ export const MarkdownRenderer: React.FC<MarkdownRendererProps> = ({
                 </SyntaxHighlighter>
               );
               // Only wrap multi-line blocks with OverflowWrapper
-              return isSingleLine ? syntaxBlock : <OverflowWrapper>{syntaxBlock}</OverflowWrapper>;
+              return isSingleLine
+                ? syntaxBlock
+                : <OverflowWrapper persistKey={codeBlockPersistKey(node)}>{syntaxBlock}</OverflowWrapper>;
             }
 
             // Code block without language
@@ -360,7 +536,9 @@ export const MarkdownRenderer: React.FC<MarkdownRendererProps> = ({
               </code>
             );
             // Only wrap multi-line blocks with OverflowWrapper
-            return isSingleLine ? codeBlock : <OverflowWrapper>{codeBlock}</OverflowWrapper>;
+            return isSingleLine
+              ? codeBlock
+              : <OverflowWrapper persistKey={codeBlockPersistKey(node)}>{codeBlock}</OverflowWrapper>;
           },
           // Remove default pre wrapper - we handle styling in code component
           pre: ({ children }) => <>{children}</>,
@@ -446,8 +624,23 @@ export const MarkdownRenderer: React.FC<MarkdownRendererProps> = ({
             </p>
           ),
           // Links
-          a: ({ href, children }) => {
-            const filePath = onOpenFile ? resolveTranscriptFilePathFromHref(href) : null;
+          a: ({ href, children, node }: any) => {
+            // Tracker reference links (`nimbalyst://NIM-123`) render as a live
+            // status chip instead of an anchor.
+            const trackerKey = parseTrackerReferenceHref(href);
+            if (trackerKey) {
+              return <TrackerReferenceChip referenceKey={trackerKey} />;
+            }
+            // Paths wrapped by `rehypeAutolinkFilePaths` carry a marker with the
+            // raw match (possibly with a :line:col suffix). They may be
+            // workspace-relative, which the markdown-href resolver rejects, so
+            // resolve them directly here and strip the location suffix before
+            // opening.
+            const autolinkedPath = node?.properties?.dataFilePath as string | undefined;
+            const resolvedAutolink =
+              onOpenFile && autolinkedPath ? stripLineAndColumnSuffix(autolinkedPath) : null;
+            const filePath =
+              resolvedAutolink ?? (onOpenFile ? resolveTranscriptFilePathFromHref(href) : null);
             const isSessionLink = onOpenSession && href && SESSION_UUID_RE.test(href.trim());
             const isInternalLink = filePath || isSessionLink;
             return (
@@ -606,10 +799,13 @@ export const MarkdownRenderer: React.FC<MarkdownRendererProps> = ({
             }}>
               {children}
             </del>
-          )
+          ),
+          // Extension overrides applied last so they can replace any of the
+          // core component handlers above.
+          ...contributions.components,
         }}
       >
-        {content}
+        {processedContent}
       </ReactMarkdown>
     </div>
   );

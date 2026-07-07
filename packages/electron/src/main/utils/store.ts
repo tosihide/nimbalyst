@@ -16,7 +16,7 @@ import { normalizeCodexProviderConfig, omitModelsField } from '@nimbalyst/runtim
 export type AppTheme = 'dark' | 'light' | 'system' | 'auto' | 'crystal-dark' | string;
 export type { SessionState, SessionWindow } from '../types';
 
-export type CompletionSoundType = 'chime' | 'bell' | 'pop' | 'alert' | 'none';
+export type CompletionSoundType = 'chime' | 'bell' | 'pop' | 'alert' | 'custom' | 'none';
 export type ReleaseChannel = 'stable' | 'alpha';
 export type PreferredTerminalShell = 'auto' | 'pwsh' | 'powershell' | 'git-bash' | 'wsl' | 'cmd';
 export type WorkspaceFileTreeFilter = 'all' | 'markdown' | 'known' | 'git-uncommitted' | 'git-worktree' | 'ai-read' | 'ai-written';
@@ -35,6 +35,8 @@ export interface ExtensionSettings {
   enabled: boolean;
   /** Whether the Claude Agent SDK plugin is enabled (if extension has one) */
   claudePluginEnabled?: boolean;
+  /** Whether provider-neutral agent workflows are enabled (if extension has them) */
+  agentWorkflowsEnabled?: boolean;
   /** Extension-specific configuration values (user scope) */
   configuration?: Record<string, unknown>;
 }
@@ -62,12 +64,20 @@ interface AppStoreSchema {
   // Sound notifications
   completionSoundEnabled?: boolean;
   completionSoundType?: CompletionSoundType;
+  // Absolute path (inside userData/custom-sounds) of the user-supplied
+  // completion sound file, used when completionSoundType === 'custom'.
+  completionSoundCustomPath?: string;
+  // Completion sound volume as a percentage of system volume (0-100).
+  completionSoundVolume?: number;
   // OS notifications
   osNotificationsEnabled?: boolean;
   // Release channel
   releaseChannel?: ReleaseChannel;
   // Default AI model for new sessions (format: "provider:model" e.g., "claude-code:sonnet")
   defaultAIModel?: string;
+  // Default GitHub CLI account login for PR review. A per-project
+  // override lives on WorkspaceState.prReviewGhAccountOverride.
+  prReviewDefaultGhAccount?: string;
   // Analytics
   analyticsEnabled?: boolean;
   // User onboarding
@@ -90,6 +100,12 @@ interface AppStoreSchema {
   extensionProjectIntroShown?: boolean;
   // Extension settings (enabled/disabled state and configuration)
   extensionSettings?: Record<string, ExtensionSettings>;
+  // Global-scope privileged-extension capability grants ("Enable for all workspaces").
+  // Workspace-scope grants live on WorkspaceState.extensionPermissionGrants.
+  // See packages/electron/src/main/extensions/permissionGrantStore.ts for the
+  // canonical read/write API. Keep this as an opaque list to keep electron-store
+  // migrations simple; the store module owns the shape and indexing.
+  extensionPermissionGrantsGlobal?: PersistedPermissionGrant[];
   // Claude Code settings
   claudeCode?: {
     // Enable project-level commands (.claude/commands/ in workspace)
@@ -97,8 +113,32 @@ interface AppStoreSchema {
     // Enable user-level commands (~/.claude/commands/)
     userCommandsEnabled?: boolean;
   };
+  // OpenAI Codex settings
+  openaiCodex?: {
+    // Which codex transport to use for new sessions. 'app-server' (default)
+    // drives `codex app-server --listen stdio://` directly via JSON-RPC v2,
+    // which provides full unified-diff text per file_change for deterministic
+    // pre-edit baselines. 'sdk' is the legacy `codex exec --experimental-json`
+    // path retained as an escape hatch.
+    transport?: 'sdk' | 'app-server';
+  };
+  // Unified agent workflow registry source settings
+  agentWorkflowSources?: {
+    workspaceClaudeCompatibilityEnabled?: boolean;
+    includeProjectClaudeSources?: boolean;
+    includeUserClaudeSources?: boolean;
+    extensionWorkflowsEnabled?: boolean;
+  };
+  // Provider-specific workflow export settings
+  agentWorkflowExports?: {
+    codexEnabled?: boolean;
+    claudeGeneratedExtensionWorkflowsEnabled?: boolean;
+  };
   // Extension Development Kit (EDK) - enables MCP tools for building/reloading extensions
   extensionDevToolsEnabled?: boolean;
+  // Kill-switch for the `nimbalyst-settings` MCP server that lets agents change Nimbalyst
+  // settings. Default false (MCP enabled). Set true from Settings > Advanced to disable.
+  settingsAgentToolsDisabled?: boolean;
   // Share encryption keys: maps sessionId -> base64 AES-256 key (for re-sharing with stable URLs)
   shareKeys?: Record<string, string>;
   // Share expiration preference: number of days (1, 7, 30). Max 30 days.
@@ -126,6 +166,11 @@ interface AppStoreSchema {
     autoCommitAudio?: boolean; // Auto-commit audio on speech pause (VAD)
     showTranscription?: boolean; // Show live transcription in UI
   };
+  // Preferred language for the agent (currently used for AI-generated session
+  // names). BCP-47 code or common name, e.g. "ja", "Japanese", "en", "fr".
+  // Empty/undefined means no preference -- the agent picks based on the
+  // conversation language.
+  preferredAgentLanguage?: string;
   // Walkthrough guide system state
   walkthroughs?: WalkthroughState;
   // First-open tracking for editor types (for walkthrough triggers)
@@ -155,19 +200,35 @@ interface AppStoreSchema {
   // Document history settings
   historyMaxAgeDays?: number; // Max age in days before snapshots are cleaned up (default: 30)
   historyMaxSnapshots?: number; // Max snapshots per file (default: 250)
-  // Internal debug flags. Off by default. Toggled from Settings -> Advanced (developer mode).
-  // Add new flags here as needed; the renderer mirrors these into a Jotai atom on startup
-  // and exposes them as a synchronous predicate via runtime/utils/debugFlags.
-  debugFlags?: {
-    /** Verbose tracing for the diff/AI-edit pipeline (DocumentModel, DiskBackedStore, TabEditor, DiffPlugin). */
-    diffTrace?: boolean;
-  };
   // Preferred interactive terminal shell on Windows. 'auto' uses detection priority.
   preferredTerminalShell?: PreferredTerminalShell;
   // Last known app version (for migrations)
   lastKnownVersion?: string;
+  // One-shot migration flag: plain fable default bumped to fable-1m (NIM-827)
+  fableDefaultMigratedTo1m?: boolean;
+  // Gutter icon visibility/order preferences (GLOBAL). Moved off per-project
+  // workspace state so the preference applies across all projects.
+  hiddenGutterItems?: string[];
+  gutterItemOrder?: Record<string, string[]>;
+  // One-shot migration flag: per-project hiddenGutterButtons unioned into the
+  // global hiddenGutterItems key above.
+  gutterButtonsMigratedToGlobal?: boolean;
   // Extension marketplace install tracking
   marketplaceInstalls?: Record<string, MarketplaceInstallRecord>;
+  // Multi-project rail: opt-in flag to host multiple projects in a single
+  // window. When false (default), each project still gets its own window.
+  multiProjectMode?: boolean;
+  // Workspace paths currently warm in the multi-project rail, in display
+  // order. Empty when multiProjectMode is off or before the user adds any.
+  openProjects?: string[];
+  // Path of the project currently visible in the rail. Restored on launch
+  // so the user lands on the same project.
+  activeProjectPath?: string | null;
+  // When true, the rail rehydrates with the projects that were warm at
+  // last app close. When false (default), the rail starts empty and is
+  // seeded only with the project the user picks from the launch screen
+  // — additional projects must be added explicitly.
+  restorePreviousProjectsOnLaunch?: boolean;
 }
 
 /**
@@ -183,6 +244,12 @@ export interface MarketplaceInstallRecord {
   checksum: string;
   source: 'marketplace' | 'github-url';
   githubUrl?: string;
+  // Populated only when source === 'github-url'. Differentiates the two
+  // GitHub install paths and carries enough metadata for a future "check
+  // GitHub Releases for newer versions" flow.
+  githubReleaseTag?: string;
+  githubReleaseAssetName?: string;
+  githubInstallMethod?: 'release-asset' | 'clone-source';
 }
 
 /**
@@ -317,6 +384,12 @@ export type AgentPermissionMode = 'ask' | 'allow-all' | 'bypass-all' | null;
 export interface AgentPermissions {
   /** Permission mode: null=untrusted, 'ask'=smart permissions, 'allow-all'=auto-approve edits, 'bypass-all'=auto-approve everything */
   permissionMode: AgentPermissionMode;
+  /**
+   * Opt-in (issue #628): when true, "Allow All" (bypass-all) routes agent-mode
+   * Claude Code sessions through the SDK auto-mode classifier instead of
+   * bypassing every operation. Undefined/false = literal allow-all.
+   */
+  allowAllUsesClassifier?: boolean;
 }
 
 export interface AgenticCodingWindowState {
@@ -386,12 +459,19 @@ export interface WorkspaceState {
   collabTree?: {
     expandedFolders: string[];
     customFolders: string[];
+    // Folder path most recently used as the destination for "Share to Team".
+    // Pre-selected on next share so users don't re-pick the same folder.
+    lastSharedFolder?: string;
   };
   collabPendingUpdates?: Record<string, {
     mergedUpdateBase64: string;
     updatedAt: number;
   }>;
   trackerSyncPolicies?: Record<string, TrackerSyncModeSetting | TrackerSyncPolicySetting>;
+  // Per-project opt-out for agent tracker tools. When false, McpConfigService
+  // omits the `nimbalyst-trackers` MCP server so the agent gets no tracker_*
+  // tools in this project. Defaults to enabled (undefined === true).
+  trackersEnabled?: boolean;
   // Issue key prefix for tracker items (e.g., "NIM", "APP"). Used for local-only trackers.
   // For synced trackers, the prefix is stored server-side in TrackerRoom metadata.
   issueKeyPrefix?: string;
@@ -406,7 +486,33 @@ export interface WorkspaceState {
     enabled?: boolean;
     autoCloseOnCommit?: boolean;
   };
+  // PR review: gh CLI account login override for this project. When set, it
+  // wins over the global AppStoreSchema.prReviewDefaultGhAccount.
+  prReviewGhAccountOverride?: string;
+  // Privileged extension capability grants scoped to this workspace.
+  // Global-scope grants live on AppStoreSchema.extensionPermissionGrantsGlobal.
+  // See packages/electron/src/main/extensions/permissionGrantStore.ts for the
+  // canonical read/write API.
+  extensionPermissionGrants?: PersistedPermissionGrant[];
   lastUpdated: number;
+}
+
+/**
+ * Persisted shape of a single permission grant row.
+ * Mirrors the grant store data model from the plan:
+ *   keyed by (extensionId, moduleId, permissionId, scope)
+ * Workspace-scope rows live in WorkspaceState; global rows live in AppStoreSchema.
+ */
+export interface PersistedPermissionGrant {
+  extensionId: string;
+  moduleId: string;
+  permissionId: string;
+  scope: 'workspace' | 'global';
+  /** Workspace path - present for workspace scope, omitted for global */
+  workspacePath?: string;
+  grantedAt: number;
+  grantedBy: 'user';
+  permissionVersion: number;
 }
 
 // Lazy-initialized stores to avoid reading userData path at module load time.
@@ -729,8 +835,11 @@ export function clearPendingThemeFallback(): void {
   getAppStore().delete('pendingThemeFallback');
 }
 
-// getThemeSync resolves 'system'/'auto' to the actual theme for the renderer
-// This prevents flash by ensuring renderer gets 'dark' or 'light', not 'system'
+// getThemeSync resolves 'system'/'auto' to the actual theme for the renderer.
+// This prevents flash by ensuring renderer gets 'dark' or 'light', not 'system'.
+// Preserves the persisted theme ID for built-in, filesystem, and extension
+// themes so callers that own the extension theme registry (the main workspace
+// renderer's useTheme.ts) can apply the correct theme.
 export function getThemeSync(): AppTheme {
   const { nativeTheme } = require('electron');
   const storedTheme = getAppStore().get('theme');
@@ -741,6 +850,36 @@ export function getThemeSync(): AppTheme {
   }
 
   return storedTheme;
+}
+
+// getResolvedThemeSync collapses any persisted theme (built-in, system,
+// filesystem, or extension-contributed) into a renderer-applicable base
+// theme: 'dark' | 'light' | 'crystal-dark'. Used by callers that cannot
+// consult the in-renderer extension theme registry (the project picker /
+// WorkspaceManager window and the flash-prevention script in index.html).
+export function getResolvedThemeSync(): AppTheme {
+  const { nativeTheme } = require('electron');
+  const storedTheme = getAppStore().get('theme');
+
+  if (storedTheme === 'system' || storedTheme === 'auto') {
+    return nativeTheme.shouldUseDarkColors ? 'dark' : 'light';
+  }
+
+  // Built-in themes the renderer knows how to render directly.
+  if (storedTheme === 'dark' || storedTheme === 'light' || storedTheme === 'crystal-dark') {
+    return storedTheme;
+  }
+
+  // Extension / filesystem theme. Callers that do not load the extension
+  // theme registry cannot resolve the theme's isDark themselves; fall back
+  // to the flag persisted alongside the theme ID by setTheme().
+  const isDark = getAppStore().get('themeIsDark');
+  if (typeof isDark === 'boolean') {
+    return isDark ? 'dark' : 'light';
+  }
+
+  // Last resort for themes persisted before themeIsDark existed: follow OS.
+  return nativeTheme.shouldUseDarkColors ? 'dark' : 'light';
 }
 
 export const setThemeSync = setTheme;
@@ -952,6 +1091,41 @@ export function getAIProviderOverrides(workspacePath: string): AIProviderOverrid
   return normalizeAIProviderOverrides(overrides);
 }
 
+/**
+ * Lazily-opened `ai-settings` electron-store (where provider API keys live —
+ * `apiKeys`). Separate from the `app-settings` store exported as `store`.
+ */
+let _aiSettingsStore: Store<Record<string, unknown>> | null = null;
+function getAiSettingsStore(): Store<Record<string, unknown>> {
+  if (!_aiSettingsStore) {
+    _aiSettingsStore = new Store<Record<string, unknown>>({ name: 'ai-settings' });
+  }
+  return _aiSettingsStore;
+}
+
+/**
+ * Resolve a provider API key from EXPLICIT settings only — a per-workspace
+ * project override if present, else the global `ai-settings` `apiKeys[providerId]`.
+ * NEVER reads `process.env` (CLAUDE.md no-implicit-env-key rule). Returns null
+ * when not configured. Mirrors `AIService.getApiKeyForProvider` so the
+ * backend-module `getApiKey` broker hands an extension engine the same key the
+ * AI providers use (the key lives in `ai-settings`, NOT `app-settings`).
+ */
+export function getProviderApiKeyFromSettings(
+  providerId: string,
+  workspacePath?: string
+): string | null {
+  if (workspacePath) {
+    const overrideKey = getAIProviderOverrides(workspacePath)?.providers?.[providerId]?.apiKey;
+    if (typeof overrideKey === 'string' && overrideKey.length > 0) {
+      return overrideKey;
+    }
+  }
+  const apiKeys = getAiSettingsStore().get('apiKeys') as Record<string, string> | undefined;
+  const key = apiKeys?.[providerId];
+  return typeof key === 'string' && key.length > 0 ? key : null;
+}
+
 export function saveAIProviderOverrides(workspacePath: string, overrides: AIProviderOverrides | undefined): void {
   const normalizedOverrides = normalizeAIProviderOverrides(overrides);
   updateWorkspaceState(workspacePath, workspace => {
@@ -995,6 +1169,40 @@ export function getEffectiveTrackerAutomation(
     enabled: override.enabled ?? globalSettings.enabled,
     autoCloseOnCommit: override.autoCloseOnCommit ?? globalSettings.autoCloseOnCommit,
   };
+}
+
+// PR review gh-account selection. Global default in app-settings,
+// per-project override in workspace state; resolver returns override ?? default.
+export function getPrReviewDefaultGhAccount(): string | undefined {
+  return getAppStore().get('prReviewDefaultGhAccount');
+}
+
+export function setPrReviewDefaultGhAccount(login: string | undefined): void {
+  const store = getAppStore();
+  if (login) {
+    store.set('prReviewDefaultGhAccount', login);
+  } else {
+    store.delete('prReviewDefaultGhAccount');
+  }
+}
+
+export function getPrReviewGhAccountOverride(workspacePath: string): string | undefined {
+  return getWorkspaceState(workspacePath).prReviewGhAccountOverride;
+}
+
+export function savePrReviewGhAccountOverride(workspacePath: string, login: string | undefined): void {
+  updateWorkspaceState(workspacePath, workspace => {
+    workspace.prReviewGhAccountOverride = login;
+  });
+}
+
+/** Resolve the effective gh account for a workspace: override ?? global default. */
+export function getEffectiveGhAccount(workspacePath?: string): string | undefined {
+  if (workspacePath) {
+    const override = getPrReviewGhAccountOverride(workspacePath);
+    if (override) return override;
+  }
+  return getPrReviewDefaultGhAccount();
 }
 
 export function normalizeAIProviderOverrides(overrides: AIProviderOverrides | undefined): AIProviderOverrides | undefined {
@@ -1171,6 +1379,36 @@ export function getCompletionSoundType(): CompletionSoundType {
 
 export function setCompletionSoundType(soundType: CompletionSoundType): void {
   getAppStore().set('completionSoundType', soundType);
+}
+
+export function getCompletionSoundCustomPath(): string | undefined {
+  return getAppStore().get('completionSoundCustomPath');
+}
+
+export function setCompletionSoundCustomPath(soundPath: string | undefined): void {
+  if (soundPath) {
+    getAppStore().set('completionSoundCustomPath', soundPath);
+  } else {
+    getAppStore().delete('completionSoundCustomPath');
+  }
+}
+
+/**
+ * Completion sound volume as a percentage of system volume (0-100).
+ * Defaults to 100 (full volume) so existing users hear no change.
+ */
+export function getCompletionSoundVolume(): number {
+  return clampVolumePercent(getAppStore().get('completionSoundVolume', 100));
+}
+
+export function setCompletionSoundVolume(volumePercent: number): void {
+  getAppStore().set('completionSoundVolume', clampVolumePercent(volumePercent));
+}
+
+/** Clamp an arbitrary input to a valid 0-100 integer percentage. */
+function clampVolumePercent(value: unknown): number {
+  const n = typeof value === 'number' && Number.isFinite(value) ? value : 100;
+  return Math.min(100, Math.max(0, Math.round(n)));
 }
 
 // OS Notifications Settings
@@ -1455,6 +1693,37 @@ export function setClaudePluginEnabled(extensionId: string, enabled: boolean): v
   setExtensionSettings(settings);
 }
 
+export function getAgentWorkflowsEnabled(extensionId: string): boolean | undefined {
+  const settings = getExtensionSettings();
+  return settings[extensionId]?.agentWorkflowsEnabled;
+}
+
+export function setAgentWorkflowsEnabled(extensionId: string, enabled: boolean): void {
+  const settings = getExtensionSettings();
+  if (!settings[extensionId]) {
+    settings[extensionId] = { enabled: true, agentWorkflowsEnabled: enabled };
+  } else {
+    settings[extensionId].agentWorkflowsEnabled = enabled;
+  }
+  setExtensionSettings(settings);
+}
+
+// Privileged extension capability grants (global scope only).
+// Workspace-scope grants live on WorkspaceState.extensionPermissionGrants.
+// See packages/electron/src/main/extensions/permissionGrantStore.ts for the
+// canonical read/write API; consumers should not touch electron-store here
+// directly.
+
+export function getExtensionPermissionGrantsGlobal(): PersistedPermissionGrant[] {
+  return getAppStore().get('extensionPermissionGrantsGlobal', []);
+}
+
+export function setExtensionPermissionGrantsGlobal(
+  rows: PersistedPermissionGrant[]
+): void {
+  getAppStore().set('extensionPermissionGrantsGlobal', rows);
+}
+
 // Claude Code settings
 export function getClaudeCodeSettings(): { projectCommandsEnabled: boolean; userCommandsEnabled: boolean } {
   const settings = getAppStore().get('claudeCode', {});
@@ -1467,11 +1736,72 @@ export function getClaudeCodeSettings(): { projectCommandsEnabled: boolean; user
 export function setClaudeCodeProjectCommandsEnabled(enabled: boolean): void {
   const current = getAppStore().get('claudeCode', {});
   getAppStore().set('claudeCode', { ...current, projectCommandsEnabled: enabled });
+  const workflowSources = getAppStore().get('agentWorkflowSources', {});
+  getAppStore().set('agentWorkflowSources', {
+    ...workflowSources,
+    workspaceClaudeCompatibilityEnabled: true,
+    includeProjectClaudeSources: enabled,
+  });
 }
 
 export function setClaudeCodeUserCommandsEnabled(enabled: boolean): void {
   const current = getAppStore().get('claudeCode', {});
   getAppStore().set('claudeCode', { ...current, userCommandsEnabled: enabled });
+  const workflowSources = getAppStore().get('agentWorkflowSources', {});
+  getAppStore().set('agentWorkflowSources', {
+    ...workflowSources,
+    workspaceClaudeCompatibilityEnabled: true,
+    includeUserClaudeSources: enabled,
+  });
+}
+
+export interface AgentWorkflowSourceSettings {
+  workspaceClaudeCompatibilityEnabled: boolean;
+  includeProjectClaudeSources: boolean;
+  includeUserClaudeSources: boolean;
+  extensionWorkflowsEnabled: boolean;
+}
+
+export interface AgentWorkflowExportSettings {
+  codexEnabled: boolean;
+  claudeGeneratedExtensionWorkflowsEnabled: boolean;
+}
+
+export function getAgentWorkflowSourceSettings(): AgentWorkflowSourceSettings {
+  const configured = getAppStore().get('agentWorkflowSources', {});
+  const claudeSettings = getAppStore().get('claudeCode', {});
+  return {
+    workspaceClaudeCompatibilityEnabled: configured.workspaceClaudeCompatibilityEnabled ?? false,
+    includeProjectClaudeSources: configured.includeProjectClaudeSources ?? claudeSettings.projectCommandsEnabled ?? false,
+    includeUserClaudeSources: configured.includeUserClaudeSources ?? claudeSettings.userCommandsEnabled ?? false,
+    extensionWorkflowsEnabled: configured.extensionWorkflowsEnabled ?? false,
+  };
+}
+
+export function getAgentWorkflowExportSettings(): AgentWorkflowExportSettings {
+  const configured = getAppStore().get('agentWorkflowExports', {});
+  return {
+    codexEnabled: configured.codexEnabled ?? false,
+    claudeGeneratedExtensionWorkflowsEnabled: configured.claudeGeneratedExtensionWorkflowsEnabled ?? false,
+  };
+}
+
+export function setAgentWorkflowSourceSettings(
+  updates: Partial<AgentWorkflowSourceSettings>
+): AgentWorkflowSourceSettings {
+  const current = getAppStore().get('agentWorkflowSources', {});
+  const next = { ...current, ...updates };
+  getAppStore().set('agentWorkflowSources', next);
+  return getAgentWorkflowSourceSettings();
+}
+
+export function setAgentWorkflowExportSettings(
+  updates: Partial<AgentWorkflowExportSettings>
+): AgentWorkflowExportSettings {
+  const current = getAppStore().get('agentWorkflowExports', {});
+  const next = { ...current, ...updates };
+  getAppStore().set('agentWorkflowExports', next);
+  return getAgentWorkflowExportSettings();
 }
 
 // Extension Development Kit (EDK) Settings
@@ -1481,6 +1811,30 @@ export function isExtensionDevToolsEnabled(): boolean {
 
 export function setExtensionDevToolsEnabled(enabled: boolean): void {
   getAppStore().set('extensionDevToolsEnabled', enabled);
+}
+
+// Settings Control MCP kill-switch. The MCP is on by default; flipping this
+// to true makes McpConfigService omit `nimbalyst-settings` from the agent's
+// MCP config.
+export function isSettingsAgentToolsDisabled(): boolean {
+  return getAppStore().get('settingsAgentToolsDisabled', false);
+}
+
+export function setSettingsAgentToolsDisabled(disabled: boolean): void {
+  getAppStore().set('settingsAgentToolsDisabled', disabled);
+}
+
+// Per-project agent tracker-tools opt-out. The `nimbalyst-trackers` MCP server
+// is on by default; flipping this off makes McpConfigService omit it for this
+// workspace so the agent gets no tracker_* tools. Default true (undefined).
+export function isTrackersAgentToolsEnabled(workspacePath: string): boolean {
+  return getWorkspaceState(workspacePath).trackersEnabled ?? true;
+}
+
+export function setTrackersAgentToolsEnabled(workspacePath: string, enabled: boolean): void {
+  updateWorkspaceState(workspacePath, (state) => {
+    state.trackersEnabled = enabled;
+  });
 }
 
 export function getExtensionConfiguration(extensionId: string): Record<string, unknown> {
@@ -1572,7 +1926,14 @@ export function getAgentPermissions(workspacePath: string): AgentPermissions | u
 
 export function saveAgentPermissions(workspacePath: string, permissions: AgentPermissions): void {
   updateWorkspaceState(workspacePath, (state) => {
-    state.agentPermissions = { permissionMode: permissions.permissionMode };
+    state.agentPermissions = {
+      permissionMode: permissions.permissionMode,
+      // Preserve the "Allow All" classifier opt-in (issue #628). Without this the
+      // field is dropped on every save and the toggle never sticks.
+      ...(permissions.allowAllUsesClassifier !== undefined && {
+        allowAllUsesClassifier: permissions.allowAllUsesClassifier,
+      }),
+    };
   });
 }
 
@@ -1583,7 +1944,14 @@ export function isWorkspaceTrusted(workspacePath: string): boolean {
 
 export function setWorkspaceTrusted(workspacePath: string, trusted: boolean, mode: 'ask' | 'allow-all' | 'bypass-all' = 'ask'): void {
   updateWorkspaceState(workspacePath, (state) => {
-    state.agentPermissions = { permissionMode: trusted ? mode : null };
+    const existing = state.agentPermissions;
+    state.agentPermissions = {
+      permissionMode: trusted ? mode : null,
+      // Preserve the "Allow All" classifier opt-in across trust toggles (issue #628).
+      ...(existing?.allowAllUsesClassifier !== undefined && {
+        allowAllUsesClassifier: existing.allowAllUsesClassifier,
+      }),
+    };
   });
 }
 
@@ -1707,17 +2075,17 @@ export function shouldShowWalkthrough(walkthroughId: string, version?: number): 
   // Globally disabled
   if (!state.enabled) return false;
 
-  // Already completed or dismissed
-  if (state.completed.includes(walkthroughId)) return false;
-  if (state.dismissed.includes(walkthroughId)) return false;
-
-  // If version is specified and a different version was shown, allow re-showing
+  // Newer versions should re-show even if the previous version was dismissed
+  // or completed. History tracks the last version the user saw.
   if (version !== undefined && state.history?.[walkthroughId]?.version !== undefined) {
     if (state.history[walkthroughId].version !== version) {
-      // New version - allow showing again
       return true;
     }
   }
+
+  // Already completed or dismissed
+  if (state.completed.includes(walkthroughId)) return false;
+  if (state.dismissed.includes(walkthroughId)) return false;
 
   return true;
 }
@@ -1776,6 +2144,34 @@ export function getAppSetting<T>(key: string): T | undefined {
  */
 export function setAppSetting<T>(key: string, value: T): void {
   getAppStore().set(key as keyof AppStoreSchema, value as any);
+}
+
+// Preferred Agent Language
+// Preferred language for the agent. Currently used to steer the auto-generated
+// session name. Empty/undefined means no preference -- the agent picks based
+// on the conversation language.
+
+/**
+ * Get the preferred agent language.
+ * Returns undefined when no preference is set.
+ */
+export function getPreferredAgentLanguage(): string | undefined {
+  const value = getAppStore().get('preferredAgentLanguage');
+  if (typeof value !== 'string') return undefined;
+  const trimmed = value.trim();
+  return trimmed.length > 0 ? trimmed : undefined;
+}
+
+/**
+ * Set the preferred agent language.
+ * Pass undefined or empty string to clear the preference.
+ */
+export function setPreferredAgentLanguage(language: string | undefined): void {
+  if (language && language.trim().length > 0) {
+    getAppStore().set('preferredAgentLanguage', language.trim());
+  } else {
+    getAppStore().delete('preferredAgentLanguage');
+  }
 }
 
 // V8 Heap Memory Limit
@@ -1947,28 +2343,6 @@ export function isDeveloperFeatureAvailable(tag: DeveloperFeatureTag): boolean {
 }
 
 // ============================================================================
-// Debug Flags
-// Internal debug toggles (verbose logging, etc.). Off by default.
-// ============================================================================
-
-export type DebugFlags = NonNullable<AppStoreSchema['debugFlags']>;
-
-const DEFAULT_DEBUG_FLAGS: DebugFlags = {
-  diffTrace: false,
-};
-
-export function getDebugFlags(): DebugFlags {
-  const stored = getAppStore().get('debugFlags');
-  return { ...DEFAULT_DEBUG_FLAGS, ...(stored ?? {}) };
-}
-
-export function setDebugFlags(flags: Partial<DebugFlags>): void {
-  const current = getDebugFlags();
-  const merged = { ...current, ...flags };
-  getAppStore().set('debugFlags', merged);
-}
-
-// ============================================================================
 // MIGRATIONS
 // ============================================================================
 
@@ -2024,12 +2398,91 @@ export function updateMarketplaceInstall(extensionId: string, updates: Partial<M
   }
 }
 
+// Multi-Project Rail Settings
+// `multiProjectMode` is the opt-in toggle that lets users open several
+// projects in a single window via the project rail. The `openProjects` list
+// and `activeProjectPath` are restored on launch so the rail rehydrates.
+
+export function getMultiProjectMode(): boolean {
+  return getAppStore().get('multiProjectMode', false);
+}
+
+export function setMultiProjectMode(enabled: boolean): void {
+  getAppStore().set('multiProjectMode', enabled);
+}
+
+export function getOpenProjectPaths(): string[] {
+  const stored = getAppStore().get('openProjects', []);
+  return Array.isArray(stored) ? stored : [];
+}
+
+export function setOpenProjectPaths(paths: string[]): void {
+  getAppStore().set('openProjects', paths);
+}
+
+export function getActiveProjectPath(): string | null {
+  return getAppStore().get('activeProjectPath', null);
+}
+
+export function setActiveProjectPath(path: string | null): void {
+  getAppStore().set('activeProjectPath', path);
+}
+
+export function getRestorePreviousProjectsOnLaunch(): boolean {
+  return getAppStore().get('restorePreviousProjectsOnLaunch', false);
+}
+
+export function setRestorePreviousProjectsOnLaunch(enabled: boolean): void {
+  getAppStore().set('restorePreviousProjectsOnLaunch', enabled);
+}
+
 export function runMigrations(currentVersion: string): void {
   const lastKnownVersion = getAppStore().get('lastKnownVersion');
 
   // Missing lastKnownVersion means user is upgrading from <= 0.52.10
   // (versions before we started tracking lastKnownVersion)
   const isUpgradingFromOldVersion = !lastKnownVersion;
+
+  // One-shot, version-independent migration (NIM-827): plain `fable` defaults
+  // become `fable-1m`. Claude Code windows plain `fable` at 200k and gates the
+  // 1M window behind `fable[1m]`; the original Fable picker row predated
+  // `fable-1m`, so users who picked it were silently on 200k and hit "Prompt
+  // is too long" as soon as a large skill loaded. Flag-guarded (not
+  // version-gated) so it also fires on dev builds where the version doesn't
+  // change; a user who later deliberately re-picks plain Fable stays on it.
+  if (!getAppStore().get('fableDefaultMigratedTo1m')) {
+    const currentDefault = getAppStore().get('defaultAIModel');
+    if (currentDefault === 'claude-code:fable' || currentDefault === 'claude-code-cli:fable') {
+      const migrated = `${currentDefault}-1m`;
+      logger.store.info(`[Migrations] Migrating default model from ${currentDefault} to ${migrated}`);
+      getAppStore().set('defaultAIModel', migrated);
+    }
+    getAppStore().set('fableDefaultMigratedTo1m', true);
+  }
+
+  // One-shot, version-independent migration: gutter icon visibility moved from
+  // per-project workspace state (hiddenGutterButtons) to a single global app
+  // setting (hiddenGutterItems). Union every project's hidden set so a user who
+  // had hidden, say, Voice Mode in one project keeps it hidden everywhere
+  // rather than having it silently reappear. Flag-guarded so it runs once.
+  if (!getAppStore().get('gutterButtonsMigratedToGlobal')) {
+    try {
+      const workspaces = getWorkspaceStore().store;
+      const union = new Set<string>(getAppStore().get('hiddenGutterItems') ?? []);
+      for (const state of Object.values(workspaces ?? {})) {
+        for (const id of state?.hiddenGutterButtons ?? []) {
+          union.add(id);
+        }
+      }
+      if (union.size > 0) {
+        logger.store.info(`[Migrations] Unioning ${union.size} hidden gutter button(s) into global setting`);
+        getAppStore().set('hiddenGutterItems', Array.from(union));
+      }
+    } catch (err) {
+      logger.store.warn('[Migrations] Failed to migrate hiddenGutterButtons to global:', err);
+    }
+    getAppStore().set('gutterButtonsMigratedToGlobal', true);
+  }
 
   // Same version - no migration needed
   if (!isUpgradingFromOldVersion && lastKnownVersion === currentVersion) {

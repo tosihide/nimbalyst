@@ -2,6 +2,7 @@ import React, { useRef, useEffect, KeyboardEvent, useState, useCallback, forward
 import { useAtomValue, useSetAtom } from 'jotai';
 import { GenericTypeahead, TypeaheadOption } from '../Typeahead/GenericTypeahead';
 import { extractTriggerMatch, getSlashTypeaheadScope, insertAtTrigger, type SlashTypeaheadScope, TriggerMatch } from '../Typeahead/typeaheadUtils';
+import { buildSlashCommandOptions, fetchSlashCommandEntries, type SlashCommandEntry } from '../Typeahead/slashCommandAutocomplete';
 import { readClipboard, type ChatAttachment } from '@nimbalyst/runtime';
 import type { TokenUsageCategory } from '@nimbalyst/runtime/ai/server/types';
 import type { EffortLevel } from '../../utils/modelUtils';
@@ -13,6 +14,8 @@ import { registerPendingVoiceCommandSetter } from './VoiceModeButton.tsx';
 import { PendingVoiceCommand } from './PendingVoiceCommand';
 import { pendingVoiceCommandAtom, voiceActiveSessionIdAtom, type PendingVoiceCommand as PendingVoiceCommandType } from '../../store/atoms/voiceModeState';
 import { ContextUsageDisplay } from './ContextUsageDisplay';
+import { ActionPromptsDropdown } from './ActionPromptsDropdown';
+import type { ActionPrompt } from '../../store/atoms/actionPrompts';
 import { MockupAnnotationIndicator } from './MockupAnnotationIndicator';
 import { TextSelectionIndicator } from './TextSelectionIndicator';
 import { EditorContextIndicator } from './EditorContextIndicator';
@@ -70,6 +73,13 @@ interface AIInputProps {
   onModelChange?: (modelId: string) => void;
   sessionHasMessages?: boolean;  // Whether current session has any messages
   currentProvider?: string | null;  // Current session provider
+  /**
+   * Show the model picker as a read-only chip even when onModelChange is
+   * omitted (e.g. a committed claude-code-cli session whose model is fixed at
+   * spawn). Keeps the provider/model visible without offering a no-op switch.
+   */
+  readOnlyModel?: boolean;
+  readOnlyModelTitle?: string;
 
   // Effort level support (Opus 4.6 adaptive reasoning)
   effortLevel?: EffortLevel;
@@ -101,6 +111,15 @@ interface AIInputProps {
 
   // Test ID for E2E testing
   testId?: string;
+
+  /**
+   * Called when the user picks an action prompt whose config is
+   * `launch: new-session`. The handler is expected to spawn a sibling
+   * session, prefix the body with an originating-session mention, and
+   * submit-or-prefill per the action's config. If omitted, launcher actions
+   * fall back to inserting into the current draft.
+   */
+  onLaunchActionInNewSession?: (action: ActionPrompt) => void | Promise<void>;
 }
 
 /**
@@ -140,6 +159,8 @@ export const AIInput = forwardRef<AIInputRef, AIInputProps>(
     onModelChange,
     sessionHasMessages,
     currentProvider,
+    readOnlyModel = false,
+    readOnlyModelTitle,
     effortLevel,
     onEffortLevelChange,
     showEffortLevel,
@@ -150,6 +171,7 @@ export const AIInput = forwardRef<AIInputRef, AIInputProps>(
     currentFilePath,
     lastUserMessageTimestamp,
     testId,
+    onLaunchActionInNewSession,
   }, ref) => {
     const textareaRef = useRef<HTMLTextAreaElement>(null);
     const [typeaheadMatch, setTypeaheadMatch] = useState<TriggerMatch | null>(null);
@@ -157,7 +179,7 @@ export const AIInput = forwardRef<AIInputRef, AIInputProps>(
     const [selectedOption, setSelectedOption] = useState<TypeaheadOption | null>(null);
     const [cursorPosition, setCursorPosition] = useState(0);
     const [slashCommandOptions, setSlashCommandOptions] = useState<TypeaheadOption[]>([]);
-    const [allSlashCommands, setAllSlashCommands] = useState<any[]>([]);
+    const [allSlashCommands, setAllSlashCommands] = useState<SlashCommandEntry[]>([]);
     const [dragActive, setDragActive] = useState(false);
     const [isFocused, setIsFocused] = useState(false);
 
@@ -237,6 +259,24 @@ export const AIInput = forwardRef<AIInputRef, AIInputProps>(
         }
       });
     }, [onChange, attachments, onAttachmentAdd, onAttachmentRemove]);
+
+    // Replace the draft with an action-prompt body and place the cursor at
+    // the end. Pushes a boundary undo snapshot so Cmd+Z restores the prior
+    // draft instead of coalescing with the user's next keystroke.
+    const handleActionPromptInsert = useCallback((body: string) => {
+      pushSnapshot(captureSnapshot(), { boundary: true });
+      onChange(body);
+      requestAnimationFrame(() => {
+        const ta = textareaRef.current;
+        if (!ta) return;
+        ta.focus();
+        try {
+          ta.setSelectionRange(body.length, body.length);
+        } catch {
+          // best-effort cursor placement
+        }
+      });
+    }, [pushSnapshot, captureSnapshot, onChange]);
 
     // File mention state via Jotai atoms
     // Subscribes directly to atoms instead of receiving props (no prop drilling)
@@ -411,132 +451,26 @@ export const AIInput = forwardRef<AIInputRef, AIInputProps>(
     const fetchSlashCommands = useCallback(async () => {
       if (!enableSlashCommands || !workspacePath) return;
       try {
-        // Get SDK commands from ClaudeCodeProvider if available
-        let sdkCommands: string[] = [];
-        let sdkSkills: string[] = [];
-        try {
-          const sdkResult = await window.electronAPI.invoke('ai:getSlashCommands', sessionId);
-          if (sdkResult?.success && Array.isArray(sdkResult.commands)) {
-            sdkCommands = sdkResult.commands;
-            sdkSkills = Array.isArray(sdkResult.skills) ? sdkResult.skills : [];
-          }
-        } catch (sdkError) {
-          console.warn('[AIInput] Failed to get SDK commands:', sdkError);
-        }
-
-        // Fetch all commands (built-in + custom)
-        const commands = await window.electronAPI.invoke('slash-command:list', {
+        const commands = await fetchSlashCommandEntries({
           workspacePath,
-          sdkCommands,
-          sdkSkills,
+          sessionId,
+          provider: currentProvider ?? provider ?? null,
         });
-
-        setAllSlashCommands(commands || []);
+        setAllSlashCommands(commands);
       } catch (error) {
         console.error('[AIInput] Failed to load slash commands:', error);
         setAllSlashCommands([]);
       }
-    }, [workspacePath, sessionId, enableSlashCommands]);
+    }, [workspacePath, sessionId, enableSlashCommands, currentProvider, provider]);
 
     // Fetch on mount and when workspace/session changes
     useEffect(() => {
       fetchSlashCommands();
     }, [fetchSlashCommands]);
 
-    // Get icon for command based on name and source
-    const getCommandIcon = (cmd: any): string => {
-      if (cmd.kind === 'skill') {
-        return 'psychology';
-      }
-      if (cmd.source === 'builtin') {
-        const builtinIcons: Record<string, string> = {
-          'compact': 'compress',
-          'clear': 'delete_sweep',
-          'context': 'info',
-          'cost': 'payments',
-          'init': 'restart_alt',
-          'output-style:new': 'palette',
-          'pr-comments': 'comment',
-          'release-notes': 'description',
-          'todos': 'checklist',
-          'review': 'rate_review',
-          'security-review': 'security'
-        };
-        return builtinIcons[cmd.name] || 'bolt';
-      }
-      if (cmd.source === 'plugin') {
-        return 'extension';
-      }
-      return 'code';
-    };
-
-    // Score a command name against a query for relevance ranking
-    // Higher score = better match
-    const scoreCommand = (name: string, query: string): number => {
-      const lowerName = name.toLowerCase();
-      const lowerQuery = query.toLowerCase();
-
-      // Exact match
-      if (lowerName === lowerQuery) return 100;
-
-      // Name starts with query (prefix match)
-      if (lowerName.startsWith(lowerQuery)) return 80;
-
-      // Name contains query at word boundary (e.g., "prepare-commit" matches at "-commit")
-      const wordBoundaryRegex = new RegExp(`(?:^|[\\s_-])${lowerQuery.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`, 'i');
-      if (wordBoundaryRegex.test(lowerName)) return 60;
-
-      // Name contains query anywhere
-      if (lowerName.includes(lowerQuery)) return 40;
-
-      // No match
-      return 0;
-    };
-
     // Filter and sort slash commands based on query
     const filterSlashCommands = useCallback((query: string, scope: SlashTypeaheadScope) => {
-      const hasQuery = query.length > 0;
-      const filtered = allSlashCommands
-        .filter(cmd => {
-          if (scope === 'commands') {
-            // At position 0: show everything (commands + skills)
-            return true;
-          }
-          // Mid-prompt skills scope: show skills AND project/user commands, not built-in commands
-          // (the SDK treats .claude/commands/ entries as invocable skills too)
-          return cmd.source !== 'builtin';
-        })
-        .map(cmd => ({
-          cmd,
-          score: scoreCommand(cmd.name, query)
-        }))
-        .filter(({ score }) => score > 0)
-        .sort((a, b) => b.score - a.score)
-        .map(({ cmd }) => {
-          // Build label with argument hint if available (e.g., "/fix-issue [issue-number]")
-          const label = cmd.argumentHint
-            ? `/${cmd.name} ${cmd.argumentHint}`
-            : `/${cmd.name}`;
-          return {
-            id: cmd.name,
-            label,
-            description: cmd.description || `Execute ${cmd.name} command`,
-            icon: getCommandIcon(cmd),
-            // Only show sections when there's no filter query (full list)
-            // When filtering, we want pure relevance-based ordering without section grouping
-            section: hasQuery ? undefined : (
-              cmd.kind === 'skill'
-                ? (cmd.source === 'project' ? 'Project Skills' :
-                   cmd.source === 'plugin' ? 'Plugin Skills' : 'User Skills')
-                : (cmd.source === 'builtin' ? 'Built-in Commands' :
-                   cmd.source === 'project' ? 'Project Commands' :
-                   cmd.source === 'plugin' ? 'Extension Commands' : 'User Commands')
-            ),
-            data: cmd
-          };
-        });
-
-      setSlashCommandOptions(filtered);
+      setSlashCommandOptions(buildSlashCommandOptions(allSlashCommands, query, scope));
     }, [allSlashCommands]);
 
     // Check for typeahead trigger when value changes (debounced for performance)
@@ -719,8 +653,8 @@ export const AIInput = forwardRef<AIInputRef, AIInputProps>(
     // Detect /implement command trigger - switch to agent mode when user types "/implement"
     // This allows the implement command to work even if user was in planning mode
     useEffect(() => {
-      // Match "/implement" or "/nimbalyst-planning:implement" at start, followed by end of string or whitespace
-      const implementCommandMatch = value.match(/^\/(nimbalyst-planning:)?implement(?:\s|$)/);
+      // Match "/implement", "/planning:implement", or the legacy "/nimbalyst-planning:implement" form
+      const implementCommandMatch = value.match(/^\/(?:nimbalyst-planning:|planning:)?implement(?:\s|$)/);
       if (implementCommandMatch && mode === 'planning' && onModeChange) {
         // Switch to agent mode immediately - implementing requires coding
         onModeChange('agent');
@@ -881,7 +815,7 @@ export const AIInput = forwardRef<AIInputRef, AIInputProps>(
       }
 
       // Handle Cmd+Shift+V for force-paste (bypass large paste → attachment conversion)
-      if ((e.metaKey || e.ctrlKey) && e.shiftKey && e.key === 'v') {
+      if ((e.metaKey || e.ctrlKey) && e.shiftKey && e.key.toLowerCase() === 'v') {
         e.preventDefault();
         readClipboard().then(text => {
           if (!text || !textareaRef.current) return;
@@ -1090,13 +1024,21 @@ export const AIInput = forwardRef<AIInputRef, AIInputProps>(
       // Handle file mention drops from file tree or files-edited sidebar
       const fileMentionPath = e.dataTransfer.getData('application/x-nimbalyst-file-mention');
       if (fileMentionPath) {
-        // Convert absolute paths to relative (file tree uses absolute, files-edited uses relative)
-        let relativePath = fileMentionPath;
-        if (workspacePath && fileMentionPath.startsWith(workspacePath)) {
-          relativePath = fileMentionPath.slice(workspacePath.length);
-          if (relativePath.startsWith('/')) relativePath = relativePath.slice(1);
-        }
-        const mention = `@${relativePath}`;
+        // The drag source may give either an absolute path (file tree) or a
+        // workspace-relative path (files-edited sidebar). Derive both so we can
+        // build a markdown link that includes the absolute target.
+        const isAbsolute = fileMentionPath.startsWith('/');
+        const absolutePath = isAbsolute
+          ? fileMentionPath
+          : workspacePath
+            ? `${workspacePath.replace(/\/$/, '')}/${fileMentionPath.replace(/^\//, '')}`
+            : fileMentionPath;
+        const displayName = absolutePath.split('/').pop() || absolutePath;
+        // Use a markdown link with the absolute path so any agent (Codex,
+        // Claude Code, etc.) can resolve it unambiguously on the first try.
+        // Bare `@workspace-relative` paths caused Codex to guess sibling
+        // directories before finding cwd-relative files.
+        const mention = `[${displayName}](${absolutePath})`;
         // Insert at cursor position, or append with space separator
         const textarea = textareaRef.current;
         const cursorPos = textarea?.selectionStart ?? value.length;
@@ -1329,7 +1271,7 @@ export const AIInput = forwardRef<AIInputRef, AIInputProps>(
         />
 
         {/* Inline controls row - hidden in memory mode */}
-        {!isMemoryMode && (onModeChange || onModelChange || (tokenUsage && provider === 'claude-code')) && (
+        {!isMemoryMode && (onModeChange || onModelChange || readOnlyModel || workspacePath || (tokenUsage && provider === 'claude-code')) && (
           <div style={{
             display: 'flex',
             alignItems: 'center',
@@ -1337,14 +1279,16 @@ export const AIInput = forwardRef<AIInputRef, AIInputProps>(
           }}>
 {onModeChange && provider === 'claude-code' && mode && <ModeTag mode={mode} onModeChange={onModeChange} />}
 
-            {onModelChange && (
+            {(onModelChange || (readOnlyModel && currentModel)) && (
               <HelpTooltip testId="model-picker">
                 <span style={{ display: 'inline-flex' }}>
                   <ModelSelector
                     currentModel={currentModel || ''}
-                    onModelChange={onModelChange}
+                    onModelChange={onModelChange ?? (() => {})}
                     sessionHasMessages={sessionHasMessages}
                     currentProvider={currentProvider}
+                    readOnly={!onModelChange && readOnlyModel}
+                    readOnlyTitle={readOnlyModelTitle}
                   />
                 </span>
               </HelpTooltip>
@@ -1354,6 +1298,17 @@ export const AIInput = forwardRef<AIInputRef, AIInputProps>(
                 level={effortLevel}
                 onLevelChange={onEffortLevelChange}
               />
+            )}
+            {workspacePath && (
+              <HelpTooltip testId="action-prompts-dropdown">
+                <span style={{ display: 'inline-flex' }}>
+                  <ActionPromptsDropdown
+                    workspacePath={workspacePath}
+                    onInsert={handleActionPromptInsert}
+                    onLaunchNewSession={onLaunchActionInNewSession}
+                  />
+                </span>
+              </HelpTooltip>
             )}
             {/* Show token usage for all providers - displays "--" if no data yet */}
             <ContextUsageDisplay

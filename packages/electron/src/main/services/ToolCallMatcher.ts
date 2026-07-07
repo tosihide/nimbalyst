@@ -24,7 +24,8 @@ import { parse as parseShellCommand } from 'shell-quote';
 import { diffLines } from 'diff';
 import { database } from '../database/PGLiteDatabaseWorker';
 import { logger } from '../utils/logger';
-import { TranscriptEventRepository } from '@nimbalyst/runtime/storage/repositories/TranscriptEventRepository';
+import { TranscriptMigrationRepository } from '@nimbalyst/runtime/storage/repositories/TranscriptMigrationRepository';
+import { AISessionsRepository } from '@nimbalyst/runtime';
 import type { TranscriptEvent, ToolCallPayload } from '@nimbalyst/runtime/ai/server/transcript/types';
 
 const gunzip = promisify(zlib.gunzip);
@@ -109,6 +110,7 @@ interface AgentMessageRow {
   id: number;
   content: string;
   created_at_ms: number;
+  metadata?: unknown;
 }
 
 interface ToolCallMatchRow {
@@ -286,6 +288,17 @@ function stringifyOutput(output: any): string {
   return String(output);
 }
 
+function extractSyntheticEditGroupId(rawMetadata: unknown): string | null {
+  if (!rawMetadata || typeof rawMetadata !== 'object') {
+    return null;
+  }
+  const editGroupId = (rawMetadata as { editGroupId?: unknown }).editGroupId;
+  if (typeof editGroupId === 'string' && editGroupId.startsWith('nimtc|')) {
+    return editGroupId;
+  }
+  return null;
+}
+
 /**
  * Parse an ai_agent_messages content string to extract tool call windows.
  */
@@ -294,7 +307,8 @@ export function parseToolCallWindows(
   content: string,
   createdAt: Date,
   sessionId: string,
-  workspacePath?: string
+  workspacePath?: string,
+  rawMetadata?: unknown,
 ): ToolCallWindow[] {
   const windows: ToolCallWindow[] = [];
 
@@ -403,8 +417,9 @@ export function parseToolCallWindows(
 
   // Get item ID and tool use ID
   const itemId = typeof item.id === 'string' ? item.id : null;
-  const toolUseId = typeof item.tool_use_id === 'string' ? item.tool_use_id :
-    typeof item.id === 'string' ? item.id : null;
+  const toolUseId = extractSyntheticEditGroupId(rawMetadata)
+    ?? (typeof item.tool_use_id === 'string' ? item.tool_use_id :
+      typeof item.id === 'string' ? item.id : null);
 
   windows.push({
     messageId,
@@ -467,7 +482,7 @@ export async function getRawToolCallWindows(
     }
 
     const messagesResult = await database.query<AgentMessageRow>(
-      `SELECT id, content, EXTRACT(EPOCH FROM created_at) * 1000 AS created_at_ms
+      `SELECT id, content, metadata, EXTRACT(EPOCH FROM created_at) * 1000 AS created_at_ms
        FROM ai_agent_messages
        WHERE ${conditions.join(' AND ')}
        ORDER BY id ASC`,
@@ -482,6 +497,7 @@ export async function getRawToolCallWindows(
         new Date(ensureNumber(msg.created_at_ms)),
         sessionId,
         workspacePath,
+        msg.metadata,
       );
       windows.push(...msgWindows);
     }
@@ -522,7 +538,7 @@ async function getRawToolCallWindowsMultiSession(
     }
 
     const messagesResult = await database.query<AgentMessageRow & { session_id: string }>(
-      `SELECT session_id, id, content, EXTRACT(EPOCH FROM created_at) * 1000 AS created_at_ms
+      `SELECT session_id, id, content, metadata, EXTRACT(EPOCH FROM created_at) * 1000 AS created_at_ms
        FROM ai_agent_messages
        WHERE ${conditions.join(' AND ')}
        ORDER BY id ASC`,
@@ -536,6 +552,8 @@ async function getRawToolCallWindowsMultiSession(
         msg.content,
         new Date(ensureNumber(msg.created_at_ms)),
         msg.session_id,
+        undefined,
+        msg.metadata,
       );
       for (const w of msgWindows) {
         let arr = result.get(msg.session_id);
@@ -1130,12 +1148,62 @@ class ToolCallMatcherImpl {
     }
   }
 
+  // Tool-call diffs are immutable once the tool has finished: the inputs are
+  // the historical ai_agent_messages content and the post-edit session_files
+  // metadata. Without dedup, every AsyncEditToolResultCard mount on the
+  // transcript fires its own 4-query lookup -- a session with 20 edit cards
+  // pegs the SQLite worker as the cards all mount in parallel. Cache the
+  // result by (sessionId, toolCallItemId, timestamp) and dedup in-flight
+  // requests so N concurrent callers share one query.
+  private diffCache = new Map<string, ToolCallDiffResult[]>();
+  private diffInFlight = new Map<string, Promise<ToolCallDiffResult[]>>();
+  private readonly DIFF_CACHE_MAX_ENTRIES = 500;
+
+  private diffCacheKey(sessionId: string, toolCallItemId: string, ts?: number): string {
+    return `${sessionId} ${toolCallItemId} ${ts ?? ''}`;
+  }
+
+  /** Invalidate cached diffs for a session (e.g. when its messages are mutated). */
+  invalidateDiffCacheForSession(sessionId: string): void {
+    const prefix = `${sessionId} `;
+    for (const key of this.diffCache.keys()) {
+      if (key.startsWith(prefix)) this.diffCache.delete(key);
+    }
+  }
+
   /**
    * Get file diffs caused by a specific tool call.
    * Looks up matches by tool_call_item_id, then extracts diff data from
    * the raw ai_agent_messages content (tool arguments).
    */
   async getDiffsForToolCall(
+    sessionId: string,
+    toolCallItemId: string,
+    toolCallTimestamp?: number
+  ): Promise<ToolCallDiffResult[]> {
+    const cacheKey = this.diffCacheKey(sessionId, toolCallItemId, toolCallTimestamp);
+    const cached = this.diffCache.get(cacheKey);
+    if (cached) return cached;
+    const inFlight = this.diffInFlight.get(cacheKey);
+    if (inFlight) return inFlight;
+
+    const promise = this.computeDiffsForToolCall(sessionId, toolCallItemId, toolCallTimestamp);
+    this.diffInFlight.set(cacheKey, promise);
+    try {
+      const result = await promise;
+      // Cap the cache to avoid unbounded growth in long-lived sessions.
+      if (this.diffCache.size >= this.DIFF_CACHE_MAX_ENTRIES) {
+        const firstKey = this.diffCache.keys().next().value;
+        if (firstKey !== undefined) this.diffCache.delete(firstKey);
+      }
+      this.diffCache.set(cacheKey, result);
+      return result;
+    } finally {
+      this.diffInFlight.delete(cacheKey);
+    }
+  }
+
+  private async computeDiffsForToolCall(
     sessionId: string,
     toolCallItemId: string,
     toolCallTimestamp?: number
@@ -1147,8 +1215,14 @@ class ToolCallMatcherImpl {
 
       const lookup = parseToolCallLookupId(toolCallItemId, toolCallTimestamp);
 
+      // Pass both forms to the content lookup. session_files.metadata.toolUseId
+      // is the synthetic `nimtc|...` ID for Codex sessions written after the
+      // Phase 1.5 streaming wiring; legacy rows persisted the raw item id. The
+      // helper queries on either form so reading historical sessions still
+      // works.
       const directDiffs = await this.getDiffsFromToolCallContent(
         sessionId,
+        toolCallItemId,
         lookup.toolCallItemId,
         lookup.toolCallTimestamp
       );
@@ -1206,12 +1280,17 @@ class ToolCallMatcherImpl {
         });
       }
 
-      // 3. Try canonical event for the specific tool call, fall back to raw messages
+      // 3. Try canonical event for the specific tool call, fall back to raw messages.
+      // Phase 3 of canonical-transcript-deprecation: canonical events live in
+      // TranscriptRuntime's in-memory cache instead of a persisted store. The
+      // runtime resolves the per-session cache and rebuilds from raw on miss.
       let canonicalPayload: ToolCallPayload | null = null;
       try {
-        if (TranscriptEventRepository.hasStore() && lookup.toolCallItemId) {
-          const store = TranscriptEventRepository.getStore();
-          const event = await store.findByProviderToolCallId(lookup.toolCallItemId, sessionId);
+        if (TranscriptMigrationRepository.hasService() && lookup.toolCallItemId) {
+          const runtime = TranscriptMigrationRepository.getService();
+          const session = await AISessionsRepository.get(sessionId);
+          const provider = session?.provider ?? 'unknown';
+          const event = await runtime.findToolCallByProviderId(sessionId, lookup.toolCallItemId, provider);
           if (event) {
             canonicalPayload = event.payload as unknown as ToolCallPayload;
           }
@@ -1864,7 +1943,8 @@ class ToolCallMatcherImpl {
 
   private async getDiffsFromToolCallContent(
     sessionId: string,
-    toolCallItemId: string,
+    primaryLookupId: string,
+    fallbackLookupId: string,
     toolCallTimestamp?: number
   ): Promise<ToolCallDiffResult[]> {
     try {
@@ -1878,15 +1958,20 @@ class ToolCallMatcherImpl {
       );
       const workspacePath = sessionResult.rows[0]?.workspace_id;
 
-      // Get file paths from the file watcher (session_files) for this tool call
+      // Get file paths from the file watcher (session_files) for this tool call.
+      // Match on either the synthetic edit-group ID (Phase 1.5+ writes) OR the
+      // raw item id (legacy data) -- both map to the same logical tool call.
       // Use EXTRACT(EPOCH) for correct epoch ms (avoids PGLite tz interpretation bug).
+      const lookupIds = primaryLookupId === fallbackLookupId
+        ? [primaryLookupId]
+        : [primaryLookupId, fallbackLookupId];
       const linkResult = await database.query<{ file_path: string; timestamp_ms: number; metadata: any }>(
         `SELECT file_path, EXTRACT(EPOCH FROM timestamp) * 1000 AS timestamp_ms, metadata
          FROM session_files
          WHERE session_id = $1
            AND link_type = 'edited'
-           AND metadata->>'toolUseId' = $2`,
-        [sessionId, toolCallItemId]
+           AND metadata->>'toolUseId' = ANY($2)`,
+        [sessionId, lookupIds]
       );
 
       if (linkResult.rows.length === 0) return [];
@@ -1912,26 +1997,52 @@ class ToolCallMatcherImpl {
 
       if (filePaths.length === 0) return [];
 
-      // Try canonical event first for diff extraction (targeted lookup via indexed column)
+      // Try canonical event first for diff extraction (targeted lookup via indexed column).
+      // Phase 1 promoted Codex synthetic IDs (`nimtc|...`) to canonical
+      // providerToolCallId, but legacy events still use the raw item id; try
+      // the synthetic form first and fall back to raw.
       let canonicalPayload: ToolCallPayload | null = null;
       let toolName = 'edit';
       try {
-        if (TranscriptEventRepository.hasStore() && toolCallItemId) {
-          const store = TranscriptEventRepository.getStore();
-          const matchingEvent = await store.findByProviderToolCallId(toolCallItemId, sessionId);
-          if (matchingEvent) {
-            canonicalPayload = matchingEvent.payload as unknown as ToolCallPayload;
-            toolName = canonicalPayload.toolName;
+        if (TranscriptMigrationRepository.hasService()) {
+          const runtime = TranscriptMigrationRepository.getService();
+          const session = await AISessionsRepository.get(sessionId);
+          const provider = session?.provider ?? 'unknown';
+          const ids = primaryLookupId === fallbackLookupId
+            ? [primaryLookupId]
+            : [primaryLookupId, fallbackLookupId];
+          for (const id of ids) {
+            if (!id) continue;
+            const matchingEvent = await runtime.findToolCallByProviderId(sessionId, id, provider);
+            if (matchingEvent) {
+              canonicalPayload = matchingEvent.payload as unknown as ToolCallPayload;
+              toolName = canonicalPayload.toolName;
+              break;
+            }
           }
         }
       } catch (canonicalError) {
         logger.main.warn('[ToolCallMatcher] Failed to load canonical event for getDiffsFromToolCallContent:', canonicalError);
       }
 
+      // Build a lookup of session_files metadata.operation by file path so
+      // the create/delete kind set by SessionFileTracker is preserved here.
+      // Hardcoding 'edit' would mask new-file creation (NewFilePreview) and
+      // route everything to DiffViewer.
+      const opByFilePath = new Map<string, string>();
+      for (const row of linkResult.rows) {
+        const op = (row.metadata as Record<string, unknown> | undefined)?.operation;
+        if (typeof op === 'string' && !opByFilePath.has(row.file_path)) {
+          opByFilePath.set(row.file_path, op);
+        }
+      }
+
       const results: ToolCallDiffResult[] = [];
       for (const filePath of filePaths) {
-        const operation = toolName === 'Bash' ? 'bash' : 'edit';
-        const debug: string[] = [`match: toolUseId in session_files`, `tool: ${toolName}`];
+        const operation =
+          opByFilePath.get(filePath) ??
+          (toolName === 'Bash' ? 'bash' : 'edit');
+        const debug: string[] = [`match: toolUseId in session_files`, `tool: ${toolName}`, `op: ${operation}`];
         const diffResult: ToolCallDiffResult = {
           filePath,
           operation,
@@ -1975,11 +2086,17 @@ class ToolCallMatcherImpl {
       }
 
       // History snapshot fallback for entries with no extractable diff data.
-      // Pass toolCallItemId so computeHistoryDiff finds the exact pre-edit
-      // snapshot for this tool call (not just the latest one).
+      // Try the synthetic ID first (matches the tagId pattern history tags
+      // are written with for new Codex sessions); fall back to raw for
+      // legacy data.
       for (const result of results) {
         if (result.diffs.length === 0 && !result.content) {
-          const historyDiff = await this.computeHistoryDiff(sessionId, result.filePath, toolCallItemId);
+          let historyDiff: { oldString: string; newString: string; linesAdded: number; linesRemoved: number } | null = null;
+          for (const id of (primaryLookupId === fallbackLookupId ? [primaryLookupId] : [primaryLookupId, fallbackLookupId])) {
+            if (!id) continue;
+            historyDiff = await this.computeHistoryDiff(sessionId, result.filePath, id);
+            if (historyDiff) break;
+          }
           if (historyDiff) {
             result.diffs = [{ oldString: historyDiff.oldString, newString: historyDiff.newString }];
             result.linesAdded = historyDiff.linesAdded;

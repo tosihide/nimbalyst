@@ -1,22 +1,12 @@
-import { defineConfig, Plugin } from 'vite';
+import { defineConfig } from 'vite';
 import react from '@vitejs/plugin-react';
 import { resolve } from 'path';
 
-// Plugin to inject a process shim at the top of the bundle
-function processShimPlugin(): Plugin {
-  return {
-    name: 'process-shim',
-    renderChunk(code) {
-      // Inject process shim at the top of the bundle
-      const shim = `
+const PROCESS_SHIM_BANNER = `
 if (typeof process === 'undefined') {
   globalThis.process = { env: { NODE_ENV: 'production' }, browser: true, platform: '' };
 }
 `;
-      return shim + code;
-    },
-  };
-}
 
 export default defineConfig({
   plugins: [
@@ -24,7 +14,6 @@ export default defineConfig({
       jsxRuntime: 'automatic',
       jsxImportSource: 'react',
     }),
-    processShimPlugin(),
   ],
   define: {
     'process.env.NODE_ENV': JSON.stringify('production'),
@@ -47,6 +36,11 @@ export default defineConfig({
         /^@lexical\//,
         /^@nimbalyst\/runtime/,
         '@nimbalyst/editor-context',
+        // yJS must resolve to the host's copy at runtime -- `instanceof Y.Doc`
+        // checks fail if the extension bundles its own (same constraint as
+        // React). The host's runtime exposes both modules.
+        'yjs',
+        /^y-protocols(\/.*)?$/,
       ],
       output: {
         globals: {
@@ -54,6 +48,7 @@ export default defineConfig({
           'react-dom': 'ReactDOM',
           'react/jsx-runtime': 'jsxRuntime',
         },
+        banner: PROCESS_SHIM_BANNER,
         assetFileNames: (assetInfo) => {
           if (assetInfo.names?.some((name) => name.endsWith('.css'))) {
             return 'index.css';

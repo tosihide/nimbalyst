@@ -3,12 +3,25 @@
  */
 
 import { BrowserWindow, ipcMain, systemPreferences } from 'electron';
-import { RealtimeAPIClient } from './RealtimeAPIClient';
+import { RealtimeAPIClient, BUILTIN_VOICE_TOOL_NAMES, type RealtimeModel, type RealtimeReasoningEffort } from './RealtimeAPIClient';
+import { buildVoiceToolSet } from './voiceToolBridge';
+import { mapAiSessionStatusToTaskStatus } from './taskStatus';
+import {
+  getVoiceEnabledExtensionTools,
+  getVoiceEnabledBackendToolsForWorkspace,
+  resolveBackendWorkspacePath,
+} from '../../mcp/mcpWorkspaceResolver';
+import { handleExtensionTool } from '../../mcp/tools/extensionToolHandler';
+import { handleBackendTool, isBackendTool } from '../../mcp/tools/backendToolHandler';
 import { safeHandle } from '../../utils/ipcRegistry';
 import Store from 'electron-store';
 import { AnalyticsService } from '../analytics/AnalyticsService';
 import { AISessionsRepository } from '@nimbalyst/runtime';
+import { searchSessionsForVoice } from './sessionSearch';
+import { getSessionSummaryForVoice } from './sessionSummary';
 import { getDatabase } from '../../database/initialize';
+import { getDefaultAIModel, getPreferredAgentLanguage } from '../../utils/store';
+import { randomUUID } from 'crypto';
 
 // Store active voice session info
 interface VoiceSession {
@@ -42,6 +55,34 @@ function sendSessionEndedEvent(reason: string, startTime: number): void {
 }
 
 let activeVoiceSession: VoiceSession | null = null;
+
+/**
+ * Request the concatenated voice session context contributed by extensions
+ * (Core hook 2). Extension providers run in the renderer, so we send a request
+ * with a one-shot result channel and await the reply (capped timeout). Returns
+ * an empty string if no providers contribute or on timeout/error.
+ */
+function requestExtensionVoiceContext(
+  window: BrowserWindow,
+  input: { workspacePath?: string; activeFilePath?: string; voiceSessionId?: string; codingSessionId?: string }
+): Promise<string> {
+  return new Promise((resolve) => {
+    if (!window || window.isDestroyed()) {
+      resolve('');
+      return;
+    }
+    const resultChannel = `voice-mode:extension-context-result-${Date.now()}-${Math.random()}`;
+    const timeout = setTimeout(() => {
+      ipcMain.removeAllListeners(resultChannel);
+      resolve('');
+    }, 5000);
+    ipcMain.once(resultChannel, (_event, data: { context?: string }) => {
+      clearTimeout(timeout);
+      resolve(typeof data?.context === 'string' ? data.context : '');
+    });
+    window.webContents.send('voice-mode:collect-extension-context', { input, resultChannel });
+  });
+}
 
 /**
  * Check if voice mode is active for a given session
@@ -147,54 +188,14 @@ export async function getSessionSummary(): Promise<{
   if (!activeVoiceSession) {
     return { success: false, error: 'No active voice session' };
   }
-
-  try {
-    const { sessionId, window, workspacePath } = activeVoiceSession;
-
-    // Load session data from the renderer
-    const session = await window.webContents.executeJavaScript(`
-      window.electronAPI.invoke('ai:loadSession', ${JSON.stringify(sessionId)}, ${JSON.stringify(workspacePath)}, false)
-    `);
-
-    if (!session) {
-      return { success: false, error: 'Session not found' };
-    }
-
-    const messages = session.messages || [];
-    const userMessages = messages.filter((m: any) => m.role === 'user');
-    const assistantMessages = messages.filter((m: any) => m.role === 'assistant');
-    const sessionName = session.title || session.name || 'Untitled';
-
-    // Calculate session duration
-    const createdAt = session.createdAt || Date.now();
-    const sessionDurationMinutes = Math.round((Date.now() - createdAt) / 60000);
-
-    // Extract recent topics from user messages (last 5)
-    const recentUserMessages = userMessages.slice(-5);
-    const recentTopics = recentUserMessages.map((m: any) => {
-      const content = typeof m.content === 'string' ? m.content : '';
-      // Truncate to first 50 chars
-      return content.length > 50 ? content.substring(0, 50) + '...' : content;
-    });
-
-    const details = {
-      sessionId,
-      sessionName,
-      messageCount: messages.length,
-      userMessageCount: userMessages.length,
-      assistantMessageCount: assistantMessages.length,
-      sessionDurationMinutes,
-      recentTopics,
-    };
-
-    // Generate a human-readable summary
-    const summary = `Session "${sessionName}" has ${userMessages.length} user messages and ${assistantMessages.length} assistant responses over ${sessionDurationMinutes} minutes. ${recentTopics.length > 0 ? `Recent topics: ${recentTopics.join('; ')}` : 'No messages yet.'}`;
-
-    return { success: true, summary, details };
-  } catch (error) {
-    console.error('[VoiceModeService] Failed to get session summary:', error);
-    return { success: false, error: error instanceof Error ? error.message : 'Unknown error' };
+  const { sessionId, window, workspacePath } = activeVoiceSession;
+  if (!workspacePath) {
+    return { success: false, error: 'No workspace path available' };
   }
+  // Shared with the mobile voice-tool proxy (mobileVoiceToolHandler) so the iOS
+  // agent gets identical summaries -- including for sessions surfaced by the
+  // desktop-backed semantic list_sessions that aren't in the phone's local DB.
+  return getSessionSummaryForVoice(workspacePath, sessionId, window);
 }
 
 export function initVoiceModeService() {
@@ -202,6 +203,31 @@ export function initVoiceModeService() {
   const settingsStore = new Store<Record<string, unknown>>({
     name: 'ai-settings',  // Same as AIService!
     watch: true,
+  });
+
+  /**
+   * Extension SDK: report the status of the agent task the voice agent is
+   * currently driving (the session it targets with submit_agent_prompt). Lets an
+   * extension voice tool (e.g. the memory extension's get_task_status) answer
+   * "is it still running?" verbally. Resolves the active voice-linked session,
+   * then reads its live status from ai_sessions (same source as list_sessions).
+   */
+  safeHandle('extensions:ai-get-task-status', async (_event, _options: { workspacePath?: string }) => {
+    const targetId = getActiveVoiceSessionId();
+    if (!targetId) return null;
+    try {
+      const db = getDatabase();
+      const { rows } = await db.query<{ id: string; title: string | null; status: string | null }>(
+        `SELECT id, title, status FROM ai_sessions WHERE id = $1`,
+        [targetId],
+      );
+      const row = rows[0];
+      if (!row) return null;
+      return mapAiSessionStatusToTaskStatus(row);
+    } catch (error) {
+      console.error('[VoiceModeService] get-task-status query failed:', error);
+      return null;
+    }
   });
 
   // Voice mode settings store (for voice mode specific settings including custom prompts)
@@ -263,11 +289,21 @@ export function initVoiceModeService() {
         `);
 
         if (session) {
-          const messageCount = session.messages?.length || 0;
+          // session.messages is TranscriptViewMessage[] from the canonical
+          // ai_transcript_events table -- discriminated by `type`, not `role`.
+          const allEvents = (session.messages || []) as Array<any>;
+          const userEvents = allEvents.filter(m => m.type === 'user_message');
+          const assistantEvents = allEvents.filter(m => m.type === 'assistant_message');
+          const toolEvents = allEvents.filter(m => m.type === 'tool_call');
+          const conversationEvents = allEvents.filter(
+            m => m.type === 'user_message' || m.type === 'assistant_message'
+          );
+
+          const messageCount = conversationEvents.length;
           hasExistingSession = messageCount > 0;
           // Session name is stored in the 'title' field, not 'name'
           const sessionName = session.title || session.name || 'Untitled';
-          const userMessageCount = session.messages?.filter((m: any) => m.role === 'user').length || 0;
+          const userMessageCount = userEvents.length;
           const sessionMode = session.mode || 'agent'; // 'agent' or 'planning'
 
           // Build context parts
@@ -278,42 +314,38 @@ export function initVoiceModeService() {
           if (messageCount === 0) {
             contextParts.push('Status: New session with no messages yet.');
           } else {
-            contextParts.push(`Activity: ${userMessageCount} user ${userMessageCount === 1 ? 'prompt' : 'prompts'}, ${messageCount} total messages.`);
+            contextParts.push(`Activity: ${userMessageCount} user ${userMessageCount === 1 ? 'prompt' : 'prompts'}, ${assistantEvents.length} assistant responses.`);
 
-            // Extract recent activity from messages (last few tool calls or key actions)
-            const recentMessages = (session.messages || []).slice(-10);
-            const recentToolCalls = recentMessages
-              .filter((m: any) => m.role === 'assistant' && m.toolCalls?.length > 0)
-              .flatMap((m: any) => m.toolCalls || [])
-              .slice(-5);
+            // Extract recent activity (last few tool calls)
+            const recentToolCalls = toolEvents.slice(-5).map(m => m.toolCall).filter(Boolean);
 
             if (recentToolCalls.length > 0) {
               const toolSummary = recentToolCalls.map((tc: any) => {
-                if (tc.name === 'Edit' || tc.name === 'Write') {
-                  const filePath = tc.arguments?.file_path || tc.arguments?.filePath;
-                  return filePath ? `edited ${filePath.split('/').pop()}` : 'edited a file';
-                } else if (tc.name === 'Read') {
-                  const filePath = tc.arguments?.file_path || tc.arguments?.filePath;
-                  return filePath ? `read ${filePath.split('/').pop()}` : 'read a file';
-                } else if (tc.name === 'Bash') {
+                const name = tc.toolName;
+                if (name === 'Edit' || name === 'Write') {
+                  const filePath = tc.arguments?.file_path || tc.arguments?.filePath || tc.targetFilePath;
+                  return filePath ? `edited ${String(filePath).split('/').pop()}` : 'edited a file';
+                } else if (name === 'Read') {
+                  const filePath = tc.arguments?.file_path || tc.arguments?.filePath || tc.targetFilePath;
+                  return filePath ? `read ${String(filePath).split('/').pop()}` : 'read a file';
+                } else if (name === 'Bash') {
                   return 'ran a command';
-                } else if (tc.name === 'Grep' || tc.name === 'Glob') {
+                } else if (name === 'Grep' || name === 'Glob') {
                   return 'searched files';
                 }
-                return tc.name?.toLowerCase() || 'used a tool';
+                return name?.toLowerCase?.() || 'used a tool';
               }).join(', ');
               contextParts.push(`Recent tools: ${toolSummary}`);
             }
 
             // Include the tail of the actual conversation so the voice agent
             // knows what has been discussed. Extract the last few user prompts
-            // and assistant text responses (skip tool messages).
-            const conversationTail = (session.messages || [])
-              .filter((m: any) => m.role === 'user' || m.role === 'assistant')
+            // and assistant text responses (skip tool/system events).
+            const conversationTail = conversationEvents
               .slice(-6)
-              .map((m: any) => {
-                const role = m.role === 'user' ? 'User' : 'Agent';
-                const text = typeof m.content === 'string' ? m.content : '';
+              .map(m => {
+                const role = m.type === 'user_message' ? 'User' : 'Agent';
+                const text = typeof m.text === 'string' ? m.text : '';
                 if (!text.trim()) return null;
                 // Truncate each message to keep total size manageable
                 const truncated = text.length > 500
@@ -390,26 +422,128 @@ export function initVoiceModeService() {
       // Load custom voice agent prompt, turn detection settings, and voice
       const voiceModeSettings = voiceModeSettingsStore.get('voiceMode') as {
         voice?: 'alloy' | 'ash' | 'ballad' | 'coral' | 'echo' | 'sage' | 'shimmer' | 'verse' | 'marin' | 'cedar';
+        model?: RealtimeModel;
+        reasoningEffort?: RealtimeReasoningEffort;
         voiceAgentPrompt?: { prepend?: string; append?: string };
         codingAgentPrompt?: { prepend?: string; append?: string };
         turnDetection?: {
           mode: 'server_vad' | 'push_to_talk';
+          detection?: 'semantic_vad' | 'server_vad';
           vadThreshold?: number;
           silenceDuration?: number;
           interruptible?: boolean;
         };
+        noiseReduction?: 'near_field' | 'far_field' | 'off';
       } | undefined;
       const customPrompt = voiceModeSettings?.voiceAgentPrompt || {};
-      const turnDetection = voiceModeSettings?.turnDetection || {
-        mode: 'server_vad' as const,
-        vadThreshold: 0.5,
-        silenceDuration: 500,
-        interruptible: true,
+      const turnDetection = {
+        ...(voiceModeSettings?.turnDetection || {
+          mode: 'server_vad' as const,
+          silenceDuration: 500,
+          interruptible: true,
+        }),
+        // Echo round 2 defaults: model-judged semantic_vad (echo-robust; the
+        // old amplitude server_vad tripped on residual echo at 0.5) and
+        // far_field noise reduction (loud open speakers are the echo case).
+        // Persisted settings can override both.
+        detection: voiceModeSettings?.turnDetection?.detection ?? ('semantic_vad' as const),
+        noiseReduction: voiceModeSettings?.noiseReduction ?? ('far_field' as const),
+        // A persisted 0.5 is indistinguishable from the old default and lets
+        // echo trip amplitude VAD -- treat it as unset so the raised builder
+        // default applies (matches the iOS NIM-1314 migration).
+        ...(voiceModeSettings?.turnDetection?.vadThreshold === 0.5 ? { vadThreshold: undefined } : {}),
       };
       const selectedVoice = voiceModeSettings?.voice || 'alloy';
+      // Old persisted settings predate these fields -- fall back to the defaults.
+      const selectedModel: RealtimeModel = voiceModeSettings?.model ?? 'gpt-realtime-2';
+      const reasoningEffort: RealtimeReasoningEffort = voiceModeSettings?.reasoningEffort ?? 'low';
+      // Pin the voice agent's spoken language to the desktop's configured default
+      // (undefined -> RealtimeAPIClient falls back to English).
+      const preferredLanguage = getPreferredAgentLanguage();
 
-      // Create PoC instance with agent session context, custom prompt, turn detection, and voice
-      const poc = new RealtimeAPIClient(apiKey, sessionId, workspacePath, window, sessionContext, customPrompt, turnDetection, selectedVoice);
+      // Core hook 2: let extensions contribute to the voice session context at
+      // start (e.g. top-N grounding facts). Appended before the client is built
+      // so it ships in the initial session instructions.
+      try {
+        const extensionContext = await requestExtensionVoiceContext(window, {
+          workspacePath: workspacePath ?? undefined,
+          voiceSessionId: sessionId,
+          codingSessionId: sessionId,
+        });
+        if (extensionContext && extensionContext.trim().length > 0) {
+          sessionContext += `\n\n${extensionContext.trim()}`;
+          console.log(`[VoiceModeService] Appended ${extensionContext.length} chars of extension voice context`);
+        }
+      } catch (error) {
+        console.error('[VoiceModeService] Failed to collect extension voice context:', error);
+      }
+
+      // Create PoC instance with agent session context, custom prompt, turn detection, voice, model, and reasoning effort
+      const poc = new RealtimeAPIClient(apiKey, sessionId, workspacePath, window, sessionContext, customPrompt, turnDetection, selectedVoice, selectedModel, reasoningEffort, preferredLanguage);
+
+      // Core hook 1: expose extension-contributed voice tools to the Realtime
+      // session. Must be set before connect() so the tool list ships in the
+      // session config. Dispatch reuses the existing extension-tool execution
+      // path (the same route MCP uses via handleExtensionTool).
+      try {
+        // Voice tools come from two sources: renderer-declared extension tools
+        // (dispatched to the renderer) and backend-module-registered tools
+        // (dispatched main->backend, no renderer hop — protects the voice
+        // latency budget). Merge both into the Realtime tool list.
+        const [extVoiceTools, backendVoiceTools] = await Promise.all([
+          getVoiceEnabledExtensionTools(workspacePath ?? undefined),
+          getVoiceEnabledBackendToolsForWorkspace(workspacePath ?? undefined),
+        ]);
+        const voiceTools = [...extVoiceTools, ...backendVoiceTools];
+        if (voiceTools.length > 0) {
+          const { schemas, nameMap } = buildVoiceToolSet(voiceTools, {
+            reservedNames: new Set(BUILTIN_VOICE_TOOL_NAMES),
+          });
+          poc.setExtensionVoiceTools(schemas, nameMap);
+          poc.setOnExtensionVoiceTool(async (namespacedName, args) => {
+            const targetWorkspace = activeVoiceSession?.workspacePath ?? workspacePath ?? undefined;
+            const targetSessionId = activeVoiceSession?.sessionId ?? sessionId;
+            try {
+              // Route backend tools to the module; everything else to the
+              // renderer extension path. Resolve worktree paths so the registry
+              // and module lookups hit the project the module started for.
+              let result;
+              const resolvedWs = targetWorkspace
+                ? await resolveBackendWorkspacePath(targetWorkspace)
+                : undefined;
+              if (resolvedWs && isBackendTool(namespacedName, resolvedWs)) {
+                result = await handleBackendTool(
+                  namespacedName,
+                  namespacedName,
+                  args,
+                  resolvedWs
+                );
+              } else {
+                result = await handleExtensionTool(
+                  namespacedName, // toolName -- matches the registered (dotted) name
+                  namespacedName, // originalName (for error messages)
+                  args,
+                  targetSessionId,
+                  targetWorkspace
+                );
+              }
+              const text = (result.content || [])
+                .map((c) => (typeof c?.text === 'string' ? c.text : ''))
+                .filter(Boolean)
+                .join('\n');
+              return { success: !result.isError, message: text };
+            } catch (error) {
+              console.error('[VoiceModeService] Extension voice tool dispatch failed:', namespacedName, error);
+              return { success: false, error: error instanceof Error ? error.message : String(error) };
+            }
+          });
+          console.log(
+            `[VoiceModeService] Exposed ${schemas.length} voice tool(s) (${extVoiceTools.length} extension, ${backendVoiceTools.length} backend): ${Array.from(nameMap.values()).join(', ')}`
+          );
+        }
+      } catch (error) {
+        console.error('[VoiceModeService] Failed to load voice tools:', error);
+      }
 
       // Helper: get the current linked session ID (may change if user switches sessions)
       const currentSessionId = () => activeVoiceSession?.sessionId ?? sessionId;
@@ -446,6 +580,12 @@ export function initVoiceModeService() {
         }
       });
 
+      poc.setOnToolCall((event) => {
+        if (window && !window.isDestroyed()) {
+          window.webContents.send('voice-mode:tool-call', { sessionId: currentSessionId(), event });
+        }
+      });
+
       // Load coding agent prompt settings for inclusion in submit-prompt events
       const codingAgentPromptSettings = voiceModeSettings?.codingAgentPrompt || {};
 
@@ -477,6 +617,21 @@ export function initVoiceModeService() {
         console.error('[VoiceModeService] Error from OpenAI:', error.type, error.message);
         if (window && !window.isDestroyed()) {
           window.webContents.send('voice-mode:error', { sessionId: currentSessionId(), error });
+        }
+      });
+
+      // Transient reconnect state: surface "reconnecting…" to the renderer
+      // instead of silently dying. A hard voice-mode:error is only emitted
+      // after retries are exhausted (handled by setOnError above).
+      poc.setOnReconnecting((attempt) => {
+        if (window && !window.isDestroyed()) {
+          window.webContents.send('voice-mode:reconnecting', { sessionId: currentSessionId(), attempt });
+        }
+      });
+
+      poc.setOnReconnected(() => {
+        if (window && !window.isDestroyed()) {
+          window.webContents.send('voice-mode:reconnected', { sessionId: currentSessionId() });
         }
       });
 
@@ -541,48 +696,90 @@ export function initVoiceModeService() {
         }
       });
 
-      // List sessions in this workspace
+      // List sessions in this workspace. When a topic query is given and the
+      // memory engine is running, this matches session *content* semantically
+      // (e.g. "the session working on the collaborative document system")
+      // rather than only session titles, then falls back to title/transcript
+      // full-text search so nothing regresses when the engine is unavailable.
       poc.setOnListSessions(async (query?: string) => {
+        const wp = activeVoiceSession?.workspacePath;
+        if (!wp) {
+          return { success: false, error: 'No workspace path available' };
+        }
+        // Shared with the mobile voice-tool proxy (mobileVoiceToolHandler) so
+        // the iOS agent gets the identical semantic, memory-backed lookup.
+        return searchSessionsForVoice(wp, query);
+      });
+
+      // Create a new coding session and switch to it
+      poc.setOnCreateSession(async (title?: string) => {
         try {
-          const wp = activeVoiceSession?.workspacePath;
+          const wp = activeVoiceSession?.workspacePath ?? workspacePath;
           if (!wp) {
             return { success: false, error: 'No workspace path available' };
           }
 
-          let sessions;
-          if (query && query.trim().length > 0) {
-            sessions = await AISessionsRepository.search(wp, query.trim());
-          } else {
-            sessions = await AISessionsRepository.list(wp);
+          const newSessionId = randomUUID();
+          const provider = 'claude-code';
+          const model = getDefaultAIModel() || 'claude-code:opus-1m';
+          const newTitle = title?.trim() || 'New Session';
+
+          await AISessionsRepository.create({
+            id: newSessionId,
+            provider,
+            model,
+            title: newTitle,
+            workspaceId: wp,
+          });
+
+          // Refresh the renderer's session registry so the new session appears
+          // in the sidebar, then navigate to it. The active-session change will
+          // be picked up by voiceModeListeners.syncLinkedSession, which updates
+          // the linked session ID for subsequent voice commands automatically.
+          if (window && !window.isDestroyed()) {
+            window.show();
+            window.focus();
+            window.webContents.send('sessions:refresh-list', {
+              workspacePath: wp,
+              sessionId: newSessionId,
+            });
+            window.webContents.send('tray:navigate-to-session', {
+              sessionId: newSessionId,
+              workspacePath: wp,
+            });
           }
 
-          // Fetch running status from database
-          const ids = sessions.slice(0, 20).map(s => s.id);
-          let statusMap = new Map<string, string>();
-          if (ids.length > 0) {
-            try {
-              const db = getDatabase();
-              const { rows } = await db.query<{ id: string; status: string }>(
-                `SELECT id, status FROM ai_sessions WHERE id = ANY($1)`,
-                [ids],
-              );
-              for (const row of rows) {
-                statusMap.set(row.id, row.status);
-              }
-            } catch {
-              // Non-critical
-            }
-          }
-
-          const results = sessions.slice(0, 20).map(s => ({
-            id: s.id,
-            title: s.title,
-            status: statusMap.get(s.id) || 'idle',
-          }));
-
-          return { success: true, sessions: results };
+          return { success: true, sessionId: newSessionId, title: newTitle };
         } catch (error) {
+          console.error('[VoiceModeService] Failed to create session:', error);
           return { success: false, error: error instanceof Error ? error.message : String(error) };
+        }
+      });
+
+      // Propose a commit via the "Commit with AI" path. The voice agent
+      // calls this when the user says "propose a commit". We forward to
+      // the renderer so it can run the SAME logic as the Smart Commit
+      // button in GitOperationsPanel (git:get-commit-context +
+      // ai:sendMessage with the COMMIT_REQUEST_PREFIX message). That makes
+      // the "Requesting commit proposal" widget appear in the transcript
+      // and the coding agent invoke developer_git_commit_proposal, which
+      // returns through the existing interactive-prompt forwarding.
+      poc.setOnProposeCommit(async () => {
+        try {
+          if (!window || window.isDestroyed()) {
+            return { success: false, error: 'Window not available' };
+          }
+          window.webContents.send('voice-mode:propose-commit', {
+            sessionId: currentSessionId(),
+            workspacePath,
+          });
+          return { success: true };
+        } catch (error) {
+          console.error('[VoiceModeService] Failed to propose commit:', error);
+          return {
+            success: false,
+            error: error instanceof Error ? error.message : String(error),
+          };
         }
       });
 
@@ -733,20 +930,31 @@ export function initVoiceModeService() {
             return;
           }
 
-          // Build a completion notification from the coding agent's response.
-          // Include enough of the summary for the voice agent to relay what
-          // happened, but truncate to stay within gpt-realtime's limits.
-          let completionMessage: string;
+          // Truncate the summary to stay within the realtime context limits.
+          const trimmed = (data.summary ?? '').trim();
+          const truncatedSummary = trimmed.length > 1500
+            ? trimmed.substring(0, 1500) + '... (truncated)'
+            : trimmed;
 
-          if (data.summary && data.summary.trim().length > 0) {
-            const trimmed = data.summary.trim();
-            const truncated = trimmed.length > 1500
-              ? trimmed.substring(0, 1500) + '... (truncated)'
-              : trimmed;
-            completionMessage = `[INTERNAL: Task complete. Result: ${truncated}]`;
-          } else {
-            completionMessage = '[INTERNAL: Task complete. The coding agent finished but did not produce a text summary.]';
+          // Async (deferred) path (gpt-realtime-2): if a submit_agent_prompt call
+          // is still open, resolve it with the real summary -- the agent receives
+          // the result as the tool's return value and relays it. No injected wake.
+          if (poc.hasDeferredCall()) {
+            const resolved = poc.resolveDeferredCall({
+              success: true,
+              summary: truncatedSummary || 'The coding agent finished but did not produce a text summary.',
+            });
+            if (resolved) {
+              console.log('[VoiceModeService] Resolved deferred submit_agent_prompt with summary');
+              return;
+            }
           }
+
+          // Fallback path (gpt-realtime, or no open deferred call): inject an
+          // [INTERNAL: Task complete] wake message for the voice agent to relay.
+          const completionMessage = truncatedSummary.length > 0
+            ? `[INTERNAL: Task complete. Result: ${truncatedSummary}]`
+            : '[INTERNAL: Task complete. The coding agent finished but did not produce a text summary.]';
 
           console.log('[VoiceModeService] Sending completion to voice agent:', completionMessage.substring(0, 300));
           poc.sendUserMessage(completionMessage);
@@ -977,119 +1185,12 @@ export function initVoiceModeService() {
     }
   });
 
-  /**
-   * Generate a voice-friendly project summary using Claude
-   * Stores the result in nimbalyst-local/voice-project-summary.md
-   */
-  safeHandle('voice-mode:generate-project-summary', async (event, workspacePath: string) => {
-    try {
-      if (!workspacePath) {
-        return { success: false, message: 'Workspace path is required' };
-      }
-
-      const fs = await import('fs/promises');
-      const path = await import('path');
-
-      // Get Anthropic API key
-      const apiKeys = settingsStore.get('apiKeys') as Record<string, string> | undefined;
-      const apiKey = apiKeys?.anthropic;
-
-      if (!apiKey) {
-        return { success: false, message: 'Anthropic API key not configured' };
-      }
-
-      // Read relevant project files for context
-      const contextFiles: { name: string; content: string }[] = [];
-
-      // Try to read CLAUDE.md
-      try {
-        const claudeMd = await fs.readFile(path.join(workspacePath, 'CLAUDE.md'), 'utf-8');
-        contextFiles.push({ name: 'CLAUDE.md', content: claudeMd.slice(0, 15000) }); // Limit size
-      } catch { /* ignore */ }
-
-      // Try to read README.md
-      try {
-        const readme = await fs.readFile(path.join(workspacePath, 'README.md'), 'utf-8');
-        contextFiles.push({ name: 'README.md', content: readme.slice(0, 8000) });
-      } catch { /* ignore */ }
-
-      // Try to read package.json
-      try {
-        const pkgJson = await fs.readFile(path.join(workspacePath, 'package.json'), 'utf-8');
-        contextFiles.push({ name: 'package.json', content: pkgJson });
-      } catch { /* ignore */ }
-
-      if (contextFiles.length === 0) {
-        return { success: false, message: 'No project files found (CLAUDE.md, README.md, or package.json)' };
-      }
-
-      // Build the prompt
-      const prompt = `You are generating a concise project summary for a voice assistant that helps developers with this codebase. The voice assistant needs a quick overview it can reference during conversations.
-
-Based on the following project files, generate a voice-friendly summary (400-600 words) that covers:
-1. What the project is and what it does (1-2 sentences)
-2. Key technologies and frameworks used
-3. Main directory/package structure (if it's a monorepo)
-4. Important conventions or patterns to be aware of
-5. Current focus areas or notable features
-
-Keep it conversational and scannable - this will be read by an AI, not displayed to humans. Avoid code blocks, bullet points with symbols, and overly technical jargon. Use natural sentences.
-
-${contextFiles.map(f => `--- ${f.name} ---\n${f.content}`).join('\n\n')}
-
-Generate the summary now:`;
-
-      // Call Anthropic API directly
-      const response = await fetch('https://api.anthropic.com/v1/messages', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'x-api-key': apiKey,
-          'anthropic-version': '2023-06-01',
-        },
-        body: JSON.stringify({
-          model: 'claude-sonnet-4-20250514',
-          max_tokens: 1024,
-          messages: [{ role: 'user', content: prompt }],
-        }),
-      });
-
-      if (!response.ok) {
-        const errorText = await response.text();
-        return { success: false, message: `API error: ${response.status} - ${errorText}` };
-      }
-
-      const result = await response.json() as { content: Array<{ type: string; text?: string }> };
-      const summary = result.content.find(c => c.type === 'text')?.text;
-
-      if (!summary) {
-        return { success: false, message: 'No summary generated' };
-      }
-
-      // Ensure nimbalyst-local directory exists
-      const nimbalystLocalDir = path.join(workspacePath, 'nimbalyst-local');
-      await fs.mkdir(nimbalystLocalDir, { recursive: true });
-
-      // Write the summary
-      const summaryPath = path.join(nimbalystLocalDir, 'voice-project-summary.md');
-      await fs.writeFile(summaryPath, summary.trim(), 'utf-8');
-
-      console.log('[VoiceModeService] Generated project summary:', summaryPath);
-
-      return {
-        success: true,
-        message: 'Project summary generated',
-        path: summaryPath,
-        summary: summary.trim(),
-      };
-    } catch (error) {
-      console.error('[VoiceModeService] Failed to generate project summary:', error);
-      return {
-        success: false,
-        message: `Failed to generate summary: ${error instanceof Error ? error.message : String(error)}`,
-      };
-    }
-  });
+  // Voice-friendly project summary generation lives in the renderer now: the
+  // Voice Mode settings panel launches an agent session that writes
+  // nimbalyst-local/voice-project-summary.md using its Write tool. See
+  // packages/electron/src/renderer/components/Settings/VoiceModePanel.tsx and
+  // voiceModeSummaryPrompt.ts. Voice mode loads the resulting file in
+  // loadSessionContext above.
 
   /**
    * Find the most recent voice session for a workspace, if it was updated
@@ -1102,14 +1203,15 @@ Generate the summary now:`;
   }) => {
     try {
       const { database } = await import('../../database/PGLiteDatabaseWorker');
+      const cutoff = new Date(Date.now() - data.timeoutMs);
       const result = await database.query(
         `SELECT id, updated_at FROM ai_sessions
          WHERE workspace_id = $1
            AND session_type = 'voice'
-           AND updated_at > NOW() - INTERVAL '1 millisecond' * $2
+           AND updated_at > $2
          ORDER BY updated_at DESC
          LIMIT 1`,
-        [data.workspacePath, data.timeoutMs]
+        [data.workspacePath, cutoff]
       );
       if (result.rows.length > 0) {
         return { found: true, sessionId: result.rows[0].id };
@@ -1275,6 +1377,18 @@ Generate the summary now:`;
   ipcMain.on('voice-mode:listen-state-changed', (_event, data: { sleeping: boolean }) => {
     if (!activeVoiceSession) return;
     activeVoiceSession.poc.setListeningPaused(data.sleeping);
+  });
+
+  /**
+   * Audible playback state from the renderer (the renderer owns the playback
+   * buffer, so only it knows when the assistant is actually audible -- audio
+   * keeps playing after response.done because it streams faster than
+   * realtime). Drives echo-vs-genuine barge-in classification and server VAD
+   * response gating (echo cancellation round 2).
+   */
+  ipcMain.on('voice-mode:playback-active', (_event, data: { active: boolean }) => {
+    if (!activeVoiceSession) return;
+    activeVoiceSession.poc.setPlaybackActive(data.active);
   });
 
   /**

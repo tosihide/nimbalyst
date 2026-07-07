@@ -87,14 +87,28 @@ const isOfficialBuild = process.env.OFFICIAL_BUILD === 'true';
 // IS_DEV_MODE is true only when running `npm run dev`, not for any packaged builds
 const isDevMode = isDev;
 
-// Read Claude Agent SDK version at build time for display in settings
+// Read Claude Agent SDK version at build time for display in settings.
+//
+// The bundled SDK may live in packages/electron/node_modules/ (when not
+// hoisted) OR in the workspace-root node_modules/ (when npm workspace dedup
+// hoists it). Hardcoding the local path to the package was silently falling
+// through to 'unknown' on builds where the install hoisted, so the Settings
+// panel always read 'Version: unknown' on those builds. Try the local path
+// first, then the workspace-root fallback. Closes #60.
 const claudeAgentSdkVersion = (() => {
-  try {
-    const pkgPath = resolve(__dirname, 'node_modules/@anthropic-ai/claude-agent-sdk/package.json');
-    return JSON.parse(fs.readFileSync(pkgPath, 'utf-8')).version;
-  } catch {
-    return 'unknown';
+  const candidates = [
+    resolve(__dirname, 'node_modules/@anthropic-ai/claude-agent-sdk/package.json'),
+    resolve(__dirname, '../../node_modules/@anthropic-ai/claude-agent-sdk/package.json'),
+  ];
+  for (const pkgPath of candidates) {
+    try {
+      const version = JSON.parse(fs.readFileSync(pkgPath, 'utf-8')).version;
+      if (version) return version;
+    } catch {
+      // try next candidate
+    }
   }
+  return 'unknown';
 })();
 const runtimeSrcDir = resolve(__dirname, '../runtime/src');
 const runtimeDistDir = resolve(__dirname, '../runtime/dist');
@@ -127,7 +141,28 @@ export default defineConfig({
       // The main process reads it from the actual runtime environment via process.env.
       // This allows crystal-run.sh to set it at runtime without affecting normal dev mode.
     },
-    plugins: [resolveWorkspaceSubpaths()],
+    plugins: [
+      resolveWorkspaceSubpaths(),
+      {
+        name: 'copy-sqlite-schemas',
+        // Use options.dir so this works regardless of the active outDir
+        // (e.g. `out/main` for `npm run dev` and `out2/main` for
+        // `npm run dev:user2`). Hard-coding `out/main` here broke user2.
+        writeBundle(options: { dir?: string }) {
+          const srcDir = resolve(__dirname, 'src/main/database/sqlite/schemas');
+          const outMainDir = options.dir
+            ? resolve(options.dir)
+            : resolve(__dirname, 'out/main');
+          const destDir = resolve(outMainDir, 'sqlite/schemas');
+          if (!fs.existsSync(srcDir)) return;
+          fs.mkdirSync(destDir, { recursive: true });
+          for (const f of fs.readdirSync(srcDir)) {
+            if (!f.endsWith('.sql')) continue;
+            fs.copyFileSync(resolve(srcDir, f), resolve(destDir, f));
+          }
+        },
+      },
+    ],
     resolve: {
       alias: {
         // Always use src for bundling - simpler than dealing with ESM/CJS issues
@@ -140,7 +175,14 @@ export default defineConfig({
       rollupOptions: {
         input: {
           // Use bootstrap.ts as entry point to handle user-data-dir before any imports
-          index: resolve(__dirname, 'src/main/bootstrap.ts')
+          index: resolve(__dirname, 'src/main/bootstrap.ts'),
+          // Backend bootstrap for privileged extension modules. Loaded by
+          // utilityProcess.fork() and worker_threads.Worker() at runtime;
+          // it MUST be a standalone entry, not pulled into the main chunk.
+          extensionBackendBootstrap: resolve(
+            __dirname,
+            'src/main/extensions/extensionBackendBootstrap.ts'
+          )
         },
         external: [
           '@anthropic-ai/claude-agent-sdk', // Exclude from bundle - loaded dynamically at runtime
@@ -201,6 +243,51 @@ export default defineConfig({
         include: [],
         protocolImports: false,
       }),
+      // The Anthropic SDK's agent-toolset (server-side file tools, added in
+      // @anthropic-ai/sdk 0.100.x) is dragged into the renderer bundle via the
+      // runtime barrel (ai/models.ts value-imports the SDK for the model
+      // picker). Those modules do NAMED imports of Node built-ins (node:crypto
+      // `randomUUID`, node:child_process `execFile`, etc.), which Vite
+      // externalizes to __vite-browser-external — a module with no named
+      // exports — turning each named import into a hard build error. The
+      // agent-toolset never runs in the renderer, so resolve just its
+      // Node-builtin imports to browser-safe shims (scoped to agent-toolset
+      // importers) so the bundle builds.
+      (() => {
+        const SHIMS: Record<string, string> = {
+          'node:crypto':
+            "export const randomUUID = () => (globalThis.crypto?.randomUUID?.() ?? '00000000-0000-0000-0000-000000000000');\nexport default {};",
+          'node:child_process':
+            "export const execFile = () => { throw new Error('node:child_process is unavailable in the renderer'); };\nexport default {};",
+          'node:util':
+            'export const promisify = (fn) => fn;\nexport default {};',
+          'node:stream':
+            'export class Readable {}\nexport default {};',
+          'node:stream/promises':
+            "export const pipeline = async () => { throw new Error('node:stream/promises is unavailable in the renderer'); };\nexport default {};",
+        };
+        const PREFIX = '\0anthropic-agent-toolset-shim:';
+        return {
+          name: 'anthropic-agent-toolset-node-shims',
+          enforce: 'pre' as const,
+          resolveId(source: string, importer?: string) {
+            if (
+              SHIMS[source] &&
+              importer &&
+              importer.includes('@anthropic-ai/sdk/tools/agent-toolset')
+            ) {
+              return PREFIX + source;
+            }
+            return null;
+          },
+          load(id: string) {
+            if (id.startsWith(PREFIX)) {
+              return SHIMS[id.slice(PREFIX.length)];
+            }
+            return null;
+          },
+        };
+      })(),
       viteNimbalystPlugin(),
       react(),
       optimizeExcalidrawPlugin(),
@@ -241,6 +328,17 @@ export default defineConfig({
         if (fs.existsSync(ghosttyWasm)) {
           targets.push({ src: toPosix(ghosttyWasm), dest: '', overwrite: true });
         }
+        // Copy prismjs core so index.html can load it as a classic <script>
+        // BEFORE any ESM module evaluates. Vite/esbuild's prebundling of
+        // @lexical/code (which transitively imports @lexical/code-prism) ends
+        // up reordering chunk imports so the prism-* language chunks evaluate
+        // before prismjs main, which the language files need to have set
+        // `window.Prism`. Loading prismjs as a classic script in the HTML
+        // sidesteps the reorder.
+        const prismCore = resolve(__dirname, '../../node_modules/prismjs/prism.js');
+        if (fs.existsSync(prismCore)) {
+          targets.push({ src: toPosix(prismCore), dest: '', overwrite: true });
+        }
         return viteStaticCopy({ targets });
       })()
     ].filter(Boolean),
@@ -275,10 +373,23 @@ export default defineConfig({
       }
     },
     resolve: {
-      alias: {
+      alias: [
         // Ensure renderer also points runtime imports at source
-        '@nimbalyst/runtime': runtimeSrcDir
-      },
+        { find: '@nimbalyst/runtime', replacement: runtimeSrcDir },
+        // Redirect `import ... from 'prismjs'` (exact match only) to a shim
+        // that returns the window.Prism instance loaded by the classic
+        // <script> tag in index.html. Avoids a second IIFE run on the ESM
+        // side that would create a separate Prism instance and orphan all
+        // the language registrations made by the prism-* chunks (which
+        // reference the bare `Prism` global pointing at the classic-script
+        // instance). The regex anchors to exact match so
+        // `prismjs/components/...` and `prismjs/themes/...` still resolve
+        // normally to the language/theme files in node_modules.
+        {
+          find: /^prismjs$/,
+          replacement: resolve(__dirname, 'src/renderer/utils/prismGlobalShim.ts')
+        }
+      ],
       dedupe: [
         'react',
         'react-dom',
@@ -382,7 +493,12 @@ export default defineConfig({
         'react-markdown',
         'remark-gfm',
         'react-syntax-highlighter',
-        // Prism language components for syntax highlighting
+        // Prism language components for syntax highlighting. Prism core
+        // itself is NOT prebundled here — it's loaded by the classic
+        // <script src="./prism.js"> tag in index.html (see resolve.alias
+        // for `prismjs` and viteStaticCopy entry for prism.js). The chunks
+        // below reference the bare `Prism` global, which the classic
+        // script guarantees is set before any module evaluates.
         'prismjs/components/prism-javascript',
         'prismjs/components/prism-typescript',
         'prismjs/components/prism-jsx',

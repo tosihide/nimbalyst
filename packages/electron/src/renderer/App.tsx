@@ -18,6 +18,7 @@ import { useIPCHandlers } from './hooks/useIPCHandlers';
 import { useWindowLifecycle } from './hooks/useWindowLifecycle';
 import { useTheme } from './hooks/useTheme';
 import { useConfirmDialog } from './hooks/useConfirmDialog';
+import { useDialogRequestTrigger } from './hooks/useDialogRequestTrigger';
 import { useKeyboardShortcuts } from './hooks/useKeyboardShortcuts';
 import { useExtensionKeybindings } from './extensions/commands/useExtensionKeybindings';
 import { useOnboarding } from './hooks/useOnboarding';
@@ -38,6 +39,7 @@ import { GlobalHistoryDialog } from './components/HistoryDialog';
 // NOTE: WindowsClaudeCodeWarning now managed by DialogProvider
 // NOTE: ErrorDialog now managed by DialogProvider
 import { ErrorToastContainer } from './components/ErrorToast/ErrorToast';
+import { ExtensionPermissionPrompt } from './components/ExtensionPermissions/ExtensionPermissionPrompt';
 import { errorNotificationService } from './services/ErrorNotificationService';
 // NOTE: ProjectSelectionDialog now managed by DialogProvider
 // NOTE: UnifiedOnboarding now managed by DialogProvider
@@ -57,6 +59,7 @@ import {
 import {
   addSessionFullAtom,
   setSelectedWorkstreamAtom,
+  initSessionList,
 } from './store/atoms/sessions';
 import { NavigationGutter } from './components/NavigationGutter';
 // NOTE: useTabs and useTabNavigation removed - EditorMode manages tabs now
@@ -90,32 +93,52 @@ import {
   sessionRegistryAtom,
   historyDialogFileAtom,
 } from './store';
+import { initOpenProjects } from './store/atoms/openProjects';
+import { initWorkspaceStatePruner } from './store/workspaceStatePruner';
+import { initActionPromptListeners } from './store/listeners/actionPromptListeners';
 import { initAiCommandListeners } from './store/listeners/aiCommandListeners';
 import { initAppCommandListeners } from './store/listeners/appCommandListeners';
 import { initClaudeUsageListeners } from './store/listeners/claudeUsageListeners';
+import { initClaudeCliTerminalListeners } from './store/listeners/claudeCliTerminalListeners';
+import { initWindowFocusListeners } from './store/listeners/windowFocusListeners';
 import { initCodexUsageListeners } from './store/listeners/codexUsageListeners';
+import { initGeminiUsageListeners } from './store/listeners/geminiUsageListeners';
 import { initFileChangeListeners } from './store/listeners/fileChangeListeners';
 import { initMcpListeners } from './store/listeners/mcpListeners';
 import { initMenuCommandListeners } from './store/listeners/menuCommandListeners';
 import { initNetworkAvailabilityListeners } from './store/listeners/networkAvailabilityListeners';
 import { initNotificationListeners } from './store/listeners/notificationListeners';
+import { initExtensionPermissionListeners } from './store/listeners/extensionPermissionListeners';
 import { initPermissionListeners } from './store/listeners/permissionListeners';
 import { initSoundListeners } from './store/listeners/soundListeners';
+import { initStytchAuthListeners } from './store/listeners/stytchAuthListeners';
 import { initSyncListeners } from './store/listeners/syncListeners';
 import { initThemeListener } from './store/listeners/themeListeners';
 import { initThemeFallbackListener } from './store/listeners/themeFallbackListeners';
 import { initTrackerSyncListeners } from './store/listeners/trackerSyncListeners';
+import { initPullRequestListeners } from './store/listeners/pullRequestListeners';
+import { initWorktreeListeners } from './store/listeners/worktreeListeners';
+import { initBlitzListeners } from './store/listeners/blitzListeners';
 import { initUpdateListeners } from './store/listeners/updateListeners';
 import { initWalkthroughListeners } from './store/listeners/walkthroughListeners';
 import { initWakeupListeners } from './store/listeners/wakeupListener';
 import { TrackerMode } from './components/TrackerMode';
-import { CollabMode } from './components/CollabMode';
+import { PullRequestMode } from './components/PullRequestMode';
+import { CollabMode, type CollabModeRef } from './components/CollabMode';
 import { TerminalBottomPanel } from './components/TerminalBottomPanel';
+import { ProjectRail } from './components/ProjectRail';
+import {
+  activeWorkspacePathAtom,
+  multiProjectModeAtom,
+  addOpenProjectAtom as addOpenProjectAction,
+} from './store/atoms/openProjects';
 import { registerDocumentLinkPlugin } from './plugins/registerDocumentLinkPlugin';
+import { registerTrackerLinkPlugin } from './plugins/registerTrackerLinkPlugin';
 import { registerAIChatPlugin } from './plugins/registerAIChatPlugin';
 import { registerTrackerPlugin } from './plugins/registerTrackerPlugin';
 import { registerSearchReplacePlugin } from './plugins/registerSearchReplacePlugin';
 import { registerMockupPlugin } from './plugins/registerMockupPlugin';
+import { registerEmbedFrame } from './components/EmbedFrame';
 import { registerExtensionSystem, setExtensionWorkspacePath } from './plugins/registerExtensionSystem';
 import { SettingsView } from './components/Settings/SettingsView';
 import type { SettingsCategory } from './components/Settings/SettingsSidebar';
@@ -127,6 +150,7 @@ import { UpdateToast } from './components/UpdateToast';
 import { ProjectTrustToast } from './components/ProjectTrustToast';
 import { getTextSelection } from './components/UnifiedAI/TextSelectionIndicator';
 // NOTE: FeedbackIntakeDialog now managed by DialogProvider
+import { buildFeedbackInitialDraft, type FeedbackIntakeLaunchOptions } from './components/Feedback';
 import OnboardingService from './services/OnboardingService';
 import { WalkthroughProvider } from './walkthroughs';
 import { TipProvider } from './tips';
@@ -137,12 +161,15 @@ import {
   electronStorageBackend,
   initializeElectronStorageBackend,
 } from './extensions/panels';
-import { setStorageBackend } from '@nimbalyst/runtime';
+import { setStorageBackend, getExtensionEditorAPI } from '@nimbalyst/runtime';
 import { store, editorDirtyAtom, makeEditorKey } from '@nimbalyst/runtime/store';
 import { extensionPanelAIContextAtom } from './store/atoms/extensionPanels';
-import { setDiffTreeGroupByDirectoryAtom, setAgentFileScopeModeAtom, setHiddenGutterButtonsAtom, hydrateFileGutterCollapsedAtom } from './store/atoms/projectState';
-import { toggleSessionHistoryCollapsedAtom, scrollToMessageAtom } from './store/atoms/agentMode';
-import { setDeveloperFeatureSettingsAtom } from './store/atoms/appSettings';
+import { setDiffTreeGroupByDirectoryAtom, setAgentFileScopeModeAtom, hydrateFileGutterCollapsedAtom } from './store/atoms/projectState';
+import { toggleSessionHistoryCollapsedAtom, scrollToMessageAtom, initAgentModeLayout } from './store/atoms/agentMode';
+import {
+  developerModeAtom,
+  setDeveloperFeatureSettingsAtom,
+} from './store/atoms/appSettings';
 import {
   agentInsertPlanReferenceRequestAtom,
   closeActiveTabRequestAtom,
@@ -168,6 +195,7 @@ import {
   initTrackerPanelLayout,
   trackerModeLayoutAtom,
 } from './store/atoms/trackers';
+import { prNavigateRequestAtom } from './store/atoms/pullRequests';
 import {
   terminalPanelVisibleAtom,
   terminalPanelHeightAtom,
@@ -206,10 +234,12 @@ const LOG_CONFIG = {
 let pluginsRegistered = false;
 if (!pluginsRegistered) {
   registerDocumentLinkPlugin();
+  registerTrackerLinkPlugin();
   registerTrackerPlugin(null); // Load built-in trackers now, custom trackers loaded in AppLayout
   registerAIChatPlugin();
   registerSearchReplacePlugin(); // Search/replace bar in fixed tab header
   registerMockupPlugin(); // Mockup embedding support
+  registerEmbedFrame(); // Inline embeds of extension editors in markdown docs
   pluginsRegistered = true;
 }
 
@@ -236,7 +266,8 @@ export default function App() {
 
         // Initialize the extension system (discovers and loads extensions)
         // This MUST complete before any editors are mounted so that extension nodes
-        // (like DataModelNode) are registered with the pluginRegistry
+        // (like DataModelNode) are published into the runtime extension stores
+        // and included in the editor's Lexical extension graph.
         await registerExtensionSystem();
         logger.ui.info('[Extensions] Extension system initialized');
 
@@ -261,42 +292,72 @@ export default function App() {
 
   // Initialize centralized IPC listeners once at app startup
   useEffect(() => {
+    // Multi-project rail state — fire-and-forget so legacy single-project
+    // startup is not blocked by IPC. The rail consumers re-render when the
+    // atoms hydrate.
+    initOpenProjects();
+    initWorkspaceStatePruner();
+
+    // Extension-contributed agent provider ids are registered with
+    // ModelIdentifier by initializeExtensionAgentProviderSync() (wired in
+    // registerExtensionSystem), which re-syncs on every extension load /
+    // re-scan / unload rather than only at startup.
+
+    const cleanupActionPrompts = initActionPromptListeners();
     const cleanupAiCommands = initAiCommandListeners();
     const cleanupAppCommands = initAppCommandListeners();
     const cleanupClaude = initClaudeUsageListeners();
+    const cleanupClaudeCliTerminal = initClaudeCliTerminalListeners();
+    const cleanupWindowFocus = initWindowFocusListeners();
     const cleanupCodex = initCodexUsageListeners();
+    const cleanupGemini = initGeminiUsageListeners();
     const cleanupFileChange = initFileChangeListeners();
     const cleanupMcp = initMcpListeners();
     const cleanupMenuCommand = initMenuCommandListeners();
     const cleanupNotification = initNotificationListeners();
+    const cleanupExtensionPermission = initExtensionPermissionListeners();
     const cleanupPermission = initPermissionListeners();
     const cleanupSound = initSoundListeners();
+    const cleanupStytchAuth = initStytchAuthListeners();
     const cleanupSync = initSyncListeners();
     const cleanupTheme = initThemeListener();
     const cleanupThemeFallback = initThemeFallbackListener();
     const cleanupTrackerSync = initTrackerSyncListeners();
+    const cleanupWorktree = initWorktreeListeners();
+    const cleanupPullRequest = initPullRequestListeners();
+    const cleanupBlitz = initBlitzListeners();
     const cleanupUpdate = initUpdateListeners();
     const cleanupWalkthrough = initWalkthroughListeners();
     const cleanupWakeup = initWakeupListeners();
-    initNetworkAvailabilityListeners();
+    const cleanupNetworkAvailability = initNetworkAvailabilityListeners();
     return () => {
+      cleanupActionPrompts?.();
       cleanupAiCommands?.();
       cleanupAppCommands?.();
       cleanupClaude?.();
+      cleanupClaudeCliTerminal?.();
+      cleanupWindowFocus?.();
       cleanupCodex?.();
+      cleanupGemini?.();
       cleanupFileChange?.();
       cleanupMcp?.();
       cleanupMenuCommand?.();
       cleanupNotification?.();
+      cleanupExtensionPermission?.();
       cleanupPermission?.();
       cleanupSound?.();
+      cleanupStytchAuth?.();
       cleanupSync?.();
       cleanupTheme?.();
       cleanupThemeFallback?.();
       cleanupTrackerSync?.();
+      cleanupWorktree?.();
+      cleanupPullRequest?.();
+      cleanupBlitz?.();
       cleanupUpdate?.();
       cleanupWalkthrough?.();
       cleanupWakeup?.();
+      cleanupNetworkAvailability?.();
     };
   }, []);
 
@@ -396,6 +457,14 @@ export default function App() {
   const [workspaceMode, setWorkspaceMode] = useState(false);
   const [workspacePath, setWorkspacePath] = useState<string | null>(null);
   const [workspaceName, setWorkspaceName] = useState<string | null>(null);
+  // Multi-project rail integration: when the user clicks a different
+  // project in the rail, the active-path atom changes. Mirror it into the
+  // existing `workspacePath` useState so the rest of the App.tsx tree
+  // (which is wired to that state) re-renders for the new project.
+  const isMultiProjectMode = useAtomValue(multiProjectModeAtom);
+  const railActivePath = useAtomValue(activeWorkspacePathAtom);
+  const addOpenProject = useSetAtom(addOpenProjectAction);
+  const setRailActivePath = useSetAtom(activeWorkspacePathAtom);
   // NOTE: fileTree, sidebarWidth, isNewFileDialogOpen, newFileDirectory, isHistoryDialogOpen moved to EditorMode
   // NOTE: Navigation dialogs (QuickOpen, SessionQuickOpen, PromptQuickOpen, ProjectQuickOpen) are now managed by DialogProvider
   // NOTE: isAIChatCollapsed, aiChatWidth moved to EditorMode for workspace mode
@@ -444,7 +513,6 @@ export default function App() {
   // Workspace state hydration setters
   const setDiffTreeGroupByDirectory = useSetAtom(setDiffTreeGroupByDirectoryAtom);
   const setAgentFileScopeMode = useSetAtom(setAgentFileScopeModeAtom);
-  const setHiddenGutterButtons = useSetAtom(setHiddenGutterButtonsAtom);
   const hydrateFileGutterCollapsed = useSetAtom(hydrateFileGutterCollapsedAtom);
 
   // Check if a fullscreen extension panel is active (hides other content modes)
@@ -453,6 +521,7 @@ export default function App() {
 
   // Window mode - which view is active (files, agent, settings)
   const activeMode = useAtomValue(windowModeAtom);
+  const developerMode = useAtomValue(developerModeAtom);
   const setActiveMode = useSetAtom(setWindowModeAtom);
   const toggleAgentCollapsed = useSetAtom(toggleSessionHistoryCollapsedAtom);
   const updateDeveloperSettings = useSetAtom(setDeveloperFeatureSettingsAtom);
@@ -461,6 +530,12 @@ export default function App() {
   useEffect(() => {
     activeModeStateRef.current = activeMode;
   }, [activeMode]);
+
+  useEffect(() => {
+    if (activeMode === 'pr-review' && !developerMode) {
+      setActiveMode('files');
+    }
+  }, [activeMode, developerMode, setActiveMode]);
 
   const openMarketplaceInstallRequest = useCallback((request: { extensionId: string; requestedAt?: string }) => {
     if (!request.extensionId) return;
@@ -527,6 +602,11 @@ export default function App() {
         },
         // Expose DocumentModelRegistry for multi-editor coordination tests
         documentModelRegistry: DocumentModelRegistry,
+        // Look up an extension editor's imperative API by file path. Replaces
+        // the legacy per-extension window globals (e.g.
+        // window.__excalidraw_getEditorAPI) that E2E tests used to poke
+        // editors directly.
+        getExtensionEditorAPI: (filePath: string) => getExtensionEditorAPI(filePath),
         // Open a file in a real AgentMode workstream editor tab (for multi-editor
         // tests). Creates a real session via IPC, selects it as the active
         // workstream, adds the file to openFilePaths, and switches layoutMode
@@ -615,10 +695,10 @@ export default function App() {
         if (state?.agentFileScopeMode !== undefined) {
           setAgentFileScopeMode({ fileScopeMode: state.agentFileScopeMode, workspacePath });
         }
-        // Hydrate hidden gutter buttons into Jotai atom
-        if (state?.hiddenGutterButtons?.length) {
-          setHiddenGutterButtons(state.hiddenGutterButtons);
-        }
+        // Gutter icon visibility is now a GLOBAL preference (see
+        // appSettings gutterCustomizationAtom, hydrated at startup); the
+        // legacy per-project hiddenGutterButtons is only read by the one-shot
+        // migration in main. Do not hydrate it here.
         // Hydrate FileGutter collapsed state per type into Jotai atom
         if (state?.fileGutterCollapsed) {
           hydrateFileGutterCollapsed(state.fileGutterCollapsed);
@@ -627,7 +707,7 @@ export default function App() {
       .catch(error => {
         console.error('[App] Failed to load workspace state:', error);
       });
-  }, [workspacePath, setDiffTreeGroupByDirectory, setAgentFileScopeMode, setHiddenGutterButtons, hydrateFileGutterCollapsed]);
+  }, [workspacePath, setDiffTreeGroupByDirectory, setAgentFileScopeMode, hydrateFileGutterCollapsed]);
 
   // Save active mode when it changes
   useEffect(() => {
@@ -785,6 +865,7 @@ export default function App() {
   const chatSidebarRef = useRef<ChatSidebarRef>(null);
   const agentModeRef = useRef<AgentModeRef>(null);
   const editorModeRef = useRef<EditorModeRef>(null);
+  const collabModeRef = useRef<CollabModeRef | null>(null);
 
   // NOTE: autoSaveIntervalRef and autoSaveCancellationRef removed - EditorContainer handles autosave now
   const activeSavesRef = useRef<Set<string>>(new Set());
@@ -924,13 +1005,11 @@ export default function App() {
   const handleOpenFeedback = useCallback(() => {
     if (!dialogRef.current) return;
     dialogRef.current.open(DIALOG_IDS.FEEDBACK_INTAKE, {
-      onLaunch: ({ kind, mayGatherLogs }: { kind: 'bug' | 'feature'; mayGatherLogs: boolean }) => {
-        const command =
-          kind === 'bug'
-            ? '/nimbalyst-feedback:bug-report'
-            : '/nimbalyst-feedback:feature-request';
-        const consent = mayGatherLogs ? 'allowed' : 'not allowed';
-        const draft = `${command}\n\nLog gathering: ${consent}\n`;
+      onLaunch: ({ kind, mayGatherLogs, shouldCreateMockup }: FeedbackIntakeLaunchOptions) => {
+        const draft = `${buildFeedbackInitialDraft(kind, {
+          mayGatherLogs,
+          shouldCreateMockup,
+        })}\n`;
 
         if (activeModeStateRef.current !== 'agent') {
           setActiveMode('agent');
@@ -1047,7 +1126,10 @@ export default function App() {
     });
   }, []);
 
-  // React to openSettingsCommandAtom (used by tips to navigate to settings)
+  // React to openSettingsCommandAtom (used by tips to navigate to settings).
+  // anchor: optional data-testid the consumer wants scrolled into view once the
+  // selected panel renders. We poll briefly because the panel mounts on a
+  // separate React commit and may not be in the DOM on the first frame.
   const openSettingsCommand = useAtomValue(openSettingsCommandAtom);
   const openSettingsCommandProcessedRef = useRef<number | null>(null);
   useEffect(() => {
@@ -1058,7 +1140,38 @@ export default function App() {
     if (openSettingsCommand.scope) setSettingsInitialScope(openSettingsCommand.scope);
     incrementSettingsKey();
     setTimeout(() => setActiveMode('settings'), 0);
+
+    const anchor = openSettingsCommand.anchor;
+    if (anchor) {
+      let attempts = 0;
+      const tryScroll = () => {
+        const el = document.querySelector(`[data-testid="${anchor}"]`);
+        if (el instanceof HTMLElement) {
+          el.scrollIntoView({ behavior: 'smooth', block: 'start' });
+          return;
+        }
+        if (attempts++ < 20) setTimeout(tryScroll, 50);
+      };
+      setTimeout(tryScroll, 50);
+    }
   }, [openSettingsCommand, setSettingsInitialCategory, setSettingsInitialScope, incrementSettingsKey]);
+
+  // Custom event dispatched by the runtime-side CodexAuthRequiredWidget. Lives
+  // in renderer because the widget cannot reach the renderer's jotai store
+  // directly across the package boundary.
+  useEffect(() => {
+    const handler = (event: Event) => {
+      const detail = (event as CustomEvent<{ anchor?: string }>).detail;
+      store.set(openSettingsCommandAtom, {
+        category: 'openai-codex',
+        scope: 'user',
+        anchor: detail?.anchor ?? 'codex-auth-section',
+        timestamp: Date.now(),
+      });
+    };
+    window.addEventListener('nimbalyst:open-codex-auth-settings', handler);
+    return () => window.removeEventListener('nimbalyst:open-codex-auth-settings', handler);
+  }, []);
 
   // React to unified navigation back/forward commands. The IPC subscriptions
   // live in store/listeners/appCommandListeners.ts.
@@ -1213,14 +1326,18 @@ export default function App() {
   // React to "show session import dialog" command (Developer menu). The IPC
   // subscription lives in store/listeners/appCommandListeners.ts.
   const showSessionImportDialogVersion = useAtomValue(showSessionImportDialogRequestAtom);
-  const showSessionImportDialogInitialRef = useRef(showSessionImportDialogVersion);
-  useEffect(() => {
-    if (showSessionImportDialogVersion === showSessionImportDialogInitialRef.current) return;
-    if (!dialogRef.current || !workspacePath) return;
-    dialogRef.current.open(DIALOG_IDS.SESSION_IMPORT, {
-      workspacePath,
-    });
-  }, [showSessionImportDialogVersion, workspacePath]);
+  // Fires once per increment, deferred until a workspace is ready. Consuming the
+  // version on fire stops the dialog re-opening on every workspace switch (#480);
+  // the previous inline effect never updated its ref and depended on
+  // workspacePath, so each folder change re-ran it and re-opened the dialog.
+  useDialogRequestTrigger(
+    showSessionImportDialogVersion,
+    Boolean(workspacePath),
+    useCallback(() => {
+      if (!workspacePath) return;
+      dialogRef.current?.open(DIALOG_IDS.SESSION_IMPORT, { workspacePath });
+    }, [workspacePath]),
+  );
 
   // React to "show extension project intro dialog" requests. The IPC
   // subscription lives in store/listeners/appCommandListeners.ts. The
@@ -1306,11 +1423,14 @@ export default function App() {
     showFigmaMcpMigrationToast(true);
   }, [showFigmaMcpMigrationVersion, showFigmaMcpMigrationToast]);
 
-  // Update window title for files mode - agent mode sets title directly from AgenticPanel
+  // Update window title to reflect the active workspace.
+  // The agent-mode early-return that used to live here was a holdover from
+  // when AgenticPanel set the title itself; nothing does that today, and
+  // the multi-project rail can switch the active workspace while the user
+  // is in agent mode, leaving the title bar stuck on the previous
+  // project's name.
   useEffect(() => {
     if (!window.electronAPI) return;
-    // Skip if in agent mode - AgenticPanel manages the title
-    if (activeMode === 'agent') return;
 
     let title = 'Nimbalyst';
     if (workspaceMode && workspaceName) {
@@ -1329,6 +1449,8 @@ export default function App() {
     editorModeRef,
     agentModeRef,
     toggleAgentCollapsed,
+    isFullscreenPanelActive,
+    exitFullscreenPanel: () => setActiveExtensionPanel(null),
   });
 
   // Extension-contributed keybindings (reads from manifests, fires commands via registry)
@@ -1373,6 +1495,69 @@ export default function App() {
     window.addEventListener('nimbalyst:navigate-tracker-item', handleNavigateTrackerItem);
     return () => window.removeEventListener('nimbalyst:navigate-tracker-item', handleNavigateTrackerItem);
   }, [setActiveMode]);
+
+  // Listen for PR navigation events (from tracker detail / session panels) —
+  // the PR-view leg of the PR ↔ tracker ↔ session navigation triangle.
+  useEffect(() => {
+    const handleNavigatePr = (e: Event) => {
+      const detail = (e as CustomEvent).detail;
+      if (typeof detail?.remote === 'string' && typeof detail?.prNumber === 'number') {
+        setActiveMode('pr-review');
+        store.set(prNavigateRequestAtom, {
+          remote: detail.remote,
+          prNumber: detail.prNumber,
+          version: detail.version ?? Date.now(),
+        });
+      }
+    };
+
+    window.addEventListener('nimbalyst:navigate-pr', handleNavigatePr);
+    return () => window.removeEventListener('nimbalyst:navigate-pr', handleNavigatePr);
+  }, [setActiveMode]);
+
+  // Host hook for converting a legacy inline tracker embed into a real tracked
+  // item. The runtime TrackerPlugin (platform-agnostic) calls this to create
+  // the canonical item, then replaces the inline node with a reference chip.
+  // Mirrors the quick-add creation path in TrackerMainView.
+  useEffect(() => {
+    if (!workspacePath) {
+      delete (window as any).__nimbalystCreateTrackerItem;
+      return;
+    }
+    (window as any).__nimbalystCreateTrackerItem = async (item: {
+      type: string;
+      title: string;
+      status?: string;
+      priority?: string;
+      description?: string;
+      owner?: string;
+      tags?: string[];
+    }): Promise<{ id: string; issueKey?: string } | null> => {
+      try {
+        const prefix = (item.type || 'itm').substring(0, 3);
+        const id = `${prefix}_${Date.now().toString(36)}${Math.random().toString(36).substring(2, 8)}`;
+        const result = await window.electronAPI.documentService.createTrackerItem({
+          id,
+          type: item.type,
+          title: item.title || `New ${item.type}`,
+          status: item.status || 'to-do',
+          priority: item.priority || 'medium',
+          description: item.description,
+          owner: item.owner,
+          tags: item.tags,
+          workspace: workspacePath,
+        });
+        if (!result.success || !result.item) return null;
+        return { id: result.item.id ?? id, issueKey: result.item.issueKey };
+      } catch (error) {
+        console.error('[App] Convert inline tracker -> create failed:', error);
+        return null;
+      }
+    };
+    return () => {
+      delete (window as any).__nimbalystCreateTrackerItem;
+    };
+  }, [workspacePath]);
 
   // Listen for open-ai-session events (from rebase/merge conflict resolution)
   useEffect(() => {
@@ -1514,6 +1699,15 @@ export default function App() {
               await initWindowMode(initialState.workspacePath);
               // Initialize unified navigation history
               await initNavigationHistory(initialState.workspacePath);
+
+              // Seed the multi-project rail: this window's primary
+              // workspace is always represented in the rail (visible only
+              // when multiProjectMode is on, hidden otherwise).
+              addOpenProject({
+                path: initialState.workspacePath,
+                name: initialState.workspaceName ?? initialState.workspacePath,
+                openedAt: Date.now(),
+              });
             }
           }
         }
@@ -1525,7 +1719,43 @@ export default function App() {
     };
 
     loadInitialState();
-  }, []);
+  }, [addOpenProject]);
+
+  // Multi-project rail switch: when the rail's active path changes, mirror
+  // it into the legacy `workspacePath` useState so the rest of the App
+  // tree re-renders for the new project. Only fires when the user
+  // explicitly clicks a different project — initial load is handled above.
+  useEffect(() => {
+    if (!isMultiProjectMode) return;
+    if (!railActivePath) return;
+    if (railActivePath === workspacePath) return;
+
+    setWorkspacePath(railActivePath);
+    setWorkspaceName(railActivePath.split(/[\\/]/).filter(Boolean).pop() ?? railActivePath);
+
+    // `activeSessionIdAtom` is cleared automatically on every flip of
+    // `activeWorkspacePathAtom` by the subscriber attached in
+    // `initOpenProjects` (`attachWorkspaceSwitchCleanup`). AgentMode's
+    // mount effect repopulates the global from the new workspace's
+    // `selectedWorkstreamAtom` if it has a selection.
+
+    // Re-init navigation history for the newly visible project.
+    initNavigationHistory(railActivePath).catch((err) => {
+      console.error('[INIT] Failed to init navigation history on rail switch:', err);
+    });
+    initWindowMode(railActivePath).catch((err) => {
+      console.error('[INIT] Failed to init window mode on rail switch:', err);
+    });
+    // Pre-warm the agent layout family and session registry for the new
+    // path so AgentMode's mount effect isn't the only initializer. Both
+    // helpers are idempotent — running them again from AgentMode is safe.
+    initAgentModeLayout(railActivePath).catch((err) => {
+      console.error('[INIT] Failed to init agent layout on rail switch:', err);
+    });
+    initSessionList(railActivePath).catch((err) => {
+      console.error('[INIT] Failed to init session list on rail switch:', err);
+    });
+  }, [isMultiProjectMode, railActivePath, workspacePath]);
 
 
   // Mode-aware tab navigation handlers
@@ -1585,6 +1815,7 @@ export default function App() {
     getContentRef,
     searchCommandRef,
     editorModeRef,
+    collabModeRef,
     currentFilePathRef,
     currentFileNameRef,
 
@@ -1749,6 +1980,9 @@ export default function App() {
     } else if (activeModeStateRef.current === 'files') {
       console.log('[App] Routing to editorModeRef.closeActiveTab()');
       editorModeRef.current?.closeActiveTab();
+    } else if (activeModeStateRef.current === 'collab') {
+      console.log('[App] Routing to collabModeRef.closeActiveTab()');
+      collabModeRef.current?.closeActiveTab();
     }
   }, [closeActiveTabVersion]);
 
@@ -1761,6 +1995,8 @@ export default function App() {
       agentModeRef.current?.reopenLastClosedSession?.();
     } else if (activeModeStateRef.current === 'files') {
       editorModeRef.current?.reopenLastClosedTab?.();
+    } else if (activeModeStateRef.current === 'collab') {
+      collabModeRef.current?.reopenLastClosedTab?.();
     }
   }, [reopenLastClosedTabVersion]);
 
@@ -1801,6 +2037,31 @@ export default function App() {
             });
             return;
           }
+
+          // In-document anchor link: scroll to the matching id inside the
+          // active editor scroll container, NOT the whole document. Multiple
+          // files can be open; we want the heading inside the same editor.
+          if (href && href.startsWith('#') && href.length > 1) {
+            let targetId: string;
+            try {
+              targetId = decodeURIComponent(href.slice(1));
+            } catch {
+              targetId = href.slice(1);
+            }
+            const scrollContainer = anchor.closest('.editor-scroller');
+            const scope: ParentNode = scrollContainer ?? document;
+            const escapedId =
+              typeof CSS !== 'undefined' && typeof CSS.escape === 'function'
+                ? CSS.escape(targetId)
+                : targetId.replace(/([\]"\\().:;'#[])/g, '\\$1');
+            const targetElement = scope.querySelector(`#${escapedId}`);
+            if (targetElement) {
+              event.preventDefault();
+              event.stopPropagation();
+              targetElement.scrollIntoView({ block: 'start', behavior: 'smooth' });
+              return;
+            }
+          }
           break;
         }
         target = target.parentElement;
@@ -1816,7 +2077,7 @@ export default function App() {
 
   // Show nothing while initializing - let HTML/CSS background show through
   // Wait for both initial state and extensions to be ready before rendering editors
-  // This ensures extension nodes (like DataModelNode) are registered with the pluginRegistry
+  // This ensures extension nodes (like DataModelNode) are published into the runtime extension stores
   if (isInitializing || !extensionsReady) {
     return <div className="h-screen" />;
   }
@@ -1838,8 +2099,11 @@ export default function App() {
       }}
     />
     <WalkthroughProvider currentMode={activeMode}>
-    <TipProvider currentMode={activeMode}>
+    <TipProvider currentMode={activeMode} workspacePath={workspacePath || undefined}>
     <div data-layout="root-container" className="h-screen flex flex-row">
+      {/* Far-left: project rail (Discord-style) — visible only when
+          multi-project mode is enabled in settings. */}
+      <ProjectRail />
       {/* Left: Navigation Gutter - full height */}
       <NavigationGutter
         contentMode={activeMode}
@@ -1892,6 +2156,9 @@ export default function App() {
         }}
         onToggleAgentCollapsed={() => {
           toggleAgentCollapsed();
+        }}
+        onToggleCollabCollapsed={() => {
+          collabModeRef.current?.toggleSidebarCollapsed();
         }}
       />
 
@@ -1948,11 +2215,14 @@ export default function App() {
                     onCloseWorkspace={handleCloseWorkspace}
                     onOpenQuickSearch={() => {
                       if (dialogRef.current && workspacePath) {
-                        dialogRef.current.open(DIALOG_IDS.QUICK_OPEN, {
+                        dialogRef.current.open(DIALOG_IDS.UNIFIED_QUICK_OPEN, {
                           workspacePath,
                           currentFilePath: currentFilePathRef.current,
+                          initialTab: 'files',
                           onFileSelect: handleQuickOpenFileSelect,
                           onFolderSelect: handleQuickOpenFolderSelect,
+                          onSessionSelect: handleSessionQuickOpenSelect,
+                          onPromptSelect: handlePromptQuickOpenSelect,
                         });
                       }
                     }}
@@ -1980,9 +2250,14 @@ export default function App() {
                   onFileOpen={handleWorkspaceFileSelect}
                   onOpenQuickSearch={() => {
                     if (dialogRef.current && workspacePath) {
-                      dialogRef.current.open(DIALOG_IDS.SESSION_QUICK_OPEN, {
+                      dialogRef.current.open(DIALOG_IDS.UNIFIED_QUICK_OPEN, {
                         workspacePath,
+                        currentFilePath: currentFilePathRef.current,
+                        initialTab: 'sessions',
+                        onFileSelect: handleQuickOpenFileSelect,
+                        onFolderSelect: handleQuickOpenFolderSelect,
                         onSessionSelect: handleSessionQuickOpenSelect,
+                        onPromptSelect: handlePromptQuickOpenSelect,
                       });
                     }
                   }}
@@ -2015,6 +2290,25 @@ export default function App() {
               )}
             </div>
 
+            {/* PR Review Mode - always mounted, visibility controlled by display */}
+            <div
+              data-layout="pr-review-mode-wrapper"
+              className={`flex-1 flex-col overflow-hidden min-h-0 ${
+                activeMode === 'pr-review' && developerMode && !isFullscreenPanelActive
+                  ? 'flex'
+                  : 'hidden'
+              }`}
+            >
+              {workspacePath && developerMode && (
+                <PullRequestMode
+                  workspacePath={workspacePath}
+                  workspaceName={workspaceName || ''}
+                  isActive={activeMode === 'pr-review'}
+                  onSwitchToFilesMode={() => setActiveMode('files')}
+                />
+              )}
+            </div>
+
             {/* Collab Mode - always mounted, visibility controlled by display */}
             <div
               data-layout="collab-mode-wrapper"
@@ -2024,6 +2318,7 @@ export default function App() {
             >
               {workspacePath && (
                 <CollabMode
+                  ref={collabModeRef}
                   workspacePath={workspacePath}
                   isActive={activeMode === 'collab'}
                   onFileOpen={handleWorkspaceFileSelect}
@@ -2143,6 +2438,7 @@ export default function App() {
       <ErrorToastContainer />
       <MockupPickerMenuHost />
       <ExtensionHostComponents />
+      <ExtensionPermissionPrompt />
       <UpdateToast />
       <ProjectTrustToast
         workspacePath={workspacePath}

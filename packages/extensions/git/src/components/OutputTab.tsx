@@ -1,5 +1,6 @@
-import { useEffect, useRef } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import type { OperationLogEntry } from '../hooks/useOperationLog';
+import { ErrorDetailPopup } from './ErrorDetailPopup';
 
 interface OutputTabProps {
   entries: OperationLogEntry[];
@@ -13,6 +14,74 @@ function formatTime(date: Date): string {
 function formatDuration(ms: number): string {
   if (ms < 1000) return `${ms}ms`;
   return `${(ms / 1000).toFixed(1)}s`;
+}
+
+const ERROR_PREVIEW_LINES = 3;
+const COPY_FEEDBACK_MS = 1500;
+
+function ErrorBlock({ command, error }: { command: string; error: string }) {
+  const [showFull, setShowFull] = useState(false);
+  const [copied, setCopied] = useState(false);
+
+  const lines = useMemo(() => error.split('\n').filter(Boolean), [error]);
+  const hasMore = lines.length > ERROR_PREVIEW_LINES;
+  const visibleLines = hasMore ? lines.slice(0, ERROR_PREVIEW_LINES) : lines;
+  const hiddenCount = lines.length - visibleLines.length;
+
+  useEffect(() => {
+    if (!copied) return;
+    const t = setTimeout(() => setCopied(false), COPY_FEEDBACK_MS);
+    return () => clearTimeout(t);
+  }, [copied]);
+
+  const handleCopy = async () => {
+    try {
+      await navigator.clipboard.writeText(error);
+      setCopied(true);
+    } catch {
+      // ignore
+    }
+  };
+
+  return (
+    <>
+      <div className="git-output-lines git-output-lines--error">
+        {visibleLines.map((line, i) => (
+          <div key={i} className="git-output-line">&gt; {line}</div>
+        ))}
+        {hasMore && (
+          <div className="git-output-line git-output-line--more">
+            ...{hiddenCount} more {hiddenCount === 1 ? 'line' : 'lines'}
+          </div>
+        )}
+      </div>
+      <div className="git-output-error-actions">
+        {hasMore && (
+          <button
+            type="button"
+            className="git-output-action-btn"
+            onClick={() => setShowFull(true)}
+          >
+            View full error
+          </button>
+        )}
+        <button
+          type="button"
+          className="git-output-action-btn"
+          onClick={handleCopy}
+        >
+          {copied ? 'Copied' : 'Copy'}
+        </button>
+      </div>
+      {showFull && (
+        <ErrorDetailPopup
+          command={command}
+          error={error}
+          onClose={() => setShowFull(false)}
+        />
+      )}
+    </>
+  );
 }
 
 function EntryRow({ entry }: { entry: OperationLogEntry }) {
@@ -36,13 +105,7 @@ function EntryRow({ entry }: { entry: OperationLogEntry }) {
         </div>
       )}
 
-      {entry.error && (
-        <div className="git-output-lines git-output-lines--error">
-          {entry.error.split('\n').filter(Boolean).map((line, i) => (
-            <div key={i} className="git-output-line">&gt; {line}</div>
-          ))}
-        </div>
-      )}
+      {entry.error && <ErrorBlock command={entry.command} error={entry.error} />}
 
       {entry.status === 'success' && (
         <div className="git-output-status git-output-status--success">

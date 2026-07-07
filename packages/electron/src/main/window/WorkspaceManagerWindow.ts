@@ -14,6 +14,7 @@ import { GitStatusService } from '../services/GitStatusService';
 import { getMcpConfigService } from '../index';
 import { autoMatchTeamForWorkspace } from '../services/TeamService';
 import { initializeTrackerSync } from '../services/TrackerSyncManager';
+import { updateTrackerSchemaWorkspace } from '../services/TrackerSchemaService';
 
 let workspaceManagerWindow: BrowserWindow | null = null;
 
@@ -302,8 +303,10 @@ export function setupWorkspaceManagerHandlers() {
 
   // Create workspace dialog
   safeHandle('workspace-manager:create-workspace-dialog', async () => {
+    const defaultPath = join(app.getPath('documents'), 'Untitled Workspace');
     const result = await dialog.showSaveDialog({
       title: 'Create New Workspace',
+      defaultPath,
       buttonLabel: 'Create',
       properties: ['createDirectory', 'showOverwriteConfirmation']
     });
@@ -404,6 +407,7 @@ export function setupWorkspaceManagerHandlers() {
       // we've yielded the main thread; both paths may probe git remotes.
       void autoMatchTeamForWorkspace(workspacePath).catch(() => {});
       void initializeTrackerSync(workspacePath).catch(() => {});
+      updateTrackerSchemaWorkspace(workspacePath);
     }, 0);
 
     // Restore dev tools if they were open

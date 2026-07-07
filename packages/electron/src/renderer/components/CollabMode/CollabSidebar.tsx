@@ -1,17 +1,23 @@
-import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { useAtomValue } from 'jotai';
 import { MaterialSymbol } from '@nimbalyst/runtime';
 import { InputModal } from '../InputModal';
 import { WorkspaceSummaryHeader } from '../WorkspaceSummaryHeader';
+import { useFloatingMenu, FloatingPortal, virtualElement } from '../../hooks/useFloatingMenu';
 import {
   sharedDocumentsAtom,
   teamSyncStatusAtom,
   removeSharedDocument,
   updateSharedDocumentTitle,
+  activeTeamOrgIdAtom,
+  workspaceHasTeamAtom,
+  buildSharedDocumentDeepLink,
   type SharedDocument,
 } from '../../store/atoms/collabDocuments';
+import { errorNotificationService } from '../../services/ErrorNotificationService';
 import {
   buildCollabTree,
+  filterCollabTree,
   getCollabDocumentPath,
   getCollabNodeName,
   getCollabParentPath,
@@ -21,6 +27,10 @@ import {
   type CollabTreeNode,
 } from './collabTree';
 import { registerDocumentInIndex } from '../../store/atoms/collabDocuments';
+import { useCollabLocalOrigin } from '../../hooks/useCollabLocalOrigin';
+import { useSetAtom } from 'jotai';
+import { historyDialogFileAtom } from '../../store/atoms/historyDialog';
+import { buildCollabUri } from '../../utils/collabUri';
 
 // ---------------------------------------------------------------------------
 // TeamSync status indicator -- shown in the header subtitle slot
@@ -59,30 +69,44 @@ export const CollabSidebar: React.FC<CollabSidebarProps> = ({
 }) => {
   const sharedDocuments = useAtomValue(sharedDocumentsAtom);
   const teamSyncStatus = useAtomValue(teamSyncStatusAtom);
+  const teamOrgId = useAtomValue(activeTeamOrgIdAtom);
+  const workspaceHasTeam = useAtomValue(workspaceHasTeamAtom);
   const [contextMenu, setContextMenu] = useState<{
     x: number;
     y: number;
     node: CollabTreeNode;
   } | null>(null);
-  const contextMenuRef = useRef<HTMLDivElement>(null);
   const [expandedFolders, setExpandedFolders] = useState<Set<string>>(new Set());
   const [customFolders, setCustomFolders] = useState<string[]>([]);
   const [selectedFolderPath, setSelectedFolderPath] = useState<string | null>(null);
+  const [searchQuery, setSearchQuery] = useState('');
   const [isCreateDocumentOpen, setIsCreateDocumentOpen] = useState(false);
   const [isCreateFolderOpen, setIsCreateFolderOpen] = useState(false);
   const [documentToRename, setDocumentToRename] = useState<SharedDocument | null>(null);
   const [hasLoadedState, setHasLoadedState] = useState(false);
   const [loadedWorkspacePath, setLoadedWorkspacePath] = useState<string | null>(null);
+  const setHistoryDialogFile = useSetAtom(historyDialogFileAtom);
   const [draggedDocument, setDraggedDocument] = useState<{
     documentId: string;
     sourcePath: string;
     name: string;
   } | null>(null);
   const [dropTargetPath, setDropTargetPath] = useState<string | null>(null);
+  // Track whether the user has manually customized the expansion set since
+  // the initial workspace state load. Until they do, we auto-expand folders
+  // that contain shared docs so newly synced content isn't hidden behind
+  // collapsed parents the user has never opened.
+  const [userTouchedExpansion, setUserTouchedExpansion] = useState(false);
 
   const tree = useMemo(
     () => buildCollabTree(sharedDocuments, customFolders),
     [sharedDocuments, customFolders]
+  );
+  const trimmedSearchQuery = searchQuery.trim();
+  const hasActiveSearch = trimmedSearchQuery.length > 0;
+  const filteredTree = useMemo(
+    () => filterCollabTree(tree, trimmedSearchQuery),
+    [tree, trimmedSearchQuery]
   );
 
   const existingPaths = useMemo(() => {
@@ -117,24 +141,18 @@ export const CollabSidebar: React.FC<CollabSidebarProps> = ({
     return false;
   }, [teamSyncStatus]);
 
-  // Close context menu on click outside or Escape
-  useEffect(() => {
-    if (!contextMenu) return;
-    const handleClick = (e: MouseEvent) => {
-      if (contextMenuRef.current && !contextMenuRef.current.contains(e.target as Node)) {
-        setContextMenu(null);
-      }
-    };
-    const handleKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') setContextMenu(null);
-    };
-    document.addEventListener('mousedown', handleClick);
-    document.addEventListener('keydown', handleKey);
-    return () => {
-      document.removeEventListener('mousedown', handleClick);
-      document.removeEventListener('keydown', handleKey);
-    };
-  }, [contextMenu]);
+  const contextMenuReference = useMemo(
+    () => (contextMenu ? virtualElement(contextMenu.x, contextMenu.y) : null),
+    [contextMenu]
+  );
+  const contextMenuFloating = useFloatingMenu({
+    placement: 'right-start',
+    reference: contextMenuReference,
+    open: contextMenu !== null,
+    onOpenChange: (open) => {
+      if (!open) setContextMenu(null);
+    },
+  });
 
   useEffect(() => {
     setHasLoadedState(false);
@@ -142,8 +160,10 @@ export const CollabSidebar: React.FC<CollabSidebarProps> = ({
     setContextMenu(null);
     setDocumentToRename(null);
     setSelectedFolderPath(null);
+    setSearchQuery('');
     setExpandedFolders(new Set());
     setCustomFolders([]);
+    setUserTouchedExpansion(false);
 
     if (!workspacePath || !window.electronAPI?.invoke) {
       setHasLoadedState(true);
@@ -164,6 +184,11 @@ export const CollabSidebar: React.FC<CollabSidebarProps> = ({
 
         setExpandedFolders(new Set(nextExpanded));
         setCustomFolders(Array.from(new Set(nextFolders)));
+        // Treat persisted tree state as a user customization so we don't
+        // override the user's collapse decisions with the auto-expand fallback.
+        setUserTouchedExpansion(
+          state?.collabTree?.userTouched === true || nextExpanded.length > 0 || nextFolders.length > 0
+        );
         setHasLoadedState(true);
         setLoadedWorkspacePath(workspacePath);
       })
@@ -185,13 +210,14 @@ export const CollabSidebar: React.FC<CollabSidebarProps> = ({
       collabTree: {
         expandedFolders: Array.from(expandedFolders),
         customFolders,
+        userTouched: userTouchedExpansion,
       },
     };
 
     window.electronAPI.invoke('workspace:update-state', workspacePath, payload).catch((error) => {
       console.warn('[CollabSidebar] Failed to persist tree state:', error);
     });
-  }, [customFolders, expandedFolders, hasLoadedState, loadedWorkspacePath, workspacePath]);
+  }, [customFolders, expandedFolders, hasLoadedState, loadedWorkspacePath, userTouchedExpansion, workspacePath]);
 
   useEffect(() => {
     if (!activeDocument) return;
@@ -227,6 +253,32 @@ export const CollabSidebar: React.FC<CollabSidebarProps> = ({
     setContextMenu({ x: e.clientX, y: e.clientY, node });
   }, []);
 
+  const handleCopyLink = useCallback(async (document: SharedDocument) => {
+    if (!teamOrgId) {
+      errorNotificationService.showWarning(
+        'No team configured',
+        'This workspace is not connected to a team, so no shareable link is available.',
+        { duration: 4000 }
+      );
+      return;
+    }
+    const url = buildSharedDocumentDeepLink(document.documentId, teamOrgId);
+    try {
+      await navigator.clipboard.writeText(url);
+      errorNotificationService.showInfo(
+        'Link copied',
+        'Paste it anywhere to open this document in Nimbalyst.',
+        { duration: 3000 }
+      );
+    } catch (err) {
+      console.error('[CollabSidebar] Failed to copy link:', err);
+      errorNotificationService.showError(
+        'Copy failed',
+        'Could not write the link to the clipboard.'
+      );
+    }
+  }, [teamOrgId]);
+
   const handleDelete = useCallback(() => {
     if (!contextMenu || contextMenu.node.type !== 'document') return;
     if (!canMutateMetadata('delete this document')) return;
@@ -238,6 +290,7 @@ export const CollabSidebar: React.FC<CollabSidebarProps> = ({
   }, [canMutateMetadata, contextMenu]);
 
   const toggleFolder = useCallback((folderPath: string) => {
+    setUserTouchedExpansion(true);
     setExpandedFolders((currentFolders) => {
       const next = new Set(currentFolders);
       if (next.has(folderPath)) {
@@ -248,6 +301,39 @@ export const CollabSidebar: React.FC<CollabSidebarProps> = ({
       return next;
     });
   }, []);
+
+  // Auto-expand any folder that contains a shared document on initial load,
+  // so a fresh visit to Collab mode doesn't hide docs behind collapsed
+  // parents. Only applies until the user manually toggles a folder, at
+  // which point persisted expansion state takes over.
+  useEffect(() => {
+    if (!hasLoadedState || loadedWorkspacePath !== workspacePath) return;
+    if (userTouchedExpansion) return;
+    if (sharedDocuments.length === 0) return;
+
+    const docFolderPaths = new Set<string>();
+    for (const document of sharedDocuments) {
+      const path = getCollabDocumentPath(document);
+      let parent = getCollabParentPath(path);
+      while (parent) {
+        docFolderPaths.add(parent);
+        parent = getCollabParentPath(parent);
+      }
+    }
+    if (docFolderPaths.size === 0) return;
+
+    setExpandedFolders((currentFolders) => {
+      let changed = false;
+      const next = new Set(currentFolders);
+      for (const folderPath of docFolderPaths) {
+        if (!next.has(folderPath)) {
+          next.add(folderPath);
+          changed = true;
+        }
+      }
+      return changed ? next : currentFolders;
+    });
+  }, [hasLoadedState, loadedWorkspacePath, workspacePath, sharedDocuments, userTouchedExpansion]);
 
   const getCreationBaseFolder = useCallback(() => {
     return contextMenu?.node.type === 'folder'
@@ -406,7 +492,7 @@ export const CollabSidebar: React.FC<CollabSidebarProps> = ({
       const indent = depth * 16 + 8;
 
       if (node.type === 'folder') {
-        const isExpanded = expandedFolders.has(node.path);
+        const isExpanded = hasActiveSearch || expandedFolders.has(node.path);
         const isSelected = selectedFolderPath === node.path;
         const isDropTarget = dropTargetPath === node.path;
 
@@ -416,7 +502,9 @@ export const CollabSidebar: React.FC<CollabSidebarProps> = ({
               className={`w-full flex items-center text-left file-tree-directory${isSelected ? ' selected' : ''}${isDropTarget ? ' drag-over' : ''}`}
               style={{ paddingLeft: indent }}
               onClick={() => {
-                toggleFolder(node.path);
+                if (!hasActiveSearch) {
+                  toggleFolder(node.path);
+                }
                 setSelectedFolderPath(node.path);
               }}
               onContextMenu={(event) => handleContextMenu(event, node)}
@@ -464,6 +552,32 @@ export const CollabSidebar: React.FC<CollabSidebarProps> = ({
       }
 
       const isActive = node.document.documentId === activeDocumentId;
+      const isLocked = node.document.decryptFailed === true;
+
+      if (isLocked) {
+        const lockedTitle =
+          'This document\'s title is encrypted with a key your account does not currently have. ' +
+          'Ask a team admin to refresh / rewrap your key envelope, then reopen the workspace.';
+        return (
+          <button
+            key={node.id}
+            type="button"
+            disabled
+            data-testid="collab-sidebar-locked-doc"
+            className="w-full flex items-center text-left file-tree-file opacity-60 cursor-not-allowed"
+            style={{ paddingLeft: indent }}
+            title={lockedTitle}
+          >
+            <span className="file-tree-spacer" />
+            <span className="file-tree-icon">
+              <MaterialSymbol icon="lock" size={16} />
+            </span>
+            <span className="file-tree-name italic text-[var(--nim-text-faint)]">
+              Encrypted document (key unavailable)
+            </span>
+          </button>
+        );
+      }
 
       return (
         <button
@@ -508,11 +622,17 @@ export const CollabSidebar: React.FC<CollabSidebarProps> = ({
     moveDraggedDocument,
     onDocumentSelect,
     selectedFolderPath,
+    hasActiveSearch,
     toggleFolder,
   ]);
 
   const selectedFolderLabel = selectedFolderPath ? getCollabNodeName(selectedFolderPath) : 'Shared Docs';
   const contextDocument = contextMenu?.node.type === 'document' ? contextMenu.node.document : null;
+  const contextLocalOrigin = useCollabLocalOrigin(
+    workspacePath,
+    contextDocument?.documentId,
+    contextDocument?.documentType,
+  );
 
   return (
     <div
@@ -552,6 +672,30 @@ export const CollabSidebar: React.FC<CollabSidebarProps> = ({
         }
       />
 
+      <div className="session-history-search px-3 py-2 border-b border-[var(--nim-border)] shrink-0 relative">
+          <input
+            type="text"
+            className="session-history-search-input nim-input w-full pl-3 pr-9 py-2 text-[13px] text-[var(--nim-text)] bg-[var(--nim-bg-secondary)] border border-[var(--nim-border)] rounded outline-none transition-colors duration-150 placeholder:text-[var(--nim-text-faint)] focus:border-[var(--nim-primary)] focus:bg-[var(--nim-bg)]"
+            placeholder="Search shared documents..."
+            value={searchQuery}
+            onChange={(event) => setSearchQuery(event.target.value)}
+            aria-label="Search shared documents"
+          />
+          {hasActiveSearch && (
+            <button
+              type="button"
+              className="session-history-search-clear absolute right-5 top-1/2 -translate-y-1/2 flex items-center justify-center w-5 h-5 rounded text-[var(--nim-text-muted)] bg-transparent border-none cursor-pointer transition-colors duration-150 hover:bg-[var(--nim-bg-hover)] hover:text-[var(--nim-text)]"
+              onClick={() => setSearchQuery('')}
+              aria-label="Clear shared document search"
+              title="Clear search"
+            >
+              <svg width="12" height="12" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">
+                <path d="M4 4L12 12M12 4L4 12" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round"/>
+              </svg>
+            </button>
+          )}
+      </div>
+
       {/* Document tree */}
       <div
         className={`flex-1 overflow-y-auto px-1.5 py-2 transition-colors ${dropTargetPath === '__root__' ? 'bg-nim-hover' : ''}`}
@@ -584,31 +728,69 @@ export const CollabSidebar: React.FC<CollabSidebarProps> = ({
           void moveDraggedDocument(null);
         }}
       >
-        {tree.length === 0 ? (
-          <div className="px-2 py-4 text-center">
-            <MaterialSymbol icon="cloud_sync" size={32} className="text-nim-faint mb-2" />
-            <p className="text-xs text-nim-faint m-0">
-              No shared documents yet.
-            </p>
-            <p className="text-xs text-nim-faint mt-1 m-0">
-              Create one here or share a local file to collaborate.
-            </p>
-          </div>
-        ) : (
-          <div>{renderTree(tree)}</div>
-        )}
+        {(() => {
+          // Loading: still resolving workspace state, or team sync is mid-
+          // handshake. Render a skeleton instead of an empty/folders-only
+          // tree so users don't think their docs disappeared.
+          const isResolvingSync =
+            teamSyncStatus === 'connecting' || teamSyncStatus === 'syncing';
+          if (!hasLoadedState || isResolvingSync) {
+            return (
+              <div className="px-2 py-4 text-center" data-testid="collab-sidebar-loading">
+                <MaterialSymbol
+                  icon="cloud_sync"
+                  size={32}
+                  className="text-nim-faint mb-2 animate-pulse"
+                />
+                <p className="text-xs text-nim-faint m-0">
+                  Loading shared documents...
+                </p>
+              </div>
+            );
+          }
+          if (tree.length === 0) {
+            return (
+              <div className="px-2 py-4 text-center">
+                <MaterialSymbol icon="cloud_sync" size={32} className="text-nim-faint mb-2" />
+                <p className="text-xs text-nim-faint m-0">
+                  {workspaceHasTeam
+                    ? 'No shared documents yet.'
+                    : 'No team connected to this workspace.'}
+                </p>
+                {workspaceHasTeam && (
+                  <p className="text-xs text-nim-faint mt-1 m-0">
+                    Create one here or share a local file to collaborate.
+                  </p>
+                )}
+              </div>
+            );
+          }
+          if (filteredTree.length === 0) {
+            return (
+              <div className="px-2 py-4 text-center">
+                <MaterialSymbol icon="search_off" size={32} className="text-nim-faint mb-2" />
+                <p className="text-xs text-nim-faint m-0">
+                  No shared documents match "{trimmedSearchQuery}".
+                </p>
+                <p className="text-xs text-nim-faint mt-1 m-0">
+                  Try a different file name or folder path.
+                </p>
+              </div>
+            );
+          }
+          return <div>{renderTree(filteredTree)}</div>;
+        })()}
       </div>
 
       {/* Context menu */}
       {contextMenu && (
-        <div
-          ref={contextMenuRef}
-          className="fixed min-w-[160px] rounded-md z-[10000] text-[13px] p-1 bg-nim-secondary border border-nim text-nim backdrop-blur-[10px] shadow-lg"
-          style={{
-            left: contextMenu.x,
-            top: contextMenu.y,
-          }}
-        >
+        <FloatingPortal>
+          <div
+            ref={contextMenuFloating.refs.setFloating}
+            style={contextMenuFloating.floatingStyles}
+            {...contextMenuFloating.getFloatingProps()}
+            className="min-w-[160px] rounded-md z-[10000] text-[13px] p-1 bg-nim-secondary border border-nim text-nim backdrop-blur-[10px] shadow-lg"
+          >
           {contextMenu.node.type === 'folder' ? (
             <>
               <button
@@ -644,6 +826,38 @@ export const CollabSidebar: React.FC<CollabSidebarProps> = ({
               </button>
               <button
                 type="button"
+                className="w-full flex items-center gap-2.5 px-3 py-1.5 rounded border-none bg-transparent cursor-pointer transition-colors text-left text-nim hover:bg-nim-hover disabled:opacity-50 disabled:cursor-not-allowed"
+                disabled={!teamOrgId}
+                title={teamOrgId ? undefined : 'No team is connected to this workspace'}
+                onClick={() => {
+                  if (!contextDocument) return;
+                  setContextMenu(null);
+                  void handleCopyLink(contextDocument);
+                }}
+              >
+                <MaterialSymbol icon="link" size={18} />
+                <span>Copy Link</span>
+              </button>
+              <button
+                type="button"
+                className="w-full flex items-center gap-2.5 px-3 py-1.5 rounded border-none bg-transparent cursor-pointer transition-colors text-left text-nim hover:bg-nim-hover disabled:opacity-50 disabled:cursor-not-allowed"
+                disabled={!teamOrgId}
+                title={teamOrgId ? undefined : 'No team is connected to this workspace'}
+                onClick={() => {
+                  if (!contextDocument || !teamOrgId) return;
+                  setContextMenu(null);
+                  // Open the tab if it isn't already; the CollaborativeTabEditor
+                  // publishes a history controller on mount. The dialog itself
+                  // grace-waits for the controller to register.
+                  onDocumentSelect(contextDocument);
+                  setHistoryDialogFile(buildCollabUri(teamOrgId, contextDocument.documentId));
+                }}
+              >
+                <MaterialSymbol icon="history" size={18} />
+                <span>View History</span>
+              </button>
+              <button
+                type="button"
                 className="w-full flex items-center gap-2.5 px-3 py-1.5 rounded border-none bg-transparent cursor-pointer transition-colors text-left text-nim hover:bg-nim-hover"
                 onClick={() => {
                   if (!contextDocument) return;
@@ -656,6 +870,56 @@ export const CollabSidebar: React.FC<CollabSidebarProps> = ({
               </button>
               <button
                 type="button"
+                className="w-full flex items-center gap-2.5 px-3 py-1.5 rounded border-none bg-transparent cursor-pointer transition-colors text-left text-nim hover:bg-nim-hover disabled:opacity-50 disabled:cursor-not-allowed"
+                disabled={!contextLocalOrigin.hasResolvedBinding || contextLocalOrigin.busyAction !== null}
+                onClick={() => {
+                  setContextMenu(null);
+                  void contextLocalOrigin.openLocalSource();
+                }}
+              >
+                <MaterialSymbol icon="draft" size={18} />
+                <span>Open Local Source</span>
+              </button>
+              <button
+                type="button"
+                className="w-full flex items-center gap-2.5 px-3 py-1.5 rounded border-none bg-transparent cursor-pointer transition-colors text-left text-nim hover:bg-nim-hover disabled:opacity-50 disabled:cursor-not-allowed"
+                disabled={!contextLocalOrigin.binding || contextLocalOrigin.busyAction !== null}
+                onClick={() => {
+                  setContextMenu(null);
+                  void contextLocalOrigin.reuploadFromLocalSource();
+                }}
+              >
+                <MaterialSymbol icon="upload" size={18} />
+                <span>Re-upload From Local</span>
+              </button>
+              <button
+                type="button"
+                className="w-full flex items-center gap-2.5 px-3 py-1.5 rounded border-none bg-transparent cursor-pointer transition-colors text-left text-nim hover:bg-nim-hover disabled:opacity-50 disabled:cursor-not-allowed"
+                disabled={contextLocalOrigin.busyAction !== null}
+                onClick={() => {
+                  setContextMenu(null);
+                  void contextLocalOrigin.relinkLocalSource();
+                }}
+              >
+                <MaterialSymbol icon="link" size={18} />
+                <span>{contextLocalOrigin.binding ? 'Relink Local Source...' : 'Link Local Source...'}</span>
+              </button>
+              {contextLocalOrigin.binding && (
+                <button
+                  type="button"
+                  className="w-full flex items-center gap-2.5 px-3 py-1.5 rounded border-none bg-transparent cursor-pointer transition-colors text-left text-nim hover:bg-nim-hover disabled:opacity-50 disabled:cursor-not-allowed"
+                  disabled={contextLocalOrigin.busyAction !== null}
+                  onClick={() => {
+                    setContextMenu(null);
+                    void contextLocalOrigin.clearLocalSource();
+                  }}
+                >
+                  <MaterialSymbol icon="link_off" size={18} />
+                  <span>Clear Local Source</span>
+                </button>
+              )}
+              <button
+                type="button"
                 className="w-full flex items-center gap-2.5 px-3 py-1.5 rounded border-none bg-transparent cursor-pointer transition-colors text-left text-nim-error hover:bg-nim-hover"
                 onClick={handleDelete}
               >
@@ -664,7 +928,8 @@ export const CollabSidebar: React.FC<CollabSidebarProps> = ({
               </button>
             </>
           )}
-        </div>
+          </div>
+        </FloatingPortal>
       )}
 
       <InputModal

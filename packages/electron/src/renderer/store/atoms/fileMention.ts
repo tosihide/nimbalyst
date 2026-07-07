@@ -17,6 +17,7 @@ import { atom } from 'jotai';
 import { atomFamily } from '../debug/atomFamilyRegistry';
 import { getFileIcon } from '@nimbalyst/runtime';
 import type { TypeaheadOption } from '../../components/Typeahead/GenericTypeahead';
+import { isPathInsideWorkspace } from './workspacePathPrefix';
 
 // ============================================================
 // Types
@@ -63,6 +64,12 @@ export const fileMentionOptionsAtom = atomFamily((workspacePath: string) =>
   atom<TypeaheadOption[]>([])
 );
 
+/** Drop cached search state for a workspace path. */
+export function pruneFileMentionWorkspaceState(workspacePath: string): void {
+  documentsLoadingAtom.remove(workspacePath);
+  fileMentionOptionsAtom.remove(workspacePath);
+}
+
 // ============================================================
 // Helpers
 // ============================================================
@@ -74,6 +81,7 @@ function getFileName(filePath: string): string {
   const parts = filePath.split('/');
   return parts[parts.length - 1] || filePath;
 }
+
 
 /**
  * Get relative path by stripping the workspace prefix.
@@ -202,14 +210,30 @@ export const searchFileMentionAtom = atom(
     try {
       // On empty query, show recently viewed files instead of the alphabetical
       // top-level listing. Once the user types, fall back to ripgrep search.
+      //
+      // Two bugs were here pre-#301/#304:
+      //   1. `getRecentWorkspaceFiles()` was called with no argument, so the
+      //      main process fell back to window-state which (with the multi-
+      //      project rail in #188) could point at a different workspace than
+      //      the @-mention context's. Recents came back from the wrong
+      //      workspace.
+      //   2. The path-prefix filter used `workspacePath + '/'`, which is
+      //      wrong on Windows where paths separate on `\`. Even when the
+      //      recents WERE from this workspace, the filter dropped them all
+      //      on Windows, fell through to the ripgrep search, and the empty-
+      //      query path returned alphabetical results.
+      //
+      // Fix: pass workspacePath explicitly so the IPC scopes correctly, and
+      // use a platform-aware prefix check that accepts the workspace path
+      // followed by either `/` or `\`.
       if (!query && api.getRecentWorkspaceFiles) {
         // Warm the ripgrep cache in the background so the first typed character is fast
         void ensureQuickOpenCache(workspacePath);
 
         try {
-          const recent: string[] = await api.getRecentWorkspaceFiles();
+          const recent: string[] = await api.getRecentWorkspaceFiles(workspacePath);
           if (Array.isArray(recent) && recent.length > 0) {
-            const inWorkspace = recent.filter(p => p.startsWith(workspacePath + '/'));
+            const inWorkspace = recent.filter(p => isPathInsideWorkspace(p, workspacePath));
             if (inWorkspace.length > 0) {
               set(
                 fileMentionOptionsAtom(workspacePath),

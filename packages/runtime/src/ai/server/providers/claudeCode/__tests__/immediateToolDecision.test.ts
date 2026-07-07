@@ -1,5 +1,6 @@
 import { describe, it, expect, vi } from 'vitest';
 import { resolveImmediateToolDecision, type ToolDecision } from '../immediateToolDecision';
+import { INTERNAL_MCP_TOOLS } from '../toolPolicy';
 
 function createDeps(overrides?: Partial<Parameters<typeof resolveImmediateToolDecision>[0]>) {
   return {
@@ -71,8 +72,11 @@ describe('resolveImmediateToolDecision', () => {
       assertZodCompliantAllow(result);
     });
 
-    it('bypass-all mode returns updatedInput', async () => {
-      const deps = createDeps({ trustChecker: vi.fn().mockReturnValue({ trusted: true, mode: 'bypass-all' }) });
+    it('bypass-all mode returns updatedInput (non-auto mode)', async () => {
+      const deps = createDeps({
+        trustChecker: vi.fn().mockReturnValue({ trusted: true, mode: 'bypass-all' }),
+        getCurrentMode: () => 'agent',
+      });
       const params = createParams({ toolName: 'Bash' });
       const result = await resolveImmediateToolDecision(deps, params);
       assertZodCompliantAllow(result);
@@ -120,6 +124,94 @@ describe('resolveImmediateToolDecision', () => {
       const result = await resolveImmediateToolDecision(deps, params);
       expect(result).toBeNull();
       expect(deps.setCurrentMode).toHaveBeenCalledWith('planning');
+    });
+  });
+
+  // Regression coverage for nimbalyst#236. All 11 in-process tracker MCP
+  // tools registered by the `nimbalyst-mcp` server were missing from
+  // `INTERNAL_MCP_TOOLS`. Without an entry,
+  // `resolveImmediateToolDecision` returned null, the SDK fell through to
+  // the dialog handler which has no UI for nimbalyst-owned tools, the
+  // Promise never resolved, and the SDK surfaced "user cancelled MCP tool
+  // call" so the kanban board appeared broken.
+  describe('tracker MCP tools are in INTERNAL_MCP_TOOLS allowlist (#236)', () => {
+    // Tracker CRUD lives on the deferred `nimbalyst-trackers` server.
+    const expectedTrackerTools = [
+      'mcp__nimbalyst-trackers__tracker_list',
+      'mcp__nimbalyst-trackers__tracker_get',
+      'mcp__nimbalyst-trackers__tracker_list_types',
+      'mcp__nimbalyst-trackers__tracker_create',
+      'mcp__nimbalyst-trackers__tracker_update',
+      'mcp__nimbalyst-trackers__tracker_link_session',
+      'mcp__nimbalyst-trackers__tracker_unlink_session',
+      'mcp__nimbalyst-trackers__tracker_link_file',
+      'mcp__nimbalyst-trackers__tracker_add_comment',
+      'mcp__nimbalyst-trackers__tracker_define_type',
+      'mcp__nimbalyst-trackers__tracker_delete_type',
+    ];
+
+    for (const toolName of expectedTrackerTools) {
+      it(`${toolName} is auto-allowed via the real INTERNAL_MCP_TOOLS list`, async () => {
+        // Use the real production list, not the controlled stub.
+        expect(INTERNAL_MCP_TOOLS).toContain(toolName);
+
+        const deps = createDeps({ internalMcpTools: INTERNAL_MCP_TOOLS as readonly string[] as string[] });
+        const params = createParams({ toolName, input: { foo: 'bar' } });
+        const result = await resolveImmediateToolDecision(deps, params);
+        assertZodCompliantAllow(result);
+        expect(result!.updatedInput).toEqual({ foo: 'bar' });
+      });
+    }
+
+    it('does NOT broaden to third-party MCP tools in non-auto modes', async () => {
+      const deps = createDeps({
+        internalMcpTools: INTERNAL_MCP_TOOLS as readonly string[] as string[],
+        getCurrentMode: () => 'agent',
+      });
+      const params = createParams({
+        toolName: 'mcp__some-third-party-server__do_something',
+        input: { x: 1 },
+      });
+      const result = await resolveImmediateToolDecision(deps, params);
+      expect(result).toBeNull();
+    });
+
+    it('auto-approves third-party MCP tools in auto mode', async () => {
+      const deps = createDeps({ getCurrentMode: () => 'auto' });
+      const params = createParams({
+        toolName: 'mcp__some-third-party-server__do_something',
+        input: { x: 1 },
+      });
+      const result = await resolveImmediateToolDecision(deps, params);
+      assertZodCompliantAllow(result);
+    });
+
+    it('auto-approves Skill tool in auto mode', async () => {
+      const deps = createDeps({ getCurrentMode: () => 'auto' });
+      const params = createParams({ toolName: 'Skill', input: { skill: 'commit' } });
+      const result = await resolveImmediateToolDecision(deps, params);
+      assertZodCompliantAllow(result);
+    });
+
+    it('does NOT auto-approve Bash in auto mode even with bypass-all trust', async () => {
+      // Auto mode only activates under bypass-all in production. When the
+      // classifier escalates a Bash call (uncertain/risky), bypass-all must
+      // NOT short-circuit — the escalation should reach the permission prompt.
+      const deps = createDeps({
+        getCurrentMode: () => 'auto',
+        trustChecker: vi.fn().mockReturnValue({ trusted: true, mode: 'bypass-all' }),
+      });
+      const params = createParams({ toolName: 'Bash', input: { command: 'rm -rf /' } });
+      const result = await resolveImmediateToolDecision(deps, params);
+      expect(result).toBeNull();
+    });
+
+    it('still auto-allows the core internal tools (regression guard)', async () => {
+      // Make sure the tracker entries did not remove or break the core internal
+      // tools (now on the eager `nimbalyst` server).
+      expect(INTERNAL_MCP_TOOLS).toContain('mcp__nimbalyst__update_session_meta');
+      expect(INTERNAL_MCP_TOOLS).toContain('mcp__nimbalyst__display_to_user');
+      expect(INTERNAL_MCP_TOOLS).toContain('mcp__nimbalyst__capture_editor_screenshot');
     });
   });
 

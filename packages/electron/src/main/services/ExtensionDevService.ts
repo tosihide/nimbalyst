@@ -1,4 +1,4 @@
-import { ClaudeCodeProvider, OpenAICodexProvider, OpenAICodexACPProvider, OpenCodeProvider } from '@nimbalyst/runtime/ai/server';
+import { configureMcpServers } from '@nimbalyst/runtime/ai/server';
 import { BrowserWindow } from 'electron';
 import {
   startExtensionDevServer,
@@ -147,11 +147,9 @@ export class ExtensionDevService {
         this.serverPort = port;
         console.log(`[ExtensionDevService] MCP server started on port ${port}`);
 
-        // Inject the port into agent providers so they can configure the MCP server
-        ClaudeCodeProvider.setExtensionDevServerPort(port);
-        OpenAICodexProvider.setExtensionDevServerPort(port);
-        OpenAICodexACPProvider.setExtensionDevServerPort(port);
-        OpenCodeProvider.setExtensionDevServerPort(port);
+        // Inject the port into the shared MCP-server config (one place; every
+        // provider + the CLI launcher read it via getMcpConfigService).
+        configureMcpServers({ extensionDevServerPort: port });
 
         this.started = true;
       } catch (error) {
@@ -175,10 +173,7 @@ export class ExtensionDevService {
 
     try {
       await shutdownExtensionDevServer();
-      ClaudeCodeProvider.setExtensionDevServerPort(null);
-      OpenAICodexProvider.setExtensionDevServerPort(null);
-      OpenAICodexACPProvider.setExtensionDevServerPort(null);
-      OpenCodeProvider.setExtensionDevServerPort(null);
+      configureMcpServers({ extensionDevServerPort: null });
       this.serverPort = null;
       this.started = false;
       console.log('[ExtensionDevService] Shutdown complete');

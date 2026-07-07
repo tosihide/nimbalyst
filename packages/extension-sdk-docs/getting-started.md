@@ -235,6 +235,8 @@ Claude will use the `extension_build` and `extension_install` tools to compile a
 - Add AI tools so Claude can interact with your editor
 - Add a toolbar with actions
 - Handle more complex file formats
+- Extend the built-in markdown editor or transcript renderer with
+  [contribution-points.md](./contribution-points.md)
 
 See the [custom-editors.md](./custom-editors.md) guide for more advanced editor development.
 

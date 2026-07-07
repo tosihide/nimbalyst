@@ -13,14 +13,17 @@
  * - FileChangeWidget (collapsed/expanded, file list)
  * - InteractivePromptWidget (permission and question prompt types)
  * - UpdateSessionMetaWidget (name/phase/tags transitions, fallback states)
+ * - TrackerToolWidget (structured tracker results, legacy tag normalization)
  */
 
 import React from 'react';
 import { describe, expect, it, vi, beforeEach } from 'vitest';
-import { render, screen, fireEvent } from '@testing-library/react';
+import * as rtl from '@testing-library/react';
 import { createStore, Provider as JotaiProvider } from 'jotai';
 import type { TranscriptViewMessage } from '../../../../ai/server/transcript/TranscriptProjector';
 import type { CustomToolWidgetProps } from '../CustomToolWidgets/index';
+
+const { render, screen, fireEvent } = rtl;
 
 // Mock clipboard
 vi.mock('../../../../utils/clipboard', () => ({
@@ -165,6 +168,67 @@ describe('MessageSegment', () => {
     // Should have error styling (red background)
     const errorDiv = container.querySelector('.text-nim-error');
     expect(errorDiv).not.toBeNull();
+  });
+
+  it('renders the Codex auth required CTA when isCodexAuthRequired is set', () => {
+    const message = makeMessage({
+      type: 'system_message',
+      text: 'Error: Sign in to OpenAI Codex to continue.',
+      isError: true,
+      isCodexAuthRequired: true,
+    });
+    const { container } = render(
+      <MessageSegment
+        message={message}
+        isUser={false}
+        showToolCalls={false}
+        showThinking={false}
+        expandedTools={new Set()}
+        onToggleToolExpand={() => {}}
+        shouldShowLoginWidget={true}
+      />
+    );
+    const widget = container.querySelector('[data-testid="codex-auth-required-widget"]');
+    expect(widget).not.toBeNull();
+    expect(widget?.textContent ?? '').toMatch(/Sign in to OpenAI Codex to continue/i);
+    const signInBtn = container.querySelector('[data-testid="codex-auth-required-sign-in"]') as HTMLButtonElement | null;
+    expect(signInBtn).not.toBeNull();
+
+    // Generic error styling MUST NOT appear when the CTA takes over.
+    expect(container.querySelector('.text-nim-error')).toBeNull();
+
+    const events: Array<{ anchor?: string }> = [];
+    const listener = (e: Event) => {
+      events.push((e as CustomEvent<{ anchor?: string }>).detail);
+    };
+    window.addEventListener('nimbalyst:open-codex-auth-settings', listener);
+    try {
+      fireEvent.click(signInBtn!);
+    } finally {
+      window.removeEventListener('nimbalyst:open-codex-auth-settings', listener);
+    }
+    expect(events).toEqual([{ anchor: 'codex-auth-section' }]);
+  });
+
+  it('suppresses the Codex auth CTA when shouldShowLoginWidget is false', () => {
+    const message = makeMessage({
+      type: 'system_message',
+      text: 'Error: Sign in to OpenAI Codex to continue.',
+      isError: true,
+      isCodexAuthRequired: true,
+    });
+    const { container } = render(
+      <MessageSegment
+        message={message}
+        isUser={false}
+        showToolCalls={false}
+        showThinking={false}
+        expandedTools={new Set()}
+        onToggleToolExpand={() => {}}
+        shouldShowLoginWidget={false}
+      />
+    );
+    expect(container.querySelector('[data-testid="codex-auth-required-widget"]')).toBeNull();
   });
 
   it('renders context limit widget for context limit errors', () => {
@@ -406,7 +470,7 @@ describe('EditToolResultCard', () => {
   it('renders file path and edit count for single edit', () => {
     const message = makeToolMessage('Edit', {
       file_path: '/workspace/src/app.ts',
-    });
+    }, { success: true }); // tool_result observed -> "Applied" (NIM-806 gating)
     const edits = [{ old_string: 'foo', new_string: 'bar' }];
     render(
       <EditToolResultCard
@@ -425,7 +489,7 @@ describe('EditToolResultCard', () => {
   it('renders "Created" status for new file edits', () => {
     const message = makeToolMessage('Write', {
       file_path: '/workspace/new-file.ts',
-    });
+    }, { success: true }); // tool_result observed -> "Created" (NIM-806 gating)
     const edits = [{ content: 'export const x = 1;\n' }];
     render(
       <EditToolResultCard
@@ -435,6 +499,29 @@ describe('EditToolResultCard', () => {
       />
     );
     expect(screen.getByText('Created')).toBeDefined();
+  });
+
+  it('renders "Pending" status while no tool_result is observed yet (awaiting approval/execution)', () => {
+    // NIM-806: for the genuine claude-code-cli, the proxy emits the Write
+    // tool_use at message_stop — BEFORE the user approves the native/widget
+    // permission prompt and before the file is actually written. The real
+    // tool_result only rides the NEXT request body. So a card with no result
+    // must NOT claim "Created"/"Applied"; it shows a pending state until the
+    // tool_result arrives (or "Failed" if it errors).
+    const message = makeToolMessage('Write', {
+      file_path: '/workspace/new-file.ts',
+    }); // no result -> status 'running', toolCall.result undefined
+    const edits = [{ content: 'export const x = 1;\n' }];
+    render(
+      <EditToolResultCard
+        toolMessage={message}
+        edits={edits}
+        workspacePath="/workspace"
+      />
+    );
+    expect(screen.getByText('Pending')).toBeDefined();
+    expect(screen.queryByText('Created')).toBeNull();
+    expect(screen.queryByText('Applied')).toBeNull();
   });
 
   it('renders "Failed" status for error', () => {
@@ -463,6 +550,41 @@ describe('EditToolResultCard', () => {
     );
     expect(container.innerHTML).toBe('');
   });
+
+  it('does not append embedded secondary files when the primary edited file is markdown', () => {
+    const message = makeToolMessage('Edit', {
+      file_path: '/workspace/nimbalyst-local/plans/formula-sheet-editor.md',
+    });
+    const edits = [
+      {
+        filePath: '/workspace/nimbalyst-local/plans/formula-sheet-editor.md',
+        old_string: 'old',
+        new_string: 'new',
+      },
+      {
+        filePath: '/workspace/nimbalyst-local/plans/formula-sheet-editor.excalidraw',
+        content: '{"type":"excalidraw"}',
+      },
+    ];
+    const renderEmbeddedFile = vi.fn(({ filePath }: { filePath: string }) => (
+      <div data-testid="embedded-preview">{filePath}</div>
+    ));
+
+    render(
+      <EditToolResultCard
+        toolMessage={message}
+        edits={edits}
+        workspacePath="/workspace"
+        renderEmbeddedFile={renderEmbeddedFile}
+        canEmbedFile={(filePath: string) => filePath.endsWith('.excalidraw')}
+      />
+    );
+
+    expect(renderEmbeddedFile).not.toHaveBeenCalled();
+    expect(screen.queryByTestId('embedded-preview')).toBeNull();
+    expect(screen.getAllByText(/formula-sheet-editor\.md/).length).toBeGreaterThan(0);
+    expect(screen.queryByText(/formula-sheet-editor\.excalidraw/)).toBeNull();
+  });
 });
 
 // ============================================================================
@@ -477,7 +599,13 @@ describe('ToolPermissionWidget', () => {
     ToolPermissionWidget = mod.ToolPermissionWidget;
   });
 
-  it('renders pending state without host (shows "Waiting...")', () => {
+  it('renders pending state with action buttons and reconnecting note when host is null', () => {
+    // Before #276: the widget rendered a button-less "Waiting..." shell when
+    // the interactiveWidgetHost atom captured a null host, leaving the user
+    // stuck with no way to approve or deny. After: the full interactive
+    // action row renders, plus a visible "Reconnecting" note so the user
+    // knows what's happening. Click handlers fall back to an imperative
+    // host lookup at click time, so the buttons stay actionable.
     const message = makeToolMessage('ToolPermission', {
       requestId: 'req-1',
       toolName: 'Bash',
@@ -496,7 +624,9 @@ describe('ToolPermissionWidget', () => {
     );
     expect(screen.getByTestId('tool-permission-widget')).toBeDefined();
     expect(screen.getByTestId('tool-permission-widget').dataset.state).toBe('pending');
-    expect(screen.getByText('Waiting...')).toBeDefined();
+    expect(screen.getByTestId('tool-permission-host-reconnecting')).toBeDefined();
+    expect(screen.getByTestId('tool-permission-deny')).toBeDefined();
+    expect(screen.getByTestId('tool-permission-allow-once')).toBeDefined();
   });
 
   it('renders granted state from tool result', () => {
@@ -617,6 +747,17 @@ describe('AskUserQuestionWidget', () => {
     expect(screen.getByTestId('ask-user-question-widget')).toBeDefined();
     expect(screen.getByTestId('ask-user-question-widget').dataset.state).toBe('pending');
     expect(screen.getByText('Waiting...')).toBeDefined();
+    // Regression: even without a host, the question options must render so the
+    // user can read them. Previously the no-host branch returned a bare
+    // "Waiting..." header with no body, which left the widget looking broken
+    // after switching to Files mode and back.
+    const options = screen.getAllByTestId('ask-user-question-option');
+    expect(options.length).toBe(2);
+    expect(screen.getByText('React')).toBeDefined();
+    expect(screen.getByText('Vue')).toBeDefined();
+    // Submit must stay disabled until the host arrives.
+    expect((screen.getByTestId('ask-user-question-submit') as HTMLButtonElement).disabled).toBe(true);
+    expect((screen.getByTestId('ask-user-question-cancel') as HTMLButtonElement).disabled).toBe(true);
   });
 
   it('renders completed state with answers', () => {
@@ -759,6 +900,8 @@ describe('AskUserQuestionWidget', () => {
       worktreeId: null,
       askUserQuestionSubmit: vi.fn().mockResolvedValue(undefined),
       askUserQuestionCancel: vi.fn().mockResolvedValue(undefined),
+      requestUserInputSubmit: vi.fn().mockResolvedValue(undefined),
+      requestUserInputCancel: vi.fn().mockResolvedValue(undefined),
       exitPlanModeApprove: vi.fn().mockResolvedValue(undefined),
       exitPlanModeStartNewSession: vi.fn().mockResolvedValue(undefined),
       exitPlanModeDeny: vi.fn().mockResolvedValue(undefined),
@@ -842,6 +985,73 @@ describe('AskUserQuestionWidget', () => {
     );
     expect(container.innerHTML).toBe('');
     expect(warnSpy).toHaveBeenCalled();
+    warnSpy.mockRestore();
+  });
+
+  it('does not crash when a question is missing its options array (issue #618)', () => {
+    // Regression: the model called AskUserQuestion with a non-select field shape
+    // (e.g. editText/confirm) that has no `options`. Before the parseQuestions
+    // hardening this threw "Cannot read properties of undefined (reading 'map')"
+    // in both the pending and completed render branches. A malformed question
+    // must be dropped, and any valid sibling question must still render.
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const message = makeToolMessage('AskUserQuestion', {
+      questions: [
+        // Malformed: no options array at all.
+        { question: 'Free text?', header: 'Text', type: 'editText' },
+        // Valid sibling that must survive.
+        {
+          question: 'Which framework?',
+          header: 'Framework',
+          options: [
+            { label: 'React', description: 'Component library' },
+            { label: 'Vue', description: 'Progressive framework' },
+          ],
+          multiSelect: false,
+        },
+      ],
+    });
+    expect(() =>
+      render(
+        <Wrapper>
+          <AskUserQuestionWidget
+            message={message}
+            isExpanded={false}
+            onToggle={() => {}}
+            sessionId="issue-618"
+          />
+        </Wrapper>
+      )
+    ).not.toThrow();
+    // The valid question renders; the malformed one is dropped.
+    expect(screen.getByText('Which framework?')).toBeDefined();
+    expect(screen.queryByText('Free text?')).toBeNull();
+    expect(screen.getAllByTestId('ask-user-question-option').length).toBe(2);
+    expect(warnSpy).toHaveBeenCalled();
+    warnSpy.mockRestore();
+  });
+
+  it('returns null when every question is malformed (issue #618)', () => {
+    // All questions lack options -> nothing renderable -> widget renders nothing
+    // rather than a "Widget failed to render" error card.
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const message = makeToolMessage('AskUserQuestion', {
+      questions: [
+        { question: 'Confirm?', header: 'Confirm', type: 'confirm' },
+        { question: 'Free text?', header: 'Text', type: 'editText' },
+      ],
+    });
+    const { container } = render(
+      <Wrapper>
+        <AskUserQuestionWidget
+          message={message}
+          isExpanded={false}
+          onToggle={() => {}}
+          sessionId="issue-618-all-bad"
+        />
+      </Wrapper>
+    );
+    expect(container.innerHTML).toBe('');
     warnSpy.mockRestore();
   });
 });
@@ -938,6 +1148,80 @@ describe('GitCommitConfirmationWidget', () => {
     const widget = screen.getByTestId('git-commit-widget');
     expect(widget.dataset.state).toBe('cancelled');
     expect(screen.getByTestId('git-commit-cancelled')).toBeDefined();
+  });
+
+  it('renders error state from tool result', () => {
+    const message = makeToolMessage(
+      'git_commit_proposal',
+      {
+        commitMessage: 'feat: failing commit',
+        filesToStage: ['src/file.ts'],
+      },
+      { action: 'error', error: 'HOOK_DETAIL: lint failed' }
+    );
+    render(
+      <Wrapper>
+        <GitCommitConfirmationWidget
+          message={message}
+          isExpanded={false}
+          onToggle={() => {}}
+          sessionId="error-commit"
+        />
+      </Wrapper>
+    );
+    const widget = screen.getByTestId('git-commit-widget');
+    expect(widget.dataset.state).toBe('error');
+    expect(screen.getByText('Commit Failed')).toBeDefined();
+    expect(screen.getByTestId('git-commit-error').textContent).toContain('HOOK_DETAIL: lint failed');
+  });
+
+  it('sends cancel through the interactive host', async () => {
+    const { interactiveWidgetHostAtom } = await import('../../../../store/atoms/interactiveWidgetHost');
+
+    const message = makeToolMessage('git_commit_proposal', {
+      commitMessage: 'fix: cancel from mobile',
+      filesToStage: ['src/file.ts'],
+    });
+
+    const testStore = createStore();
+    const gitCommitCancel = vi.fn().mockResolvedValue(undefined);
+    testStore.set(interactiveWidgetHostAtom('cancel-session'), {
+      sessionId: 'cancel-session',
+      workspacePath: '/',
+      worktreeId: null,
+      askUserQuestionSubmit: vi.fn().mockResolvedValue(undefined),
+      askUserQuestionCancel: vi.fn().mockResolvedValue(undefined),
+      requestUserInputSubmit: vi.fn().mockResolvedValue(undefined),
+      requestUserInputCancel: vi.fn().mockResolvedValue(undefined),
+      exitPlanModeApprove: vi.fn().mockResolvedValue(undefined),
+      exitPlanModeStartNewSession: vi.fn().mockResolvedValue(undefined),
+      exitPlanModeDeny: vi.fn().mockResolvedValue(undefined),
+      exitPlanModeCancel: vi.fn().mockResolvedValue(undefined),
+      toolPermissionSubmit: vi.fn().mockResolvedValue(undefined),
+      toolPermissionCancel: vi.fn().mockResolvedValue(undefined),
+      autoCommitEnabled: false,
+      setAutoCommitEnabled: vi.fn(),
+      gitCommit: vi.fn().mockResolvedValue({ success: true }),
+      gitCommitCancel,
+      superLoopBlockedFeedback: vi.fn().mockResolvedValue({ success: true }),
+      openFile: vi.fn().mockResolvedValue(undefined),
+      trackEvent: vi.fn(),
+    });
+
+    render(
+      <JotaiProvider store={testStore}>
+        <GitCommitConfirmationWidget
+          message={message}
+          isExpanded={false}
+          onToggle={() => {}}
+          sessionId="cancel-session"
+        />
+      </JotaiProvider>
+    );
+
+    fireEvent.click(screen.getByTestId('git-commit-cancel'));
+
+    expect(gitCommitCancel).toHaveBeenCalledTimes(1);
   });
 
   it('returns null when no tool call', () => {
@@ -1331,12 +1615,50 @@ describe('ToolCallChanges', () => {
   it('returns null when not expanded', () => {
     const { container } = render(
       <ToolCallChanges
-        toolCallItemId="tc-1"
-        getToolCallDiffs={async () => null}
+        diffs={null}
         isExpanded={false}
       />
     );
     expect(container.innerHTML).toBe('');
+  });
+
+  it('does not render embedded secondary files when the first changed file is markdown', async () => {
+    const renderEmbeddedFile = vi.fn(({ filePath }: { filePath: string }) => (
+      <div data-testid="embedded-preview">{filePath}</div>
+    ));
+
+    render(
+      <ToolCallChanges
+        diffs={[
+          {
+            filePath: '/workspace/nimbalyst-local/plans/formula-sheet-editor.md',
+            operation: 'edit',
+            diffs: [{ oldString: 'old', newString: 'new' }],
+            linesAdded: 1,
+            linesRemoved: 1,
+          },
+          {
+            filePath: '/workspace/nimbalyst-local/plans/formula-sheet-editor.excalidraw',
+            operation: 'create',
+            diffs: [],
+            content: '{"type":"excalidraw"}',
+            linesAdded: 1,
+            linesRemoved: 0,
+          },
+        ]}
+        isExpanded={true}
+        workspacePath="/workspace"
+        renderEmbeddedFile={renderEmbeddedFile}
+        canEmbedFile={(filePath: string) => filePath.endsWith('.excalidraw')}
+      />
+    );
+
+    fireEvent.click(screen.getByText('File Changes'));
+
+    expect(renderEmbeddedFile).not.toHaveBeenCalled();
+    expect(screen.queryByTestId('embedded-preview')).toBeNull();
+    expect(screen.getAllByText(/formula-sheet-editor\.md/).length).toBeGreaterThan(0);
+    expect(screen.queryByText(/formula-sheet-editor\.excalidraw/)).toBeNull();
   });
 });
 
@@ -1581,6 +1903,50 @@ describe('UpdateSessionMetaWidget', () => {
   });
 });
 
+describe('TrackerToolWidget', () => {
+  let TrackerToolWidget: React.FC<CustomToolWidgetProps>;
+
+  beforeEach(async () => {
+    const mod = await import('../CustomToolWidgets/TrackerToolWidget');
+    TrackerToolWidget = mod.TrackerToolWidget;
+  });
+
+  it('normalizes legacy string tag values before rendering tracker_update diffs', () => {
+    const result = {
+      structured: {
+        action: 'updated',
+        id: 'bug_123',
+        type: 'bug',
+        typeTags: ['bug'],
+        title: 'Fix transcript widget crash',
+        changes: {
+          tags: {
+            from: 'alpha, beta',
+            to: ['beta', 'gamma'],
+          },
+        },
+      },
+      summary: 'Updated tracker item',
+    };
+
+    render(
+      <Wrapper>
+        <TrackerToolWidget
+          message={makeToolMessage('tracker_update', { id: 'bug_123' }, JSON.stringify(result))}
+          isExpanded={false}
+          onToggle={() => {}}
+          sessionId="tracker-tag-normalization"
+        />
+      </Wrapper>
+    );
+
+    expect(screen.getByText('Tracker Updated')).toBeDefined();
+    expect(screen.getByText('#alpha')).toBeDefined();
+    expect(screen.getByText('#beta')).toBeDefined();
+    expect(screen.getByText('#gamma')).toBeDefined();
+  });
+});
+
 describe('EditorScreenshotWidget', () => {
   let EditorScreenshotWidget: React.FC<CustomToolWidgetProps>;
 
@@ -1623,4 +1989,3 @@ describe('EditorScreenshotWidget', () => {
     expect(img?.getAttribute('src')).toContain('data:image/png;base64,');
   });
 });
-

@@ -91,7 +91,14 @@ Runs the extension's build step, zips it into a `.nimext` file in `dist/`, and w
 ./scripts/build-all-extensions.sh
 ```
 
-Finds all extensions in `packages/extensions/` that have a `manifest.json` and builds each one.
+Builds the curated release set listed in `release-extensions.txt`. That file is the source of truth for which extensions are public right now, including external extension repos that live alongside the monorepo. The script clears stale `.nimext` packages and `registry.json` from `dist/` before rebuilding.
+
+Each line in `release-extensions.txt` is a path relative to `packages/marketplace/`. Append `|skip-build` for external repos that should package their checked-in `dist/` output instead of running a local build, for example:
+
+```text
+../extensions/csv-spreadsheet
+../../../nimbalyst-mindmap|skip-build
+```
 
 ### Generate the registry
 
@@ -139,6 +146,30 @@ npm run deploy:production
 ```
 
 The deploy script bumps the version in `package.json`, passes it to the Worker as a build-time define, and runs `wrangler deploy`.
+
+## Cloudflare account isolation
+
+This Worker deploys to the **Nimbalyst** Cloudflare account
+(`454b0e55f2d7f9abc0d52d4217ecdc3c`). Every npm script and shell script
+that shells out to wrangler sets:
+
+```
+XDG_CONFIG_HOME="$HOME/.config/nimbalyst"
+```
+
+Wrangler reads its OAuth tokens from `~/.config/nimbalyst/.wrangler/`,
+isolated from any other Cloudflare accounts on this machine. The same
+`XDG_CONFIG_HOME` is reused by `packages/collabv3` and
+`packages/collabv3-metrics` so one `npm run login` covers all three.
+
+Always go through the npm scripts. Running `wrangler` directly from the
+shell will use the default config dir and may pick a different account.
+
+```bash
+npm run login        # one-time: sign in to the Nimbalyst account
+npm run whoami       # sanity-check the active account
+npm run wrangler -- <subcommand>   # any unaliased wrangler command
+```
 
 ## Infrastructure Setup (one-time)
 

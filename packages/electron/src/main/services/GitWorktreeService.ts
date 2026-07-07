@@ -13,6 +13,7 @@
  */
 
 import simpleGit, { SimpleGit } from 'simple-git';
+import { simpleGitWithHookEnv } from './gitEnv';
 import * as path from 'path';
 import * as fs from 'fs';
 import { ulid } from 'ulid';
@@ -21,6 +22,20 @@ import { getAllFilesInDirectory } from '../utils/fileUtils';
 import { gitOperationLock } from './GitOperationLock';
 
 const logger = log.scope('GitWorktreeService');
+
+/**
+ * Thrown when a workspace's git repository has no commits yet, so HEAD
+ * does not resolve to a tree-ish. Worktree operations cannot proceed.
+ */
+export class WorkspaceHasNoCommitsError extends Error {
+  constructor(workspacePath: string) {
+    super(
+      `Workspace '${workspacePath}' has no commits yet, so worktrees cannot be created. ` +
+      `Make an initial commit, or open a different folder that already has commits.`
+    );
+    this.name = 'WorkspaceHasNoCommitsError';
+  }
+}
 
 /**
  * Worktree data structure (matches runtime types)
@@ -674,6 +689,33 @@ export class GitWorktreeService {
   }
 
   /**
+   * Throws WorkspaceHasNoCommitsError if the repo's HEAD does not resolve
+   * to a commit. This is the empty-repo case (`git init` ran, no commits).
+   * Cheap pre-flight that lets callers fail fast with a friendly message
+   * before any worktree-record or session-row gets created.
+   */
+  async validateWorkspaceHasCommits(workspacePath: string): Promise<void> {
+    if (!workspacePath) {
+      throw new Error('workspacePath is required');
+    }
+    // Differentiate "not a git repo at all" from "git repo with no commits".
+    // simple-git's checkIsRepo defaults to IN_TREE which walks UP the directory
+    // tree and would return true if any ancestor has a .git. We need the
+    // workspacePath itself to be the repo root for worktree ops, so do a
+    // direct fs check for `.git` (file or directory - submodules use a file).
+    const gitMeta = path.join(workspacePath, '.git');
+    if (!fs.existsSync(gitMeta)) {
+      throw new Error(`Not a git repository: ${workspacePath}`);
+    }
+    const git: SimpleGit = simpleGit(workspacePath);
+    try {
+      await git.raw(['rev-parse', '--verify', 'HEAD']);
+    } catch {
+      throw new WorkspaceHasNoCommitsError(workspacePath);
+    }
+  }
+
+  /**
    * Get the current branch of a git repository (private helper)
    * @private
    */
@@ -683,7 +725,14 @@ export class GitWorktreeService {
       return branch.trim();
     } catch (error) {
       logger.error('Failed to get current branch', { error });
-      throw new Error(`Failed to get current branch: ${error instanceof Error ? error.message : String(error)}`);
+      const message = error instanceof Error ? error.message : String(error);
+      // Recognize the empty-repo failure mode and rethrow as a typed error
+      // so callers can show a friendly message. Git emits this stderr when
+      // HEAD points at a symbolic ref whose target does not exist (no commits).
+      if (message.includes("ambiguous argument 'HEAD'")) {
+        throw new WorkspaceHasNoCommitsError('repository');
+      }
+      throw new Error(`Failed to get current branch: ${message}`);
     }
   }
 
@@ -1146,7 +1195,7 @@ ${newLines.map(line => '+' + line).join('\n')}`;
       throw new Error('worktreePath is required');
     }
 
-    logger.info('Getting worktree commits', { worktreePath, baseBranchOverride });
+    // logger.info('Getting worktree commits', { worktreePath, baseBranchOverride });
 
     const git: SimpleGit = simpleGit(worktreePath);
 
@@ -1272,7 +1321,7 @@ ${newLines.map(line => '+' + line).join('\n')}`;
         }
       }
 
-      logger.info('Found worktree commits', { count: commits.length });
+      // logger.info('Found worktree commits', { count: commits.length });
       return commits;
     } catch (error) {
       logger.error('Failed to get worktree commits', { error, worktreePath });
@@ -1308,7 +1357,7 @@ ${newLines.map(line => '+' + line).join('\n')}`;
   private async commitChangesImpl(worktreePath: string, message: string, files?: string[]): Promise<CommitInfo> {
     logger.info('Committing changes', { worktreePath, message, fileCount: files?.length });
 
-    const git: SimpleGit = simpleGit(worktreePath);
+    const git: SimpleGit = simpleGitWithHookEnv(worktreePath);
 
     try {
       // CRITICAL: Check git state before committing
@@ -1401,8 +1450,8 @@ ${newLines.map(line => '+' + line).join('\n')}`;
   private async mergeToMainImpl(worktreePath: string, mainRepoPath: string): Promise<MergeResult> {
     logger.info('Merging worktree to main', { worktreePath, mainRepoPath });
 
-    const worktreeGit: SimpleGit = simpleGit(worktreePath);
-    const mainGit: SimpleGit = simpleGit(mainRepoPath);
+    const worktreeGit: SimpleGit = simpleGitWithHookEnv(worktreePath);
+    const mainGit: SimpleGit = simpleGitWithHookEnv(mainRepoPath);
 
     try {
       // CRITICAL: Check git state before any operations
@@ -1913,7 +1962,7 @@ ${newLines.map(line => '+' + line).join('\n')}`;
   }> {
     logger.info('Rebasing worktree from base branch', { worktreePath, baseBranch });
 
-    const git: SimpleGit = simpleGit(worktreePath);
+    const git: SimpleGit = simpleGitWithHookEnv(worktreePath);
 
     try {
       // CRITICAL: Check git state before any operations
@@ -2192,7 +2241,7 @@ ${newLines.map(line => '+' + line).join('\n')}`;
       throw new Error('worktreePath is required');
     }
 
-    logger.info('Getting changed files', { worktreePath });
+    // logger.info('Getting changed files', { worktreePath });
 
     const git: SimpleGit = simpleGit(worktreePath);
 
@@ -2239,7 +2288,7 @@ ${newLines.map(line => '+' + line).join('\n')}`;
         changedFiles.push({ path: file.path, status, staged });
       }
 
-      logger.info('Found changed files', { count: changedFiles.length });
+      // logger.info('Found changed files', { count: changedFiles.length });
       return changedFiles;
     } catch (error) {
       logger.error('Failed to get changed files', { error, worktreePath });
@@ -2331,7 +2380,7 @@ ${newLines.map(line => '+' + line).join('\n')}`;
   private async squashCommitsImpl(worktreePath: string, commitHashes: string[], message: string): Promise<string> {
     logger.info('Squashing commits', { worktreePath, commitCount: commitHashes.length });
 
-    const git: SimpleGit = simpleGit(worktreePath);
+    const git: SimpleGit = simpleGitWithHookEnv(worktreePath);
 
     // Create backup branch name with timestamp
     const backupBranchName = `backup-before-squash-${Date.now()}`;

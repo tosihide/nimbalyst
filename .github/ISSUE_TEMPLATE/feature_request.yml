@@ -1,7 +1,8 @@
 name: Feature request
 description: Suggest a concrete new feature or capability
 title: "[Feature]: "
-labels: ["type:feature", "status:needs-triage"]
+type: Feature
+labels: ["status:needs-triage"]
 body:
   - type: markdown
     attributes:

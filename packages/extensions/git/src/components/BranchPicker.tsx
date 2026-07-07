@@ -208,9 +208,11 @@ export function BranchPicker({ branches, current, onChange }: BranchPickerProps)
 
   const hasLocal = localTree.leaves.length > 0 || Object.keys(localTree.folders).length > 0;
   const hasRemotes = remoteEntries.length > 0;
-  const displayLabel = current.startsWith('remotes/')
-    ? current.slice('remotes/'.length)
-    : current;
+  const displayLabel = current === 'HEAD'
+    ? 'Detached HEAD'
+    : current.startsWith('remotes/')
+      ? current.slice('remotes/'.length)
+      : current;
 
   return (
     <>

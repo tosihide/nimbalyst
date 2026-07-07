@@ -29,6 +29,12 @@ public final class AppState: ObservableObject {
     /// The user needs to re-pair their device from the desktop QR code.
     @Published public var needsRepair: Bool = false
 
+    /// When true, sync has been failing with auth-class errors (sustained
+    /// disconnect while authenticated, or repeated refreshSession failures)
+    /// for long enough that the user almost certainly needs to sign in again.
+    /// Drives the in-app SyncAuthDegradedBanner shown above MainNavigationView.
+    @Published public var syncAuthDegraded: Bool = false
+
     /// When true, views should show demo connection indicators (green desktop dot).
     public var screenshotMode: Bool = false
 
@@ -42,6 +48,11 @@ public final class AppState: ObservableObject {
     /// Voice mode agent. One instance shared across the app (iOS only).
     #if os(iOS)
     @Published public private(set) var voiceAgent: VoiceAgent?
+
+    /// Session the UI should navigate to because the voice agent just created it
+    /// on this device. Observed by the navigation views (iPhone stack / iPad
+    /// split) to open the new session. Set back to nil by the view once handled.
+    @Published public var voiceNavigationRequest: String?
     #endif
 
     private var cryptoManager: CryptoManager?
@@ -49,6 +60,35 @@ public final class AppState: ObservableObject {
     public private(set) var documentSyncManager: DocumentSyncManager?
     private var cancellables = Set<AnyCancellable>()
     private var jwtRefreshTimer: Timer?
+
+    // MARK: - Sync auth-degraded tracking
+
+    /// Number of consecutive `.failed` results from `authManager.refreshSession`.
+    /// Reset to 0 on `.success`. At `refreshFailureBannerThreshold` we surface
+    /// the degraded banner; at `refreshFailureEscalationThreshold` we treat the
+    /// situation as `.sessionExpired` and force a logout. Without escalation,
+    /// historically the timer would retry forever -- today's Stytch JWKS
+    /// rotation incident (2026-05-20) silently broke every iOS client because
+    /// refreshSession returned 403 (not 401/404) and 403 mapped to `.failed`.
+    private var consecutiveRefreshFailures: Int = 0
+    private static let refreshFailureBannerThreshold = 3
+    private static let refreshFailureEscalationThreshold = 5
+
+    /// Timestamp of the last `isConnected: true -> false` transition while
+    /// the user was authenticated. Cleared on reconnect, logout, or unpair.
+    /// Used to detect sustained auth-class disconnects.
+    private var disconnectedSinceWhileAuthed: Date?
+
+    /// One-shot timer that re-evaluates `syncAuthDegraded` after the sustained
+    /// disconnect window has elapsed. Rescheduled on each disconnect; cancelled
+    /// on reconnect, logout, or unpair.
+    private var degradedBannerCheckTimer: Timer?
+
+    /// How long sync must stay disconnected (while authenticated) before the
+    /// degraded banner appears. Long enough to ride out normal startup churn
+    /// and short network blips, short enough that a real broken-session day
+    /// (like the JWKS rotation incident) surfaces visibly within a minute.
+    private static let sustainedDisconnectThreshold: TimeInterval = 60
 
     public init() {
         // Initialize analytics early so events can be captured throughout the lifecycle
@@ -144,6 +184,19 @@ public final class AppState: ObservableObject {
         DatabaseManager.deleteDatabase()
         isPaired = false
         isConnected = false
+        clearSyncAuthDegradedState()
+    }
+
+    /// Disconnect sync and log out of Stytch, routing the user to LoginView.
+    /// Pairing and synced data are preserved on this device. Used by the
+    /// SyncAuthDegradedBanner when the user taps "Sign in again", and matches
+    /// what the Settings "Sign Out" button does inline.
+    public func signOutForAuthRecovery() {
+        logger.info("signOutForAuthRecovery invoked")
+        syncManager?.disconnect()
+        authManager.logout()
+        // clearSyncAuthDegradedState() runs via the $isAuthenticated observer
+        // when logout flips isAuthenticated to false.
     }
 
     /// Request a full index sync from the server.
@@ -177,6 +230,11 @@ public final class AppState: ObservableObject {
                     self.setupManagersIfNeeded()
                     self.connectIfReady()
                     self.warmupTranscriptWebViewIfAppropriate()
+                } else {
+                    // Auth lost (logout, session expired, escalation): tear down
+                    // the degraded-banner state so LoginView doesn't render with
+                    // the banner still on screen.
+                    self.clearSyncAuthDegradedState()
                 }
             }
             .store(in: &cancellables)
@@ -360,21 +418,108 @@ public final class AppState: ObservableObject {
         let result = await authManager.refreshSession(serverUrl: serverUrl)
         switch result {
         case .success:
+            consecutiveRefreshFailures = 0
             // Reconnect with fresh JWT
             connectIfReady()
         case .sessionExpired:
             // Session is dead -- log the user out so they see the login screen
             // with an explanation of what happened.
             logger.warning("Session expired, logging out to prompt re-authentication")
-            jwtRefreshTimer?.invalidate()
-            jwtRefreshTimer = nil
-            syncManager?.disconnect()
-            authManager.logout()
-            authManager.authError = "Your session has expired. Please sign in again."
+            handleSessionExpired(reason: "Your session has expired. Please sign in again.")
         case .failed:
-            // Transient failure (network, server error) -- will retry on next timer tick
-            logger.warning("JWT refresh failed (transient), will retry")
+            // Transient failure (network, server error) or non-401/404 server
+            // status that AuthManager couldn't classify as "dead session".
+            // Track consecutive failures so a sustained outage (like Stytch's
+            // 2026-05-20 JWKS rotation, which returned 403) escalates to a
+            // logout + login prompt instead of retrying forever in silence.
+            consecutiveRefreshFailures += 1
+            let count = consecutiveRefreshFailures
+            logger.warning("JWT refresh failed (transient, \(count) consecutive)")
+
+            if count >= AppState.refreshFailureEscalationThreshold {
+                logger.error("JWT refresh has failed \(count) consecutive times; escalating to sessionExpired")
+                handleSessionExpired(reason: "Your session could not be refreshed. Please sign in again.")
+                return
+            }
+            if count >= AppState.refreshFailureBannerThreshold && !syncAuthDegraded {
+                logger.warning("Surfacing degraded banner after \(count) consecutive refresh failures")
+                syncAuthDegraded = true
+            }
         }
+    }
+
+    /// Tear down the JWT refresh timer, disconnect sync, log the user out,
+    /// and surface a reason on the login screen. Shared between the
+    /// AuthManager-reported `.sessionExpired` path and the consecutive-failure
+    /// escalation path.
+    private func handleSessionExpired(reason: String) {
+        jwtRefreshTimer?.invalidate()
+        jwtRefreshTimer = nil
+        syncManager?.disconnect()
+        authManager.logout()
+        authManager.authError = reason
+        // clearSyncAuthDegradedState() runs via the $isAuthenticated observer
+        // when logout flips isAuthenticated to false.
+    }
+
+    // MARK: - Sync degraded-banner tracking
+
+    /// Reset all sync auth-degraded tracking (counter, timestamp, timer,
+    /// banner flag). Called when sync reconnects, when the user logs out
+    /// or is escalated to sessionExpired, and on unpair.
+    private func clearSyncAuthDegradedState() {
+        consecutiveRefreshFailures = 0
+        disconnectedSinceWhileAuthed = nil
+        degradedBannerCheckTimer?.invalidate()
+        degradedBannerCheckTimer = nil
+        if syncAuthDegraded {
+            syncAuthDegraded = false
+        }
+    }
+
+    /// Called whenever the sync manager's connection state changes.
+    /// On reconnect we clear all degraded-state tracking. On disconnect
+    /// (while authenticated) we record the timestamp and schedule a one-shot
+    /// re-evaluation at `sustainedDisconnectThreshold` seconds out.
+    private func handleSyncConnectionChange(connected: Bool) {
+        if connected {
+            clearSyncAuthDegradedState()
+            return
+        }
+        guard authManager.isAuthenticated else { return }
+        if disconnectedSinceWhileAuthed == nil {
+            disconnectedSinceWhileAuthed = Date()
+        }
+        scheduleDegradedBannerCheck()
+    }
+
+    private func scheduleDegradedBannerCheck() {
+        degradedBannerCheckTimer?.invalidate()
+        degradedBannerCheckTimer = Timer.scheduledTimer(
+            withTimeInterval: AppState.sustainedDisconnectThreshold,
+            repeats: false
+        ) { [weak self] _ in
+            Task { @MainActor in
+                self?.evaluateDegradedBanner()
+            }
+        }
+    }
+
+    /// Fires `sustainedDisconnectThreshold` after a disconnect-while-authed.
+    /// If we're still disconnected and still authenticated, surface the
+    /// banner. The user can then either tap "Sign in again" or wait for the
+    /// refresh-failure escalation path (~20 min) to log them out automatically.
+    private func evaluateDegradedBanner() {
+        guard authManager.isAuthenticated else { return }
+        guard !isConnected else { return }
+        guard let since = disconnectedSinceWhileAuthed,
+              Date().timeIntervalSince(since) >= AppState.sustainedDisconnectThreshold else {
+            return
+        }
+        guard !syncAuthDegraded else { return }
+        let elapsed = Int(Date().timeIntervalSince(since))
+        logger.warning("Sync degraded: disconnected for \(elapsed)s while authenticated; surfacing banner")
+        syncAuthDegraded = true
     }
 
     private func setupManagers() {
@@ -432,6 +577,18 @@ public final class AppState: ObservableObject {
             .receive(on: DispatchQueue.main)
             .assign(to: &$isConnected)
 
+        // Drive degraded-banner tracking from the same publisher. We use a
+        // separate subscription because `assign(to:&)` is a terminal Combine
+        // operator -- it doesn't fan out -- and we need to schedule a one-shot
+        // timer on each disconnect rather than just mirror the value.
+        sync.$isConnected
+            .receive(on: DispatchQueue.main)
+            .removeDuplicates()
+            .sink { [weak self] connected in
+                self?.handleSyncConnectionChange(connected: connected)
+            }
+            .store(in: &cancellables)
+
         // Observe encryption key mismatch (wrong pairing / stale key)
         sync.$encryptionKeyMismatch
             .receive(on: DispatchQueue.main)
@@ -446,6 +603,18 @@ public final class AppState: ObservableObject {
         sync.onSessionCompleted = { [weak voice] sessionId, summary in
             Task { @MainActor in
                 voice?.onSessionCompleted(sessionId: sessionId, summary: summary)
+            }
+        }
+
+        // When the voice agent creates a session, switch this device's UI to it.
+        // Only the device that issued the request navigates (matched by requestId);
+        // other paired devices just see the session appear in their list.
+        sync.onSessionCreated = { [weak self, weak voice] requestId, sessionId in
+            Task { @MainActor in
+                guard let self, let voice,
+                      voice.consumePendingCreateSession(requestId: requestId) else { return }
+                voice.activeSessionId = sessionId
+                await self.navigateWhenSessionAvailable(sessionId)
             }
         }
 
@@ -482,6 +651,25 @@ public final class AppState: ObservableObject {
         voice.configure(database: database, syncManager: sync, projectId: projectId)
         #endif
     }
+
+    #if os(iOS)
+    /// Publish a navigation request to the just-created session once its row has
+    /// synced into the local database. The `createSessionResponseBroadcast` can
+    /// arrive before the session's `indexBroadcast`, so we briefly wait for the
+    /// row rather than navigate to a session the views can't yet resolve.
+    @MainActor
+    private func navigateWhenSessionAvailable(_ sessionId: String) async {
+        for _ in 0..<25 { // ~5s max (25 * 200ms)
+            if let db = databaseManager, (try? db.session(byId: sessionId)) != nil {
+                voiceNavigationRequest = sessionId
+                return
+            }
+            try? await Task.sleep(nanoseconds: 200_000_000)
+        }
+        // Fall back: navigate anyway; the view retries the row lookup itself.
+        voiceNavigationRequest = sessionId
+    }
+    #endif
 
     // MARK: - Screenshot Mode
 

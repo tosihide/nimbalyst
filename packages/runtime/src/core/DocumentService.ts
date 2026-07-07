@@ -55,6 +55,54 @@ export type TrackerItemSyncStatus = 'local' | 'synced' | 'pending';
 export type TrackerItemSource = 'native' | 'inline' | 'frontmatter' | 'import';
 
 /**
+ * Pointer to the upstream record an imported tracker item came from.
+ * Carries everything the source chip needs to render (and re-snapshot) even
+ * when the importing extension is uninstalled or offline.
+ */
+export interface ExternalSourceRef {
+  /** Importer contribution id, e.g. 'github-issues', 'linear'. */
+  providerId: string;
+  /** Opaque per-provider identifier (issue number, GID, URL fragment, etc.). */
+  externalId: string;
+  /** Stable URN, namespaced by scheme: 'github://owner/repo#42', 'linear://NIM-123'. */
+  urn: string;
+  /** Canonical URL to open in a browser. */
+  url: string;
+  /** Snapshot of the upstream title at last import (display fallback when provider is offline). */
+  titleSnapshot: string;
+  /** Snapshot of the upstream state at last import (e.g. 'open', 'closed'). */
+  stateSnapshot?: string;
+  /** ISO timestamp of the first import. */
+  importedAt: string;
+  /** ISO timestamp of the most recent refresh. */
+  lastSyncedAt: string;
+  /**
+   * Host-computed hash of the upstream body markdown at last sync. Lets
+   * re-snapshot detect an upstream body change without storing the full body or
+   * diffing Lexical content. Set by the host on import / re-snapshot.
+   */
+  bodyHash?: string;
+  /**
+   * Set by re-snapshot when the upstream body changed since last sync. The
+   * detail view surfaces a banner so the user can apply or dismiss the change
+   * (the body is never auto-overwritten).
+   */
+  upstreamBodyChanged?: boolean;
+}
+
+/**
+ * How a local tracker item entered Nimbalyst. Replaces the loose
+ * `source`/`sourceRef` pair (kept deprecated for one release for back-compat).
+ * Absent on legacy items — default to `{ kind: 'native' }` at read time via
+ * {@link normalizeTrackerOrigin}.
+ */
+export type TrackerOrigin =
+  | { kind: 'native' }
+  | { kind: 'inline'; filePath: string }
+  | { kind: 'frontmatter'; filePath: string }
+  | { kind: 'external'; external: ExternalSourceRef };
+
+/**
  * Identity record for tracker item authorship and attribution.
  * Email is the canonical key for matching users across orgs and login states.
  * Display info is snapshotted at write time for offline rendering.
@@ -124,9 +172,15 @@ export interface TrackerItem {
   archived?: boolean;
   /** When the item was archived */
   archivedAt?: string;
-  /** How the item was created */
+  /**
+   * Structured origin record: how the item entered Nimbalyst and, for imports,
+   * a pointer back to the upstream source. Absent on legacy items — default to
+   * `{ kind: 'native' }` at read time via {@link normalizeTrackerOrigin}.
+   */
+  origin?: TrackerOrigin;
+  /** @deprecated Use {@link origin}. How the item was created. */
   source?: TrackerItemSource;
-  /** Origin reference: file path for inline/frontmatter, 'linear:NIM-123' for imports */
+  /** @deprecated Use {@link origin}. Origin reference: file path for inline/frontmatter, 'linear:NIM-123' for imports. */
   sourceRef?: string;
 
   // Identity fields
@@ -146,8 +200,16 @@ export interface TrackerItem {
   assigneeId?: string;
   /** @deprecated Use reporterEmail instead. Org member ID, per-team scoped. */
   reporterId?: string;
-  /** Labels for categorization */
+  /** Labels for categorization (projection of non-tombstoned entries in `labelsMap`). */
   labels?: string[];
+  /**
+   * Add-wins CRDT map for labels. Each `LabelEntry` has a stable per-element
+   * ID; concurrent additions across peers all survive after union. Tombstoned
+   * entries are excluded from the `labels` projection. Optional because
+   * legacy items written before the CRDT shipped have only `labels`.
+   * See `trackerLabels.ts` for the merge / diff helpers.
+   */
+  labelsMap?: Record<string, { value: string; id: string; tombstone?: true }>;
   /** Linked AI session IDs */
   linkedSessions?: string[];
   /** Linked git commit SHA (deprecated: use linkedCommits) */
@@ -159,9 +221,14 @@ export interface TrackerItem {
   /** Sync status: local (never synced), synced (up to date), pending (queued for sync) */
   syncStatus?: TrackerItemSyncStatus;
 
-  // Field-level LWW timestamps (persisted for sync conflict resolution)
-  /** Per-field timestamps for Last-Write-Wins conflict resolution during sync */
-  fieldUpdatedAt?: Record<string, number>;
+  /**
+   * Body Y.Doc version pointer. Bumped on every body save (phase 4b of
+   * the tracker sync redesign, see D5). Carried through the sync wire
+   * envelope so remote clients can invalidate stale cached body
+   * snapshots without re-reading the Y.Doc. Zero for items whose body
+   * has never been written.
+   */
+  bodyVersion?: number;
 }
 
 /**

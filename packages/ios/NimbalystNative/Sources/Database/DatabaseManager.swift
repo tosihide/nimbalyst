@@ -295,6 +295,8 @@ public final class DatabaseManager: @unchecked Sendable {
 
     /// Recalculate lastUpdatedAt and sessionCount for all projects from their sessions.
     /// This ensures project ordering is correct even if server-side stats are stale.
+    /// sessionCount reflects what the user sees in SessionListView -- archived and
+    /// workstream/blitz containers are excluded.
     public func refreshAllProjectStats() throws {
         try writer.write { db in
             try db.execute(sql: """
@@ -306,6 +308,7 @@ public final class DatabaseManager: @unchecked Sendable {
                         SELECT COUNT(*) FROM sessions
                         WHERE sessions.projectId = projects.id
                           AND COALESCE(sessions.sessionType, 'session') NOT IN ('workstream', 'blitz')
+                          AND sessions.isArchived = 0
                     )
             """)
         }
@@ -344,10 +347,15 @@ public final class DatabaseManager: @unchecked Sendable {
     }
 
     /// Recount sessions for a project and update the stored count.
+    /// Matches the filter applied in SessionListView (and refreshAllProjectStats):
+    /// archived sessions and workstream/blitz container types are excluded so the
+    /// displayed count matches what the user actually sees.
     public func refreshSessionCount(forProject projectId: String) throws {
         try writer.write { db in
             let count = try Session
                 .filter(Session.Columns.projectId == projectId)
+                .filter(Session.Columns.isArchived == false)
+                .filter(Session.Columns.sessionType == nil || (Session.Columns.sessionType != "workstream" && Session.Columns.sessionType != "blitz"))
                 .fetchCount(db)
             try db.execute(
                 sql: "UPDATE projects SET sessionCount = ? WHERE id = ?",
@@ -511,6 +519,15 @@ public final class DatabaseManager: @unchecked Sendable {
     public func document(byId syncId: String) throws -> SyncedDocument? {
         try writer.read { db in
             try SyncedDocument.fetchOne(db, id: syncId)
+        }
+    }
+
+    public func document(forProject projectId: String, relativePath: String) throws -> SyncedDocument? {
+        try writer.read { db in
+            try SyncedDocument
+                .filter(SyncedDocument.Columns.projectId == projectId)
+                .filter(SyncedDocument.Columns.relativePath == relativePath)
+                .fetchOne(db)
         }
     }
 

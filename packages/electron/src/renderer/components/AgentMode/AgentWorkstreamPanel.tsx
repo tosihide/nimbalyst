@@ -16,9 +16,20 @@
  * Clicking a file in any session's sidebar opens it in the workstream editor tabs.
  */
 
-import React, { useCallback, useEffect, useRef, useState, useImperativeHandle, type KeyboardEvent } from 'react';
+import React, { useCallback, useEffect, useLayoutEffect, useRef, useState, useImperativeHandle, type KeyboardEvent } from 'react';
 import { getWorktreeNameFromPath } from '../../utils/pathUtils';
 import { useAtom, useAtomValue, useSetAtom } from 'jotai';
+import {
+  useFloating,
+  offset,
+  flip,
+  shift,
+  FloatingPortal,
+  useClick,
+  useDismiss,
+  useRole,
+  useInteractions,
+} from '@floating-ui/react';
 import { ProviderIcon, MaterialSymbol, SearchReplaceStateManager } from '@nimbalyst/runtime';
 import { WorkstreamEditorTabs, type WorkstreamEditorTabsRef } from './WorkstreamEditorTabs';
 import { WorkstreamSessionTabs } from './WorkstreamSessionTabs';
@@ -58,7 +69,10 @@ import {
 import {
   filesEditedWidthAtom,
   setFilesEditedWidthAtom,
+  sessionHistoryCollapsedAtom,
+  toggleSessionHistoryCollapsedAtom,
 } from '../../store/atoms/agentMode';
+import { useEditorMaximize } from '../../hooks/useEditorMaximize';
 import { ArchiveWorktreeDialog } from './ArchiveWorktreeDialog';
 import { useArchiveWorktreeDialog } from '../../hooks/useArchiveWorktreeDialog';
 import { detectFileType, type SerializableDocumentContext } from '../../hooks/useDocumentContext';
@@ -91,6 +105,292 @@ export interface AgentWorkstreamPanelProps {
 }
 
 /**
+ * Tag pill row that fits as many tags as the container allows on a single line.
+ * Overflowing tags collapse into a "+N" pill that opens a floating dropdown.
+ *
+ * Measurement runs in a hidden layer that mirrors the real pill widths, so the
+ * visible row never has to render-then-clip the overflowing pills.
+ */
+const TAG_PILL_CLASS = "group flex items-center gap-0.5 text-[10px] font-medium leading-none pl-1.5 pr-1 py-0.5 rounded-full whitespace-nowrap cursor-default text-nim-faint bg-[color-mix(in_srgb,var(--nim-text)_8%,transparent)]";
+const TAG_OVERFLOW_PILL_CLASS = "flex items-center gap-0.5 text-[10px] font-medium leading-none px-1.5 py-0.5 rounded-full whitespace-nowrap cursor-pointer text-nim-faint bg-[color-mix(in_srgb,var(--nim-text)_8%,transparent)] hover:bg-[color-mix(in_srgb,var(--nim-text)_14%,transparent)] border-none";
+
+const WorkstreamHeaderTagsRow: React.FC<{ workstreamId: string }> = ({ workstreamId }) => {
+  const tags = useAtomValue(workstreamTagsAtom(workstreamId));
+  const allTags = useAtomValue(sessionKanbanTagsAtom);
+  const registry = useAtomValue(sessionRegistryAtom);
+  const setSessionTags = useSetAtom(setSessionTagsAtom);
+
+  const rootTags = registry.get(workstreamId)?.tags ?? [];
+
+  const [isEditingTags, setIsEditingTags] = useState(false);
+  const [tagInput, setTagInput] = useState('');
+  const tagInputRef = useRef<HTMLInputElement>(null);
+  const tagDropdownRef = useRef<HTMLDivElement>(null);
+
+  const containerRef = useRef<HTMLDivElement>(null);
+  const measureRef = useRef<HTMLDivElement>(null);
+  const [visibleCount, setVisibleCount] = useState(tags.length);
+
+  const [overflowOpen, setOverflowOpen] = useState(false);
+  const { refs: overflowRefs, floatingStyles: overflowFloatingStyles, context: overflowContext } = useFloating({
+    open: overflowOpen,
+    onOpenChange: setOverflowOpen,
+    placement: 'bottom-end',
+    middleware: [offset(6), flip({ padding: 8 }), shift({ padding: 8 })],
+  });
+  const overflowClick = useClick(overflowContext);
+  const overflowDismiss = useDismiss(overflowContext);
+  const overflowRole = useRole(overflowContext, { role: 'menu' });
+  const { getReferenceProps: getOverflowReferenceProps, getFloatingProps: getOverflowFloatingProps } = useInteractions([overflowClick, overflowDismiss, overflowRole]);
+
+  // Close the suggestions dropdown when clicking outside the input.
+  useEffect(() => {
+    if (!isEditingTags) return;
+    const handleClickOutside = (e: MouseEvent) => {
+      if (
+        tagDropdownRef.current && !tagDropdownRef.current.contains(e.target as Node) &&
+        tagInputRef.current && !tagInputRef.current.contains(e.target as Node)
+      ) {
+        setIsEditingTags(false);
+        setTagInput('');
+      }
+    };
+    const handleEscape = (e: globalThis.KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        setIsEditingTags(false);
+        setTagInput('');
+      }
+    };
+    document.addEventListener('mousedown', handleClickOutside);
+    document.addEventListener('keydown', handleEscape);
+    return () => {
+      document.removeEventListener('mousedown', handleClickOutside);
+      document.removeEventListener('keydown', handleEscape);
+    };
+  }, [isEditingTags]);
+
+  useEffect(() => {
+    if (isEditingTags && tagInputRef.current) {
+      tagInputRef.current.focus();
+    }
+  }, [isEditingTags]);
+
+  const handleAddTag = useCallback((tag: string) => {
+    const trimmed = tag.trim().toLowerCase();
+    if (!trimmed || rootTags.includes(trimmed)) return;
+    setSessionTags({ sessionId: workstreamId, tags: [...rootTags, trimmed] });
+    setTagInput('');
+  }, [workstreamId, rootTags, setSessionTags]);
+
+  const handleRemoveTag = useCallback((tag: string) => {
+    setSessionTags({ sessionId: workstreamId, tags: rootTags.filter(t => t !== tag) });
+  }, [workstreamId, rootTags, setSessionTags]);
+
+  const handleTagInputKeyDown = useCallback((e: React.KeyboardEvent<HTMLInputElement>) => {
+    e.stopPropagation();
+    if (e.key === 'Enter' && tagInput.trim()) {
+      e.preventDefault();
+      handleAddTag(tagInput);
+    } else if (e.key === 'Backspace' && !tagInput && rootTags.length > 0) {
+      handleRemoveTag(rootTags[rootTags.length - 1]);
+    } else if (e.key === 'Escape') {
+      setIsEditingTags(false);
+      setTagInput('');
+    }
+  }, [tagInput, rootTags, handleAddTag, handleRemoveTag]);
+
+  const filteredSuggestions = React.useMemo(() => {
+    if (!tagInput.trim()) return [];
+    const q = tagInput.trim().toLowerCase();
+    return allTags
+      .filter(t => t.name.toLowerCase().includes(q) && !tags.includes(t.name))
+      .slice(0, 5);
+  }, [tagInput, allTags, tags]);
+
+  // Content key so the layout effect only re-runs when tag contents change.
+  const tagsKey = tags.join(' ');
+
+  useLayoutEffect(() => {
+    const container = containerRef.current;
+    const measure = measureRef.current;
+    if (!container || !measure) return;
+
+    const compute = () => {
+      const containerWidth = container.clientWidth;
+      if (containerWidth <= 0) return;
+
+      const tagEls = Array.from(measure.querySelectorAll<HTMLElement>('[data-measure-tag]'));
+      const overflowEl = measure.querySelector<HTMLElement>('[data-measure-overflow]');
+      const trailingEl = measure.querySelector<HTMLElement>('[data-measure-trailing]');
+
+      const GAP = 4; // matches gap-1
+      const trailingWidth = trailingEl ? trailingEl.offsetWidth + GAP : 0;
+      const overflowWidth = overflowEl ? overflowEl.offsetWidth + GAP : 0;
+
+      let used = 0;
+      let count = 0;
+      for (let i = 0; i < tagEls.length; i++) {
+        const w = tagEls[i].offsetWidth;
+        const gap = count > 0 ? GAP : 0;
+        const remaining = tagEls.length - i - 1;
+        const overflowReserve = remaining > 0 ? overflowWidth : 0;
+        if (used + gap + w + overflowReserve + trailingWidth > containerWidth) break;
+        used += gap + w;
+        count++;
+      }
+
+      setVisibleCount(count);
+    };
+
+    const ro = new ResizeObserver(compute);
+    ro.observe(container);
+    compute();
+    return () => ro.disconnect();
+  }, [tagsKey, isEditingTags]);
+
+  const visibleTags = tags.slice(0, visibleCount);
+  const hiddenTags = tags.slice(visibleCount);
+  const hasOverflow = hiddenTags.length > 0;
+
+  const renderTrailing = () => (
+    isEditingTags ? (
+      <div className="relative">
+        <input
+          ref={tagInputRef}
+          type="text"
+          className="text-[10px] leading-none py-0.5 px-1.5 rounded-full border border-[var(--nim-border)] bg-[var(--nim-bg-secondary)] text-[var(--nim-text)] outline-none w-[80px]"
+          placeholder="add tag..."
+          value={tagInput}
+          onChange={(e) => setTagInput(e.target.value)}
+          onKeyDown={handleTagInputKeyDown}
+          onBlur={() => {
+            setTimeout(() => {
+              setIsEditingTags(false);
+              setTagInput('');
+            }, 150);
+          }}
+        />
+        {filteredSuggestions.length > 0 && (
+          <div
+            ref={tagDropdownRef}
+            className="absolute top-full left-0 mt-1 min-w-[120px] rounded-md z-[10000] py-0.5 text-[11px] bg-nim border border-nim shadow-[0_4px_12px_rgba(0,0,0,0.3)]"
+          >
+            {filteredSuggestions.map(s => (
+              <div
+                key={s.name}
+                className="px-2 py-1 cursor-pointer text-[var(--nim-text-muted)] hover:bg-[var(--nim-bg-hover)] hover:text-[var(--nim-text)]"
+                onMouseDown={(e) => { e.preventDefault(); handleAddTag(s.name); }}
+              >
+                {s.name} <span className="text-[var(--nim-text-faint)]">({s.count})</span>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+    ) : (
+      <button
+        className="flex items-center justify-center w-4 h-4 rounded-full border border-dashed border-[var(--nim-border)] bg-transparent cursor-pointer text-[var(--nim-text-faint)] hover:border-[var(--nim-text-faint)] hover:text-[var(--nim-text-muted)] transition-colors duration-100"
+        onClick={() => setIsEditingTags(true)}
+        title="Add tag"
+      >
+        <MaterialSymbol icon="add" size={10} />
+      </button>
+    )
+  );
+
+  return (
+    <div
+      ref={containerRef}
+      className="workstream-header-tags self-stretch flex items-center gap-1 flex-nowrap overflow-hidden min-w-0 relative"
+    >
+      {/* Hidden measurement layer. Mirrors visible-pill sizes without taking layout space. */}
+      <div
+        ref={measureRef}
+        aria-hidden
+        className="flex items-center gap-1 absolute left-0 top-0 pointer-events-none invisible"
+      >
+        {tags.map(tag => (
+          <span key={tag} data-measure-tag className={TAG_PILL_CLASS}>
+            {tag}
+            <span className="flex items-center justify-center w-3 h-3 rounded-full">
+              <MaterialSymbol icon="close" size={10} />
+            </span>
+          </span>
+        ))}
+        {tags.length > 0 && (
+          <span data-measure-overflow className={TAG_OVERFLOW_PILL_CLASS}>
+            +{tags.length}
+          </span>
+        )}
+        <div data-measure-trailing>
+          {isEditingTags ? (
+            <span className="inline-block w-[80px] h-[18px] rounded-full border border-[var(--nim-border)]" />
+          ) : (
+            <span className="flex items-center justify-center w-4 h-4 rounded-full border border-dashed border-[var(--nim-border)]">
+              <MaterialSymbol icon="add" size={10} />
+            </span>
+          )}
+        </div>
+      </div>
+
+      {visibleTags.map(tag => (
+        <span key={tag} className={TAG_PILL_CLASS}>
+          {tag}
+          <button
+            className="opacity-0 group-hover:opacity-100 flex items-center justify-center w-3 h-3 rounded-full border-none bg-transparent cursor-pointer text-[var(--nim-text-faint)] hover:text-[var(--nim-text)] transition-opacity duration-100"
+            onClick={() => handleRemoveTag(tag)}
+            title={`Remove tag "${tag}"`}
+          >
+            <MaterialSymbol icon="close" size={10} />
+          </button>
+        </span>
+      ))}
+
+      {hasOverflow && (
+        <>
+          <button
+            ref={overflowRefs.setReference}
+            {...getOverflowReferenceProps()}
+            className={TAG_OVERFLOW_PILL_CLASS}
+            title={`Show ${hiddenTags.length} more tag${hiddenTags.length === 1 ? '' : 's'}`}
+          >
+            +{hiddenTags.length}
+          </button>
+          {overflowOpen && (
+            <FloatingPortal>
+              <div
+                ref={overflowRefs.setFloating}
+                style={overflowFloatingStyles}
+                {...getOverflowFloatingProps()}
+                className="z-[10000] min-w-[140px] max-h-[300px] overflow-y-auto rounded-md py-1 bg-nim border border-nim shadow-[0_4px_12px_rgba(0,0,0,0.3)]"
+              >
+                {hiddenTags.map(tag => (
+                  <div
+                    key={tag}
+                    className="group flex items-center justify-between gap-2 px-2 py-1 text-[11px] text-[var(--nim-text-muted)] hover:bg-[var(--nim-bg-hover)] hover:text-[var(--nim-text)]"
+                  >
+                    <span className="truncate">{tag}</span>
+                    <button
+                      className="flex items-center justify-center w-4 h-4 rounded-full opacity-0 group-hover:opacity-100 text-[var(--nim-text-faint)] hover:text-[var(--nim-text)] bg-transparent border-none cursor-pointer"
+                      onClick={() => handleRemoveTag(tag)}
+                      title={`Remove tag "${tag}"`}
+                    >
+                      <MaterialSymbol icon="close" size={10} />
+                    </button>
+                  </div>
+                ))}
+              </div>
+            </FloatingPortal>
+          )}
+        </>
+      )}
+
+      {renderTrailing()}
+    </div>
+  );
+};
+
+/**
  * Header showing workstream title, provider icon, processing state, and layout controls.
  * Subscribes to atoms directly for isolated re-renders.
  */
@@ -112,9 +412,6 @@ const WorkstreamHeader: React.FC<{
   const layoutMode = useAtomValue(workstreamLayoutModeAtom(workstreamId));
   const hasTabs = useAtomValue(workstreamHasOpenFilesAtom(workstreamId));
   const sessions = useAtomValue(workstreamSessionsAtom(workstreamId));
-  const tags = useAtomValue(workstreamTagsAtom(workstreamId));
-  const allTags = useAtomValue(sessionKanbanTagsAtom);
-  const setSessionTags = useSetAtom(setSessionTagsAtom);
   const [isArchived, setIsArchived] = useAtom(sessionArchivedAtom(workstreamId));
   const setLayoutMode = useSetAtom(setWorkstreamLayoutModeAtom);
   const updateSessionStore = useSetAtom(updateSessionStoreAtom);
@@ -123,12 +420,6 @@ const WorkstreamHeader: React.FC<{
   const [isEditing, setIsEditing] = useState(false);
   const [editValue, setEditValue] = useState(title ?? '');
   const inputRef = useRef<HTMLInputElement>(null);
-
-  // Tag editing state
-  const [isEditingTags, setIsEditingTags] = useState(false);
-  const [tagInput, setTagInput] = useState('');
-  const tagInputRef = useRef<HTMLInputElement>(null);
-  const tagDropdownRef = useRef<HTMLDivElement>(null);
 
   // Terminal button context menu state
   const [terminalContextMenu, setTerminalContextMenu] = useState<{ x: number; y: number } | null>(null);
@@ -167,78 +458,6 @@ const WorkstreamHeader: React.FC<{
     setTerminalContextMenu(null);
     onCreateNewTerminal?.();
   }, [onCreateNewTerminal]);
-
-  // Close tag dropdown when clicking outside
-  useEffect(() => {
-    if (!isEditingTags) return;
-
-    const handleClickOutside = (e: MouseEvent) => {
-      if (
-        tagDropdownRef.current && !tagDropdownRef.current.contains(e.target as Node) &&
-        tagInputRef.current && !tagInputRef.current.contains(e.target as Node)
-      ) {
-        setIsEditingTags(false);
-        setTagInput('');
-      }
-    };
-
-    const handleEscape = (e: globalThis.KeyboardEvent) => {
-      if (e.key === 'Escape') {
-        setIsEditingTags(false);
-        setTagInput('');
-      }
-    };
-
-    document.addEventListener('mousedown', handleClickOutside);
-    document.addEventListener('keydown', handleEscape);
-    return () => {
-      document.removeEventListener('mousedown', handleClickOutside);
-      document.removeEventListener('keydown', handleEscape);
-    };
-  }, [isEditingTags]);
-
-  // Focus tag input when editing starts
-  useEffect(() => {
-    if (isEditingTags && tagInputRef.current) {
-      tagInputRef.current.focus();
-    }
-  }, [isEditingTags]);
-
-  // Get the root session's own tags from registry (what we write to)
-  const registry = useAtomValue(sessionRegistryAtom);
-  const rootTags = registry.get(workstreamId)?.tags ?? [];
-
-  const handleAddTag = useCallback((tag: string) => {
-    const trimmed = tag.trim().toLowerCase();
-    if (!trimmed || rootTags.includes(trimmed)) return;
-    setSessionTags({ sessionId: workstreamId, tags: [...rootTags, trimmed] });
-    setTagInput('');
-  }, [workstreamId, rootTags, setSessionTags]);
-
-  const handleRemoveTag = useCallback((tag: string) => {
-    setSessionTags({ sessionId: workstreamId, tags: rootTags.filter(t => t !== tag) });
-  }, [workstreamId, rootTags, setSessionTags]);
-
-  const handleTagInputKeyDown = useCallback((e: React.KeyboardEvent<HTMLInputElement>) => {
-    e.stopPropagation();
-    if (e.key === 'Enter' && tagInput.trim()) {
-      e.preventDefault();
-      handleAddTag(tagInput);
-    } else if (e.key === 'Backspace' && !tagInput && rootTags.length > 0) {
-      handleRemoveTag(rootTags[rootTags.length - 1]);
-    } else if (e.key === 'Escape') {
-      setIsEditingTags(false);
-      setTagInput('');
-    }
-  }, [tagInput, rootTags, handleAddTag, handleRemoveTag]);
-
-  const filteredSuggestions = React.useMemo(() => {
-    if (!tagInput.trim()) return [];
-    const q = tagInput.trim().toLowerCase();
-    return allTags
-      .filter(t => t.name.toLowerCase().includes(q) && !tags.includes(t.name))
-      .slice(0, 5);
-  }, [tagInput, allTags, tags]);
 
   // A workstream has children if there are multiple sessions
   const hasChildren = sessions.length > 1;
@@ -336,7 +555,7 @@ const WorkstreamHeader: React.FC<{
   }, [workstreamId, onArchiveStatusChange, updateSessionStore]);
 
   return (
-    <div className="workstream-header shrink-0 h-12 px-4 border-b border-[var(--nim-border)] bg-[var(--nim-bg)]">
+    <div className="workstream-header shrink-0 h-14 px-4 border-b border-[var(--nim-border)] bg-[var(--nim-bg)]">
       <div className="workstream-header-main flex items-center gap-3 h-full">
         <div className="workstream-header-icon shrink-0 text-[var(--nim-text-muted)]">
           {hasChildren ? (
@@ -346,12 +565,12 @@ const WorkstreamHeader: React.FC<{
           )}
         </div>
 
-        <div className="workstream-header-content min-w-0">
+        <div className="workstream-header-content flex flex-col min-w-0 flex-1 gap-0.5 items-start">
           {isEditing ? (
             <input
               ref={inputRef}
               type="text"
-              className="workstream-header-title-input text-sm font-semibold text-[var(--nim-text)] bg-[var(--nim-bg-secondary)] border border-[var(--nim-border-accent)] rounded py-0.5 px-1 m-0 outline-none w-full min-w-[150px] max-w-[300px]"
+              className="workstream-header-title-input text-sm font-semibold text-[var(--nim-text)] bg-[var(--nim-bg-secondary)] border border-[var(--nim-border-accent)] rounded py-0.5 px-1 m-0 outline-none w-full min-w-[150px] max-w-[500px]"
               value={editValue}
               onChange={(e) => setEditValue(e.target.value)}
               onBlur={handleRenameSubmit}
@@ -359,75 +578,14 @@ const WorkstreamHeader: React.FC<{
             />
           ) : (
             <h2
-              className="workstream-header-title m-0 text-sm font-semibold text-[var(--nim-text)] whitespace-nowrap overflow-hidden text-ellipsis leading-tight cursor-pointer py-0.5 px-1 rounded transition-colors duration-150 hover:bg-[var(--nim-bg-hover)]"
+              className="workstream-header-title max-w-full m-0 text-sm font-semibold text-[var(--nim-text)] whitespace-nowrap overflow-hidden text-ellipsis leading-tight cursor-pointer py-0.5 px-1 rounded transition-colors duration-150 hover:bg-[var(--nim-bg-hover)]"
               onClick={handleTitleClick}
               title="Click to rename"
             >
               {title}
             </h2>
           )}
-        </div>
-
-        <div className="workstream-header-tags flex items-center gap-1 flex-wrap max-w-[50%] min-w-0 relative">
-          {tags.map(tag => (
-            <span
-              key={tag}
-              className="group flex items-center gap-0.5 text-[10px] font-medium leading-none pl-1.5 pr-1 py-0.5 rounded-full whitespace-nowrap cursor-default text-nim-faint bg-[color-mix(in_srgb,var(--nim-text)_8%,transparent)]"
-            >
-              {tag}
-              <button
-                className="opacity-0 group-hover:opacity-100 flex items-center justify-center w-3 h-3 rounded-full border-none bg-transparent cursor-pointer text-[var(--nim-text-faint)] hover:text-[var(--nim-text)] transition-opacity duration-100"
-                onClick={() => handleRemoveTag(tag)}
-                title={`Remove tag "${tag}"`}
-              >
-                <MaterialSymbol icon="close" size={10} />
-              </button>
-            </span>
-          ))}
-          {isEditingTags ? (
-            <div className="relative">
-              <input
-                ref={tagInputRef}
-                type="text"
-                className="text-[10px] leading-none py-0.5 px-1.5 rounded-full border border-[var(--nim-border)] bg-[var(--nim-bg-secondary)] text-[var(--nim-text)] outline-none w-[80px]"
-                placeholder="add tag..."
-                value={tagInput}
-                onChange={(e) => setTagInput(e.target.value)}
-                onKeyDown={handleTagInputKeyDown}
-                onBlur={() => {
-                  // Delay to allow click on suggestion
-                  setTimeout(() => {
-                    setIsEditingTags(false);
-                    setTagInput('');
-                  }, 150);
-                }}
-              />
-              {filteredSuggestions.length > 0 && (
-                <div
-                  ref={tagDropdownRef}
-                  className="absolute top-full left-0 mt-1 min-w-[120px] rounded-md z-[10000] py-0.5 text-[11px] bg-nim border border-nim shadow-[0_4px_12px_rgba(0,0,0,0.3)]"
-                >
-                  {filteredSuggestions.map(s => (
-                    <div
-                      key={s.name}
-                      className="px-2 py-1 cursor-pointer text-[var(--nim-text-muted)] hover:bg-[var(--nim-bg-hover)] hover:text-[var(--nim-text)]"
-                      onMouseDown={(e) => { e.preventDefault(); handleAddTag(s.name); }}
-                    >
-                      {s.name} <span className="text-[var(--nim-text-faint)]">({s.count})</span>
-                    </div>
-                  ))}
-                </div>
-              )}
-            </div>
-          ) : (
-            <button
-              className="flex items-center justify-center w-4 h-4 rounded-full border border-dashed border-[var(--nim-border)] bg-transparent cursor-pointer text-[var(--nim-text-faint)] hover:border-[var(--nim-text-faint)] hover:text-[var(--nim-text-muted)] transition-colors duration-100"
-              onClick={() => setIsEditingTags(true)}
-              title="Add tag"
-            >
-              <MaterialSymbol icon="add" size={10} />
-            </button>
-          )}
+          <WorkstreamHeaderTagsRow workstreamId={workstreamId} />
         </div>
 
         {isProcessing && (
@@ -435,8 +593,6 @@ const WorkstreamHeader: React.FC<{
             <span className="workstream-header-spinner w-4 h-4 border-2 border-[var(--nim-border)] border-t-[var(--nim-primary)] rounded-full animate-spin" />
           </div>
         )}
-
-        <div className="workstream-header-spacer flex-1" />
 
         {/* Terminal button - only show for worktree sessions, positioned before layout controls */}
         {worktreeId && onOpenTerminal && (
@@ -555,6 +711,40 @@ export const AgentWorkstreamPanel = React.memo(React.forwardRef<AgentWorkstreamP
 
   // Session store for updating archived state
   const updateSessionStore = useSetAtom(updateSessionStoreAtom);
+
+  // Session history collapse (global agent-mode sidebar) for full-window maximize
+  const sessionHistoryCollapsed = useAtomValue(sessionHistoryCollapsedAtom);
+  const toggleSessionHistory = useSetAtom(toggleSessionHistoryCollapsedAtom);
+
+  // Double-click a tab to maximize the editor to the whole window: hide the
+  // transcript (layoutMode 'editor'), the files-edited sidebar, and the
+  // session-history sidebar. Second double-click restores the exact prior
+  // layout. The captured layoutMode is always 'editor' or 'split' since editor
+  // tabs are only visible (and double-clickable) in those modes.
+  const { isMaximized: isEditorMaximized, toggle: toggleEditorMaximized, clearMaximize: clearEditorMaximized } =
+    useEditorMaximize<{ layoutMode: WorkstreamLayoutMode; filesSidebar: boolean; historyCollapsed: boolean }>({
+      scopeKey: workstreamId,
+      snapshot: () => ({ layoutMode, filesSidebar: sidebarVisible, historyCollapsed: sessionHistoryCollapsed }),
+      maximize: () => {
+        setLayoutMode({ workstreamId, mode: 'editor' });
+        if (sidebarVisible) toggleSidebar(workstreamId);
+        if (!sessionHistoryCollapsed) toggleSessionHistory();
+      },
+      restore: (snap) => {
+        setLayoutMode({ workstreamId, mode: snap.layoutMode });
+        if (sidebarVisible !== snap.filesSidebar) toggleSidebar(workstreamId);
+        if (sessionHistoryCollapsed !== snap.historyCollapsed) toggleSessionHistory();
+      },
+    });
+
+  // Drop the stale restore snapshot if the maximized layout is broken by a
+  // manual panel toggle (or the auto-switch to transcript when the last tab
+  // closes), so the next double-click re-maximizes from the current layout.
+  useEffect(() => {
+    if (isEditorMaximized && !(layoutMode === 'editor' && !sidebarVisible && sessionHistoryCollapsed)) {
+      clearEditorMaximized();
+    }
+  }, [isEditorMaximized, layoutMode, sidebarVisible, sessionHistoryCollapsed, clearEditorMaximized]);
 
   // Load persisted state when workstream changes
   useEffect(() => {
@@ -1126,6 +1316,7 @@ export const AgentWorkstreamPanel = React.memo(React.forwardRef<AgentWorkstreamP
                 isActive={true}
                 onSwitchToAgentMode={onSwitchToAgentMode}
                 onOpenSessionInChat={onOpenSessionInChat}
+                onTabDoubleClick={toggleEditorMaximized}
               />
             </div>
           )}

@@ -1,3 +1,6 @@
+# Agent mistake log (local only)
+agent-mistakes.md
+
 # Dependencies
 node_modules/
 .pnpm-store/
@@ -158,6 +161,10 @@ worktrees/
 .nimbalyst/
 nimbalyst-local/
 
+# Nimbalyst-generated agent/skill/plugin compatibility shims (regenerated on launch)
+.agents/skills/.nimbalyst-generated/
+.claude/plugins/.nimbalyst-generated/
+
 # Personal/agent plan documents (Nimbalyst planning feature stores these at
 # workspace root; they're personal working files, not source).
 plans/
@@ -188,6 +195,8 @@ packages/electron/marketing/videos/
 
 # Test screenshots
 packages/electron/e2e/permissions/screenshots/
+packages/electron/e2e/smoke/screenshots/
+packages/electron/e2e/walkthroughs/screenshots/
 packages/ios/screenshots/
 
 # Auto-generated platform artifacts
@@ -206,3 +215,13 @@ packages/android/app/google-services.json
 # Generated bundle / packaged extension artifact
 packages/electron/index.js
 packages/browser-extension/nimbalyst-web-clipper.zip
+# Built-in extensions ship via build:extensions + electron-builder, not as committed .nimext blobs
+packages/electron/resources/bundled-extensions/*.nimext
+
+# accidentally-tracked SQLite caches
+packages/electron/data/*.db
+packages/electron/memories.db
+
+# Local RAG/memory-tool artifacts (SQLite stores + caches created in the cwd)
+memories.db
+.rag-cache/

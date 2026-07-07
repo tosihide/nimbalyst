@@ -15,69 +15,23 @@
  *   - Queues outgoing messages when offline, replays on reconnect
  */
 
-// Wire protocol types (matching collabv3/src/types.ts ProjectSync messages)
-// Defined inline to avoid runtime -> collabv3 cross-package dependency
-
-interface ProjectSyncRequestMessage {
-  type: 'projectSyncRequest';
-  files: Array<{ syncId: string; contentHash: string; lastModifiedAt: number; hasYjs: boolean; yjsSeq: number }>;
-}
-
-interface FileContentPushMessage {
-  type: 'fileContentPush';
-  syncId: string;
-  encryptedContent: string; contentIv: string;
-  contentHash: string;
-  encryptedPath: string; pathIv: string;
-  encryptedTitle: string; titleIv: string;
-  lastModifiedAt: number;
-}
-
-interface FileContentBatchPushMessage {
-  type: 'fileContentBatchPush';
-  files: Omit<FileContentPushMessage, 'type'>[];
-}
-
-interface FileDeleteMessage { type: 'fileDelete'; syncId: string }
-interface FileYjsInitMessage { type: 'fileYjsInit'; syncId: string; encryptedSnapshot: string; iv: string }
-interface FileYjsUpdateMessage { type: 'fileYjsUpdate'; syncId: string; encryptedUpdate: string; iv: string }
-interface FileYjsCompactMessage { type: 'fileYjsCompact'; syncId: string; encryptedSnapshot: string; iv: string; replacesUpTo: number }
-
-interface ProjectSyncFileEntry {
-  syncId: string;
-  encryptedContent: string; contentIv: string;
-  contentHash: string;
-  encryptedPath: string; pathIv: string;
-  encryptedTitle: string; titleIv: string;
-  lastModifiedAt: number;
-  hasYjs: boolean;
-}
-
-interface ProjectSyncYjsUpdate {
-  syncId: string; encryptedUpdate: string; iv: string; sequence: number;
-}
-
-interface ProjectSyncResponseMessage {
-  type: 'projectSyncResponse';
-  updatedFiles: ProjectSyncFileEntry[];
-  yjsUpdates: ProjectSyncYjsUpdate[];
-  newFiles: ProjectSyncFileEntry[];
-  needFromClient: string[];
-  deletedSyncIds: string[];
-}
-
-interface FileContentBroadcastMessage {
-  type: 'fileContentBroadcast';
-  syncId: string;
-  encryptedContent: string; contentIv: string;
-  contentHash: string;
-  encryptedPath: string; pathIv: string;
-  encryptedTitle: string; titleIv: string;
-  lastModifiedAt: number;
-  fromConnectionId: string;
-}
-
-interface FileDeleteBroadcastMessage { type: 'fileDeleteBroadcast'; syncId: string; fromConnectionId: string }
+// Wire protocol types come from `@nimbalyst/collab-protocol`, which is the
+// single source of truth shared with the sync server.
+import type {
+  ProjectSyncRequestMessage,
+  FileContentPushMessage,
+  FileContentBatchPushMessage,
+  FileDeleteMessage,
+  FileYjsInitMessage,
+  FileYjsUpdateMessage,
+  FileYjsCompactMessage,
+  ProjectSyncFileEntry,
+  ProjectSyncYjsUpdate,
+  ProjectSyncResponseMessage,
+  FileContentBroadcastMessage,
+  FileDeleteBroadcastMessage,
+} from '@nimbalyst/collab-protocol';
+import { appendSyncClientParams } from './syncClientInfo';
 
 
 export interface ProjectSyncConfig {
@@ -160,6 +114,10 @@ export class ProjectSyncProvider {
   private offlineQueues = new Map<string, string[]>();
   private reconnectTimers = new Map<string, ReturnType<typeof setTimeout>>();
   private reconnectAttempts = new Map<string, number>();
+  // Per-project manifest builder. Called on every (re)connect so the server
+  // always diffs against *current* disk state, never a stale startup snapshot
+  // (NIM-853, Layer 1).
+  private manifestProviders = new Map<string, () => Promise<ProjectSyncManifestFile[]>>();
 
   // Event callbacks
   private onFileUpdateCallbacks = new Set<(projectId: string, file: ProjectSyncFileUpdate) => void>();
@@ -173,8 +131,11 @@ export class ProjectSyncProvider {
 
   // MARK: - Connection
 
-  async connect(projectId: string, manifest: ProjectSyncManifestFile[]): Promise<void> {
+  async connect(projectId: string, getManifest: () => Promise<ProjectSyncManifestFile[]>): Promise<void> {
     if (this.connections.has(projectId)) return;
+
+    // Remember the builder so reconnects re-announce fresh disk state.
+    this.manifestProviders.set(projectId, getManifest);
 
     try {
       const jwt = await this.config.getJwt();
@@ -185,7 +146,7 @@ export class ProjectSyncProvider {
         .replace(/\/+$/, '');
 
       const encodedToken = encodeURIComponent(jwt);
-      const url = `${wsBase}/sync/${roomId}?token=${encodedToken}`;
+      const url = appendSyncClientParams(`${wsBase}/sync/${roomId}?token=${encodedToken}`);
 
       const ws = new WebSocket(url);
       this.connections.set(projectId, ws);
@@ -193,8 +154,12 @@ export class ProjectSyncProvider {
       ws.onopen = () => {
         this.reconnectAttempts.set(projectId, 0);
         this.notifyStatus(projectId, true);
-        this.sendSyncRequest(projectId, manifest);
-        this.replayOfflineQueue(projectId);
+        // Build the manifest from *current* disk, send it, then drain the queue.
+        // Ordering preserved: sync request before replayed pushes.
+        void (async () => {
+          await this.sendFreshSyncRequest(projectId);
+          this.replayOfflineQueue(projectId);
+        })();
       };
 
       ws.onmessage = (event) => {
@@ -204,7 +169,7 @@ export class ProjectSyncProvider {
       ws.onclose = () => {
         this.connections.delete(projectId);
         this.notifyStatus(projectId, false);
-        this.scheduleReconnect(projectId, manifest);
+        this.scheduleReconnect(projectId);
       };
 
       ws.onerror = () => {
@@ -222,6 +187,7 @@ export class ProjectSyncProvider {
       this.reconnectTimers.delete(projectId);
     }
     this.reconnectAttempts.delete(projectId);
+    this.manifestProviders.delete(projectId);
 
     const ws = this.connections.get(projectId);
     if (ws) {
@@ -236,6 +202,12 @@ export class ProjectSyncProvider {
     for (const projectId of [...this.connections.keys()]) {
       this.disconnect(projectId);
     }
+    // Cancel any reconnects still pending for projects without a live socket.
+    for (const timer of this.reconnectTimers.values()) {
+      clearTimeout(timer);
+    }
+    this.reconnectTimers.clear();
+    this.manifestProviders.clear();
     this.offlineQueues.clear();
   }
 
@@ -245,6 +217,22 @@ export class ProjectSyncProvider {
   }
 
   // MARK: - Sync Request
+
+  /** Rebuild the manifest from current disk state and send the sync request. */
+  private async sendFreshSyncRequest(projectId: string): Promise<void> {
+    const getManifest = this.manifestProviders.get(projectId);
+    if (!getManifest) return;
+    let manifest: ProjectSyncManifestFile[];
+    try {
+      manifest = await getManifest();
+    } catch (err) {
+      console.error(`[ProjectSync] Failed to build manifest for ${projectId}:`, err);
+      return;
+    }
+    // The connection may have dropped while building the manifest.
+    if (this.connections.get(projectId)?.readyState !== WebSocket.OPEN) return;
+    this.sendSyncRequest(projectId, manifest);
+  }
 
   private sendSyncRequest(projectId: string, manifest: ProjectSyncManifestFile[]): void {
     const msg: ProjectSyncRequestMessage = {
@@ -543,14 +531,17 @@ export class ProjectSyncProvider {
     this.offlineQueues.delete(projectId);
   }
 
-  private scheduleReconnect(projectId: string, manifest: ProjectSyncManifestFile[]): void {
+  private scheduleReconnect(projectId: string): void {
     const attempts = this.reconnectAttempts.get(projectId) ?? 0;
     const delay = Math.min(2000 * Math.pow(2, attempts), 30000);
     this.reconnectAttempts.set(projectId, attempts + 1);
 
     const timer = setTimeout(() => {
       this.reconnectTimers.delete(projectId);
-      this.connect(projectId, manifest);
+      const getManifest = this.manifestProviders.get(projectId);
+      if (getManifest) {
+        this.connect(projectId, getManifest);
+      }
     }, delay);
     this.reconnectTimers.set(projectId, timer);
   }

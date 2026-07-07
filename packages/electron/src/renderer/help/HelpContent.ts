@@ -29,6 +29,15 @@ export interface HelpEntry {
  */
 export const HelpContent: Record<string, HelpEntry> = {
   // ============================================================================
+  // Teams - Security & encryption (Epic H2)
+  // ============================================================================
+
+  'h2-security-encryption-section': {
+    title: 'Security & encryption',
+    body: 'Controls how your team\'s shared data is encrypted. End-to-end encrypted teams (desktop & mobile only) can be migrated to server-managed keys to unlock web, CLI, and AI-agent access — encrypted, isolated per team, and audit-logged, but no longer zero-knowledge. Your personal sync always stays end-to-end encrypted. Only owners and admins can migrate.',
+  },
+
+  // ============================================================================
   // Files Mode - File Tree
   // ============================================================================
 
@@ -49,6 +58,10 @@ export const HelpContent: Record<string, HelpEntry> = {
   'file-tree-new-folder-button': {
     title: 'New Folder',
     body: 'Create a new folder in the selected folder.',
+  },
+  'file-tree-refresh-button': {
+    title: 'Refresh File Tree',
+    body: 'Reload the file list from disk to pick up files added or removed outside Nimbalyst.',
   },
 
   // ============================================================================
@@ -227,6 +240,18 @@ export const HelpContent: Record<string, HelpEntry> = {
     title: 'Select AI Model',
     body: 'Choose which AI model to use. Different models have different capabilities and speeds.',
   },
+  'model-picker-provider-claude-code': {
+    title: 'Claude Agent (Claude Code Based)',
+    body: 'The in-app agent built on Claude Code with full Nimbalyst integration: it sees your active document and selection, renders the rich inline transcript, and tracks every file it edits. Uses your configured Anthropic API key.',
+  },
+  'model-picker-provider-claude-code-cli': {
+    title: 'Claude Code CLI (Terminal Mode)',
+    body: 'Runs the genuine claude terminal binary in an embedded terminal, billed to your Claude subscription. You get native CLI behavior — its slash commands and TUI — in the Raw terminal drawer, while Nimbalyst mirrors the conversation into the rich transcript.',
+  },
+  'action-prompts-dropdown': {
+    title: 'Action Prompts',
+    body: 'Reusable prompts you define in nimbalyst-local/ai-actions.md. Picking one inserts its body into the draft so you can tweak it before sending.',
+  },
   'context-indicator': {
     title: 'Context Window',
     body: 'Shows how much of the AI context window is used. Includes files, conversation history, and tools.',
@@ -297,6 +322,11 @@ export const HelpContent: Record<string, HelpEntry> = {
     body: 'Browse and edit documents shared with your team in real-time. Collaborate on markdown, spreadsheets, and diagrams.',
     shortcut: KeyboardShortcuts.view.collabMode,
   },
+  'pr-review-mode-button': {
+    title: 'Pull Requests',
+    body: 'Review GitHub pull requests without leaving the app: browse the list, read diffs and conversation, and approve or merge.',
+    shortcut: KeyboardShortcuts.view.prReviewMode,
+  },
 
   // ============================================================================
   // Settings
@@ -326,7 +356,6 @@ export const HelpContent: Record<string, HelpEntry> = {
   'project-manager-open': {
     title: 'Open Project',
     body: 'Open a project folder from your computer.',
-    shortcut: KeyboardShortcuts.file.openFolder,
   },
   'project-manager-recent': {
     title: 'Recent Projects',

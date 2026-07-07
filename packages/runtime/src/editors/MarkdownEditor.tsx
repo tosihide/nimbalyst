@@ -20,6 +20,7 @@ import {
   type EditorConfig,
   type ConfigTheme,
   type UploadedEditorAsset,
+  type CommentsConfig,
   $convertFromEnhancedMarkdownString,
   getEditorTransformers,
 } from '../editor';
@@ -54,8 +55,11 @@ export interface MarkdownEditorConfig {
   /** Resolve editor image sources to browser-openable URLs. */
   resolveImageSrc?: (src: string) => Promise<string | null>;
 
-  /** Open an attachment link rendered in the editor. */
-  onOpenAssetLink?: (href: string) => Promise<void> | void;
+  /**
+   * Notified (debounced) with the URIs that have *disappeared* from the
+   * live editor state since the previous scan. Wires through to AssetGCPlugin.
+   */
+  onAssetReferencesRemoved?: (removedUris: string[]) => void;
 
   /** Callback to rename document */
   onRenameDocument?: () => void;
@@ -85,6 +89,13 @@ export interface MarkdownEditorProps {
 
   /** Callback when getContent function is available (for mode switching) */
   onGetContent?: (getContentFn: () => string) => void;
+
+  /**
+   * When set (collaborative documents only), enables document comments
+   * (text-selection MarkNode comments, `@`-mention picker, thread panel,
+   * inbox fanout). Passed straight through to `EditorConfig.comments`.
+   */
+  commentsConfig?: CommentsConfig;
 
   /**
    * When set, the editor operates in collaborative mode:
@@ -125,6 +136,7 @@ export function MarkdownEditor({
   onEditorReady,
   onGetContent: onGetContentProp,
   collaborationConfig,
+  commentsConfig,
 }: MarkdownEditorProps): React.ReactElement {
   const isCollabMode = !!collaborationConfig;
   // Personal sync: collab is active but disk operations continue
@@ -271,7 +283,7 @@ export function MarkdownEditor({
       onImageDragStart: config.onImageDragStart,
       onUploadAsset: config.onUploadAsset,
       resolveImageSrc: config.resolveImageSrc,
-      onOpenAssetLink: config.onOpenAssetLink,
+      onAssetReferencesRemoved: config.onAssetReferencesRemoved,
       onViewHistory: handleViewHistory,
       onRenameDocument: config.onRenameDocument,
       onSwitchToAgentMode: config.onSwitchToAgentMode,
@@ -311,6 +323,9 @@ export function MarkdownEditor({
             : undefined,
         };
       })() : undefined,
+
+      // Document comments (collaborative documents only).
+      comments: commentsConfig,
     }),
     [
       config.theme,
@@ -322,7 +337,7 @@ export function MarkdownEditor({
       config.onImageDragStart,
       config.onUploadAsset,
       config.resolveImageSrc,
-      config.onOpenAssetLink,
+      config.onAssetReferencesRemoved,
       config.onRenameDocument,
       config.onSwitchToAgentMode,
       config.onOpenSessionInChat,
@@ -337,6 +352,7 @@ export function MarkdownEditor({
       handleEditorReady,
       handleViewHistory,
       collaborationConfig,
+      commentsConfig,
     ]
   );
 

@@ -197,6 +197,23 @@ struct ServerError: Codable {
     let message: String
 }
 
+/// Voice-tool response broadcast (desktop -> mobile) for a proxied voice tool.
+struct VoiceToolResponseBroadcast: Codable {
+    let type: String
+    let response: EncryptedVoiceToolResponse
+    let fromConnectionId: String?
+}
+
+/// Encrypted voice-tool response payload (result/error carry project knowledge).
+struct EncryptedVoiceToolResponse: Codable {
+    let requestId: String
+    let success: Bool
+    let encryptedResult: String?
+    let resultIv: String?
+    let encryptedError: String?
+    let errorIv: String?
+}
+
 /// Encrypted settings payload from desktop (e.g., API keys, voice mode config).
 struct EncryptedSettingsPayload: Codable {
     let encryptedSettings: String
@@ -219,6 +236,12 @@ public struct SyncedSettings: Codable {
     public let voiceMode: SyncedVoiceModeSettings?
     public let availableModels: [SyncedAvailableModel]?
     public let defaultModel: String?
+    /// Whether the desktop "meta-agent" alpha feature is enabled (gates the mobile Meta Agent UI).
+    public let metaAgentEnabled: Bool?
+    /// Desktop's preferred agent language. The voice agent pins its spoken
+    /// language to this so it never starts up in a different language than the
+    /// desktop is configured for. Nil/empty means no preference -> English.
+    public let preferredAgentLanguage: String?
     public let version: Int
 }
 
@@ -277,6 +300,7 @@ struct EncryptedCreateSessionRequest: Codable {
     let parentSessionId: String?
     let provider: String?
     let model: String?
+    let agentRole: String?
     let timestamp: Int
 }
 
@@ -291,6 +315,25 @@ struct CreateWorktreeRequest: Codable {
     let requestId: String
     let encryptedProjectId: String
     let projectIdIv: String
+    let timestamp: Int
+}
+
+// MARK: - Voice Tool Request (mobile -> desktop)
+
+struct VoiceToolRequestMessage: Codable {
+    let type = "voiceToolRequest"
+    let request: EncryptedVoiceToolRequest
+}
+
+/// Encrypted voice-tool request payload (toolName/args carry project knowledge).
+struct EncryptedVoiceToolRequest: Codable {
+    let requestId: String
+    let encryptedProjectId: String
+    let projectIdIv: String
+    let encryptedToolName: String
+    let toolNameIv: String
+    let encryptedArgs: String
+    let argsIv: String
     let timestamp: Int
 }
 
@@ -375,8 +418,15 @@ struct ServerMessageEntry: Codable {
 }
 
 /// Session metadata returned with syncResponse.
+///
+/// Titles are E2E encrypted: the server only ever returns ciphertext under
+/// `encryptedTitle` / `titleIv`. The session list pulls decrypted titles
+/// from the IndexRoom path; this struct does not currently surface a title
+/// to the UI, but the fields are declared so future consumers can decrypt
+/// without re-introducing a plaintext server-side field.
 struct SessionRoomMetadata: Codable {
-    let title: String?
+    let encryptedTitle: String?
+    let titleIv: String?
     let provider: String?
     let model: String?
     let mode: String?

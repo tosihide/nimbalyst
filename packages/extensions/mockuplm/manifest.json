@@ -1,12 +1,13 @@
 {
   "id": "com.nimbalyst.mockuplm",
   "name": "MockupLM",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Visual UX mockup creation with HTML/CSS for planning and design",
   "author": "Nimbalyst",
   "main": "dist/index.js",
   "apiVersion": "1.0.0",
   "marketplace": {
+    "changelog": "1.0.1: Share to Team collaboration for mockups and projects, shared viewer and diff review fixes.",
     "categories": ["diagrams"],
     "tags": ["mockup", "wireframe", "ui", "ux", "design", "prototype", "html"],
     "icon": "palette",
@@ -39,13 +40,24 @@
         "filePatterns": ["*.mockup.html"],
         "displayName": "Mockup Editor",
         "component": "MockupEditor",
-        "supportsSourceMode": true
+        "supportsSourceMode": true,
+        "supportsDiffMode": true,
+        "supportsTranscriptEmbed": true,
+        "transcriptEmbedHeight": 480,
+        "collaboration": {
+          "supported": true,
+          "awarenessFields": ["selection", "editingFieldId"]
+        }
       },
       {
         "filePatterns": ["*.mockupproject"],
         "displayName": "Mockup Project",
         "component": "MockupProjectEditor",
-        "supportsSourceMode": true
+        "supportsSourceMode": true,
+        "collaboration": {
+          "supported": true,
+          "awarenessFields": ["selectedMockupId", "selectedConnectionId"]
+        }
       }
     ],
     "fileIcons": {

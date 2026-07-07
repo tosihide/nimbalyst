@@ -19,13 +19,19 @@ import {
   getExtensionLoader,
   setOffscreenMountCallback,
   setEnsureEditorCallback,
+  collectVoiceSessionContext,
 } from '@nimbalyst/runtime';
+import {
+  listRegisteredCollabContentAdapters,
+  onCollabContentAdaptersChange,
+} from '@nimbalyst/collab-adapters';
 import { ExtensionPlatformServiceImpl } from '../services/ExtensionPlatformServiceImpl';
 import { initializeExtensionEditorBridge } from '../extensions/ExtensionEditorBridge';
 import { initializeExtensionPluginBridge } from '../extensions/ExtensionPluginBridge';
 import { initializeExtensionDocumentHeaderBridge, syncExtensionDocumentHeaders } from '../extensions/ExtensionDocumentHeaderBridge';
 import { syncExtensionEditors } from '../extensions/ExtensionEditorBridge';
 import { initializeExtensionThemeBridge } from '../extensions/ExtensionThemeBridge';
+import { initializeExtensionAgentProviderSync } from '../store/extensionAgentProviderSync';
 import { hiddenTabManager } from '../services/HiddenTabManager';
 
 // Track workspace path for MCP tool registration
@@ -46,8 +52,51 @@ let extensionStatusListenerSetup = false;
 // Track if extension tool execution listener is set up
 let extensionToolListenerSetup = false;
 
+// Track if the voice-context collection listener is set up
+let voiceContextListenerSetup = false;
+
 // Track if renderer eval listener is set up
 let rendererEvalListenerSetup = false;
+
+// Track if collab adapter descriptor forwarding is set up
+let collabAdapterForwardingSetup = false;
+
+/**
+ * Forward serializable collab adapter descriptors to the main process so it can
+ * rebuild the adapter and reach parity (seed/reupload/history) for any installed
+ * extension's document type -- not just the statically-bundled built-ins. Only
+ * adapters that carry a `serializableDescriptor` (text adapters today) are
+ * forwarded. Runs once, then re-forwards on every registry change (late /
+ * hot-reloaded extensions).
+ */
+function setupCollabAdapterForwarding(): void {
+  if (collabAdapterForwardingSetup) return;
+  collabAdapterForwardingSetup = true;
+
+  const documentSync = (window as any).electronAPI?.documentSync;
+  if (!documentSync?.registerCollabAdapterDescriptor) {
+    console.warn('[ExtensionSystem] documentSync.registerCollabAdapterDescriptor unavailable; collab adapters stay renderer-only');
+    return;
+  }
+
+  const forwarded = new Set<string>();
+  const forward = () => {
+    for (const adapter of listRegisteredCollabContentAdapters()) {
+      const descriptor = adapter.serializableDescriptor;
+      if (!descriptor) continue;
+      const key = `${descriptor.documentType}:${descriptor.kind}`;
+      if (forwarded.has(key)) continue;
+      forwarded.add(key);
+      documentSync.registerCollabAdapterDescriptor(descriptor).catch((err: unknown) => {
+        forwarded.delete(key);
+        console.warn('[ExtensionSystem] Failed to forward collab adapter descriptor for', descriptor.documentType, err);
+      });
+    }
+  };
+
+  forward();
+  onCollabContentAdaptersChange(forward);
+}
 
 // Track if extension test listeners are set up
 let extensionTestListenersSetup = false;
@@ -459,24 +508,24 @@ function setupRendererEvalListener(): void {
     console.log('[ExtensionSystem] Renderer eval request');
 
     try {
-      // Wrap in async IIFE to support await expressions and statements
-      // Try as expression first (e.g. "1 + 2", "await fetch(...)"), fall back to statements (e.g. "const x = 1; x")
-      let asyncEval;
+      const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor as new (
+        ...args: string[]
+      ) => () => Promise<unknown>;
+
+      // Compile as an async function to support await expressions and
+      // multi-statement snippets without relying on eval().
+      let asyncEval: () => Promise<unknown>;
       try {
-        // eslint-disable-next-line no-eval
-        asyncEval = eval(`(async () => { return (${data.expression}); })()`);
+        asyncEval = new AsyncFunction(`return (${data.expression});`);
       } catch (syntaxErr) {
         if (syntaxErr instanceof SyntaxError) {
-          // Expression failed to parse — treat as statement(s) where the last expression is the result
-          // eslint-disable-next-line no-eval
-          asyncEval = eval(`(async () => { ${data.expression} })()`);
+          asyncEval = new AsyncFunction(data.expression);
         } else {
           throw syntaxErr;
         }
       }
 
-      // Await the result (handles both sync and async expressions)
-      const result = await asyncEval;
+      const result = await asyncEval();
 
       electronAPI.send(data.responseChannel, {
         value: serializeEvalResult(result)
@@ -598,15 +647,21 @@ function setupExtensionTestListeners(): void {
 
 /**
  * Set the workspace path for extension tool registration.
- * Should be called when workspace changes.
+ * Should be called when workspace changes (including rail switches in
+ * multi-project mode — every new path needs its own tool registration).
  */
 export function setExtensionWorkspacePath(workspacePath: string | null): void {
-  const wasNull = currentWorkspacePath === null;
+  const previous = currentWorkspacePath;
   currentWorkspacePath = workspacePath;
 
-  // If workspace path was just set (not null anymore), register extension tools
-  // This handles the case where tools were loaded before workspace was known
-  if (wasNull && workspacePath && window.electronAPI?.registerExtensionTools) {
+  // Register extension tools for every new workspace we see. The previous
+  // implementation only fired on the first non-null assignment, which left
+  // additional rail-warm projects without their MCP tools registered.
+  if (
+    workspacePath &&
+    workspacePath !== previous &&
+    window.electronAPI?.registerExtensionTools
+  ) {
     const tools = getMCPToolDefinitions();
     if (tools.length > 0) {
       console.log(`[ExtensionSystem] Registering ${tools.length} extension tools for workspace: ${workspacePath}`);
@@ -655,6 +710,10 @@ export async function registerExtensionSystem(): Promise<void> {
     // Initialize the bridge to register custom editors from extensions
     initializeExtensionEditorBridge();
 
+    // Forward collab adapter descriptors to main so marketplace editors reach
+    // main-process parity (seed/reupload/history), not just bundled built-ins.
+    setupCollabAdapterForwarding();
+
     // Initialize the plugin bridge to register slash commands, nodes, and transformers
     initializeExtensionPluginBridge();
 
@@ -686,6 +745,11 @@ export async function registerExtensionSystem(): Promise<void> {
     // Initialize the AI tools bridge to register extension tools with the tool registry
     initializeExtensionAIToolsBridge();
 
+    // Keep extension-contributed agent provider ids registered with
+    // ModelIdentifier as extensions load / re-scan / unload (not only at
+    // startup), so a provider enabled after launch is recognized immediately.
+    initializeExtensionAgentProviderSync();
+
     // Expose extension tools bridge on window in dev mode for Playwright page.evaluate() access
     if (process.env.NODE_ENV !== 'production') {
       (window as any).__nimbalyst_extension_tools__ = {
@@ -710,6 +774,28 @@ export async function registerExtensionSystem(): Promise<void> {
         window.electronAPI.registerExtensionTools(currentWorkspacePath, tools);
       }
     });
+
+    // Core hook 2: when a voice session starts, the main process asks the
+    // renderer for any extension-contributed voice session context. Run the
+    // registered providers and reply on the one-shot result channel.
+    if (!voiceContextListenerSetup && window.electronAPI?.on && window.electronAPI?.send) {
+      voiceContextListenerSetup = true;
+      window.electronAPI.on(
+        'voice-mode:collect-extension-context',
+        async (data: {
+          input: { workspacePath?: string; activeFilePath?: string; voiceSessionId?: string; codingSessionId?: string };
+          resultChannel: string;
+        }) => {
+          let context = '';
+          try {
+            context = await collectVoiceSessionContext(data.input || {});
+          } catch (error) {
+            console.error('[ExtensionSystem] Failed to collect voice context:', error);
+          }
+          window.electronAPI.send(data.resultChannel, { context });
+        }
+      );
+    }
 
     // Set up IPC listener for extension tool execution
     if (!extensionToolListenerSetup && window.electronAPI?.onExecuteExtensionTool && window.electronAPI?.sendExtensionToolResult) {

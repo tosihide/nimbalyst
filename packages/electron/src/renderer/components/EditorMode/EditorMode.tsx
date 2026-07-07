@@ -1,12 +1,13 @@
 import React, { useCallback, useEffect, useRef, useState, useImperativeHandle, forwardRef } from 'react';
-import { useSetAtom, useAtomValue } from 'jotai';
+import { useSetAtom, useAtomValue, useAtom } from 'jotai';
 import type { ConfigTheme } from '@nimbalyst/runtime';
 import { useTabsActions, type TabData } from '../../contexts/TabsContext';
 import { store, editorDirtyAtom, makeEditorKey } from '@nimbalyst/runtime/store';
 import { fileDeletedAtomFamily } from '../../store/atoms/fileWatch';
 import { pushNavigationEntryAtom, isRestoringNavigationAtom, historyDialogFileAtom } from '../../store';
-import { newMockupRequestAtom, toggleAIChatPanelRequestAtom } from '../../store/atoms/appCommands';
+import { newBrowserTabRequestAtom, newMockupRequestAtom, toggleAIChatPanelRequestAtom } from '../../store/atoms/appCommands';
 import { useTabNavigation } from '../../hooks/useTabNavigation';
+import { useEditorMaximize } from '../../hooks/useEditorMaximize';
 import { handleWorkspaceFileSelect as handleWorkspaceFileSelectUtil } from '../../utils/workspaceFileOperations';
 import { createInitialFileContent, createMockupContent } from '../../utils/fileUtils';
 import { getFileName } from '../../utils/pathUtils';
@@ -29,6 +30,13 @@ import {
   collabConnectionStatusAtom,
   hasCollabUnsyncedChanges,
 } from '../../store/atoms/collabEditor';
+import {
+  sidebarWidthAtomFamily,
+  sidebarCollapsedAtomFamily,
+  sidebarPreCollapseWidthAtomFamily,
+  aiChatWidthAtomFamily,
+  aiChatCollapsedAtomFamily,
+} from '../../store/atoms/workspaceLayout';
 
 export interface EditorModeRef {
   closeActiveTab: () => void;
@@ -74,10 +82,12 @@ const EditorMode = forwardRef<EditorModeRef, EditorModeProps>(function EditorMod
   onOpenQuickSearch,
   onSwitchToAgentMode
 }, ref) {
-  // Sidebar state
-  const [sidebarWidth, setSidebarWidth] = useState<number>(250);
-  const [sidebarCollapsed, setSidebarCollapsed] = useState<boolean>(false);
-  const [preCollapseWidth, setPreCollapseWidth] = useState<number>(250);
+  // Sidebar state — kept in per-workspace atom families so each open
+  // project preserves its own width / collapse state when the project rail
+  // hides and re-shows it.
+  const [sidebarWidth, setSidebarWidth] = useAtom(sidebarWidthAtomFamily(workspacePath));
+  const [sidebarCollapsed, setSidebarCollapsed] = useAtom(sidebarCollapsedAtomFamily(workspacePath));
+  const [preCollapseWidth, setPreCollapseWidth] = useAtom(sidebarPreCollapseWidthAtomFamily(workspacePath));
   const [selectedFolderPath, setSelectedFolderPath] = useState<string | null>(null);
 
   // Dirty state is tracked via ref to avoid re-render cascade
@@ -95,9 +105,10 @@ const EditorMode = forwardRef<EditorModeRef, EditorModeProps>(function EditorMod
   // Extension file types state
   const [extensionFileTypes, setExtensionFileTypes] = useState<ExtensionFileType[]>([]);
 
-  // AI Chat panel state
-  const [isAIChatCollapsed, setIsAIChatCollapsed] = useState(false);
-  const [aiChatWidth, setAIChatWidth] = useState<number>(350);
+  // AI Chat panel state — per-workspace so the rail-switch keeps each
+  // project's collapse and width preferences.
+  const [isAIChatCollapsed, setIsAIChatCollapsed] = useAtom(aiChatCollapsedAtomFamily(workspacePath));
+  const [aiChatWidth, setAIChatWidth] = useAtom(aiChatWidthAtomFamily(workspacePath));
 
   // Track active tab for document context (AI needs to know current file)
   // Uses ref to avoid re-rendering EditorMode on every tab switch
@@ -339,10 +350,15 @@ const EditorMode = forwardRef<EditorModeRef, EditorModeProps>(function EditorMod
   }, [currentFilePath, workspacePath]);
 
   // Dev helper: open a collaborative document from the console
-  // Usage: window.__openCollabDoc('my-doc-id', 'My Document Title')
+  // Usage: window.__openCollabDoc('my-doc-id', 'My Document Title', '<initialContent>?', 'documentType?')
   useEffect(() => {
     if (!import.meta.env.DEV) return;
-    (window as any).__openCollabDoc = async (documentId: string, title?: string) => {
+    (window as any).__openCollabDoc = async (
+      documentId: string,
+      title?: string,
+      initialContent?: string,
+      documentType?: string,
+    ) => {
       if (!workspacePath) {
         console.error('[openCollabDoc] No workspace path');
         return;
@@ -352,12 +368,102 @@ const EditorMode = forwardRef<EditorModeRef, EditorModeProps>(function EditorMod
         workspacePath,
         documentId,
         title,
+        initialContent,
+        documentType,
         addTab: tabsActions.addTab,
       });
       console.log('[openCollabDoc] Opened tab:', tabId);
       return tabId;
     };
-    return () => { delete (window as any).__openCollabDoc; };
+
+    // Playwright-only helper: open a collab doc without going through Stytch
+    // auth. Resolves the config via `document-sync:open-test` (gated by
+    // PLAYWRIGHT=1 in the main process) and re-uses the same `openCollabDocument`
+    // + `createProxiedWebSocket` plumbing the real share path uses. The test
+    // injects `test_user_id` / `test_org_id` by wrapping the URL passed
+    // through `createProxiedWebSocket` via `urlOverride` below.
+    (window as any).__openCollabDocTest = async (params: {
+      documentId: string;
+      title?: string;
+      initialContent?: string;
+      documentType?: string;
+      serverUrl: string;
+      orgId: string;
+      userId: string;
+      encryptionKeyBase64: string;
+      /** Optional query-string suffix appended to the WS URL (no leading ?). */
+      urlExtraQuery?: string;
+    }) => {
+      if (!workspacePath) {
+        throw new Error('[openCollabDocTest] No workspace path');
+      }
+      const testResult = await (window as any).electronAPI.invoke(
+        'document-sync:open-test',
+        {
+          serverUrl: params.serverUrl,
+          orgId: params.orgId,
+          userId: params.userId,
+          documentId: params.documentId,
+          title: params.title ?? params.documentId,
+          encryptionKeyBase64: params.encryptionKeyBase64,
+        },
+      );
+      if (!testResult?.success || !testResult.config) {
+        throw new Error(
+          `[openCollabDocTest] document-sync:open-test failed: ${testResult?.error ?? 'unknown'}`,
+        );
+      }
+      const cfg = testResult.config;
+      // Reconstruct CryptoKey from base64.
+      const binary = atob(cfg.orgKeyBase64);
+      const bytes = new Uint8Array(binary.length);
+      for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+      const documentKey = await crypto.subtle.importKey(
+        'raw',
+        bytes,
+        { name: 'AES-GCM', length: 256 },
+        false,
+        ['encrypt', 'decrypt'],
+      );
+
+      const { openCollabDocument, createProxiedWebSocket } = await import(
+        '../../utils/collabDocumentOpener'
+      );
+      const hasWsProxy = !!(window as any).electronAPI?.documentSync?.wsConnect;
+      const createWebSocket = hasWsProxy
+        ? (url: string) => {
+            const target = params.urlExtraQuery
+              ? `${url}${url.includes('?') ? '&' : '?'}${params.urlExtraQuery}`
+              : url;
+            return createProxiedWebSocket(target);
+          }
+        : undefined;
+
+      const tabId = openCollabDocument({
+        workspacePath,
+        orgId: cfg.orgId,
+        documentId: cfg.documentId,
+        title: cfg.title,
+        documentType: params.documentType,
+        documentKey,
+        serverUrl: cfg.serverUrl,
+        userId: cfg.userId,
+        userName: cfg.userName ?? 'Test User',
+        userEmail: cfg.userEmail ?? 'test@test.com',
+        initialContent: params.initialContent,
+        urlExtraQuery: params.urlExtraQuery,
+        createWebSocket,
+        getJwt: async () => 'test-jwt',
+        addTab: tabsActions.addTab,
+      });
+      console.log('[openCollabDocTest] Opened tab:', tabId);
+      return tabId;
+    };
+
+    return () => {
+      delete (window as any).__openCollabDoc;
+      delete (window as any).__openCollabDocTest;
+    };
   }, [workspacePath, tabsActions]);
 
   // Update MCP document state for custom editors (non-markdown files)
@@ -621,6 +727,30 @@ const EditorMode = forwardRef<EditorModeRef, EditorModeProps>(function EditorMod
     }
   }, [sidebarCollapsed, sidebarWidth, preCollapseWidth]);
 
+  // Double-click a tab to maximize the editor (collapse file tree + AI chat).
+  // Second double-click restores the exact prior collapse state.
+  const { isMaximized: isEditorMaximized, toggle: toggleEditorMaximized, clearMaximize: clearEditorMaximized } =
+    useEditorMaximize<{ sidebar: boolean; chat: boolean }>({
+      scopeKey: workspacePath,
+      snapshot: () => ({ sidebar: sidebarCollapsed, chat: isAIChatCollapsed }),
+      maximize: () => {
+        if (!sidebarCollapsed) toggleSidebarCollapsed();
+        if (!isAIChatCollapsed) setIsAIChatCollapsed(true);
+      },
+      restore: (snap) => {
+        if (sidebarCollapsed !== snap.sidebar) toggleSidebarCollapsed();
+        setIsAIChatCollapsed(snap.chat);
+      },
+    });
+
+  // If the user manually reopens a panel while maximized, drop the stale
+  // restore snapshot so the next double-click re-maximizes from scratch.
+  useEffect(() => {
+    if (isEditorMaximized && !(sidebarCollapsed && isAIChatCollapsed)) {
+      clearEditorMaximized();
+    }
+  }, [isEditorMaximized, sidebarCollapsed, isAIChatCollapsed, clearEditorMaximized]);
+
   // Expose methods to parent via ref
   // CRITICAL: Use tabsRef.current inside closures to avoid stale closure bugs
   // The useImperativeHandle re-runs when tabs changes, but the methods it creates
@@ -722,7 +852,7 @@ const EditorMode = forwardRef<EditorModeRef, EditorModeProps>(function EditorMod
     const handleMouseMove = (e: MouseEvent) => {
       if (!isResizingRef.current) return;
 
-      const newWidth = Math.min(Math.max(150, e.clientX), 500);
+      const newWidth = Math.min(Math.max(200, e.clientX), 500);
       setSidebarWidth(newWidth);
     };
 
@@ -756,7 +886,9 @@ const EditorMode = forwardRef<EditorModeRef, EditorModeProps>(function EditorMod
       try {
         const savedWidth = await window.electronAPI.getSidebarWidth(workspacePath);
         if (savedWidth && typeof savedWidth === 'number') {
-          setSidebarWidth(savedWidth);
+          // Clamp to the current drag-resize range so a width persisted
+          // under an older, smaller floor doesn't load too narrow.
+          setSidebarWidth(Math.min(Math.max(200, savedWidth), 500));
         }
       } catch (error) {
         console.error('Error loading sidebar width:', error);
@@ -873,6 +1005,30 @@ const EditorMode = forwardRef<EditorModeRef, EditorModeProps>(function EditorMod
     void handleNewMockup();
   }, [newMockupVersion, workspacePath, selectedFolderPath, handleWorkspaceFileSelect]);
 
+  // React to the "New Browser Tab" command (Cmd+Shift+B) from the menu. The IPC
+  // subscription lives in store/listeners/appCommandListeners.ts; here we watch
+  // the counter and open a fileless browser virtual tab, mirroring the
+  // "New Browser Tab" entry in the sidebar's New File menu.
+  const newBrowserTabVersion = useAtomValue(newBrowserTabRequestAtom);
+  const newBrowserTabInitialVersionRef = useRef(newBrowserTabVersion);
+  useEffect(() => {
+    if (newBrowserTabVersion === newBrowserTabInitialVersionRef.current) return;
+
+    // The browser extension contributes a New File menu entry that opens a
+    // virtual:// tab. Reuse its virtualScheme so the command degrades to a
+    // no-op when the browser extension is disabled.
+    const browserTabType = extensionFileTypes.find(
+      (e) =>
+        e.action === 'openVirtualTab' &&
+        e.virtualScheme?.startsWith('virtual://com.nimbalyst.browser/'),
+    );
+    if (!browserTabType?.virtualScheme) return;
+
+    const id = `tab-${Date.now().toString(36)}-${Math.random().toString(16).slice(2, 8)}`;
+    const title = encodeURIComponent(browserTabType.displayName);
+    void handleWorkspaceFileSelect(`${browserTabType.virtualScheme}${id}?title=${title}`);
+  }, [newBrowserTabVersion, extensionFileTypes, handleWorkspaceFileSelect]);
+
   // React to "toggle AI chat panel" (Cmd+Shift+A) from the menu. The IPC
   // subscription lives in store/listeners/appCommandListeners.ts.
   // Use a ref to debounce rapid calls (can happen with menu accelerators).
@@ -917,7 +1073,7 @@ const EditorMode = forwardRef<EditorModeRef, EditorModeProps>(function EditorMod
         const extType = extensionFileTypes.find(e => e.extension === extName);
         if (extType) {
           fullFileName = fileName.endsWith(extName) ? fileName : `${fileName}${extName}`;
-          content = extType.defaultContent;
+          content = extType.defaultContent ?? '';
         } else {
           // Fallback
           fullFileName = fileName;
@@ -994,6 +1150,7 @@ const EditorMode = forwardRef<EditorModeRef, EditorModeProps>(function EditorMod
               isActive={isActive}
               onToggleAIChat={() => setIsAIChatCollapsed(prev => !prev)}
               isAIChatCollapsed={isAIChatCollapsed}
+              onTabDoubleClick={toggleEditorMaximized}
             >
               <TabContent
                 onManualSaveReady={(saveFn) => {
@@ -1047,6 +1204,7 @@ const EditorMode = forwardRef<EditorModeRef, EditorModeProps>(function EditorMod
           <ChatSidebar
             ref={chatSidebarRef}
             workspacePath={workspacePath}
+            isActive={isActive}
             isCollapsed={isAIChatCollapsed}
             onToggleCollapse={() => setIsAIChatCollapsed(prev => !prev)}
             width={aiChatWidth}

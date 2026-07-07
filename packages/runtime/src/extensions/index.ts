@@ -17,6 +17,7 @@ export type {
   CommandContribution,
   NewFileMenuContribution,
   SlashCommandContribution,
+  AgentWorkflowsContribution,
   ClaudePluginContribution,
   ClaudePluginCommand,
   ClaudePluginAgent,
@@ -49,6 +50,7 @@ export type {
   SettingsPanelProps,
   ExtensionStorage,
   ExtensionFileStorage,
+  ExtensionDataAccess,
   ExecOptions,
   ExecResult,
   // Theme types
@@ -88,6 +90,15 @@ export {
 } from './ExtensionAIToolsBridge';
 export type { MCPToolDefinition } from './ExtensionAIToolsBridge';
 
+// Voice context provider registry (Core hook 2)
+export {
+  registerVoiceContextProvider,
+  unregisterVoiceContextProvidersForExtension,
+  collectVoiceSessionContext,
+  _clearVoiceContextProvidersForTest,
+} from './VoiceContextProviderRegistry';
+export type { CollectVoiceContextOptions } from './VoiceContextProviderRegistry';
+
 // Extension Editor API Registry
 export {
   registerEditorAPI,
@@ -106,6 +117,11 @@ export type {
   EditorContext,
   DiffConfig,
   DiffResult,
+  CollaborationContext,
+  CollaborationStatus,
+  CollaboratorInfo,
+  RevisionSnapshotAdapter,
+  StandardAwarenessState,
 } from './editorHost';
 
 // Editor Lifecycle Hook
@@ -115,6 +131,25 @@ export type {
   UseEditorLifecycleResult,
   DiffState,
 } from './useEditorLifecycle';
+
+// Collaborative Editor Hook
+export { useCollaborativeEditor, COLLAB_INIT_ORIGIN } from './useCollaborativeEditor';
+export type {
+  UseCollaborativeEditorConfig,
+  UseCollaborativeEditorResult,
+} from './useCollaborativeEditor';
+
+// Collab content adapter factory + cross-process reconstruction (re-exported
+// from the SDK so the Electron main process can use them via @nimbalyst/runtime
+// without depending on @nimbalyst/extension-sdk directly).
+export {
+  createTextCollabContentAdapter,
+  reconstructCollabContentAdapterFromDescriptor,
+  TEXT_COLLAB_DEFAULT_FIELD,
+  type TextCollabContentAdapterOptions,
+  type CollabAdapterDescriptor,
+  type TextCollabAdapterDescriptor,
+} from '@nimbalyst/extension-sdk';
 
 // Extension Storage
 export {

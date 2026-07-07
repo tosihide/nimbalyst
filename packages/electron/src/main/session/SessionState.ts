@@ -10,6 +10,7 @@ import { logger } from '../utils/logger';
 import { AnalyticsService } from '../services/analytics/AnalyticsService';
 import { GitStatusService } from '../services/GitStatusService';
 import { autoMatchTeamForWorkspace } from '../services/TeamService';
+import { updateTrackerSchemaWorkspace } from '../services/TrackerSchemaService';
 
 // Save session state
 export async function saveSessionState() {
@@ -49,12 +50,12 @@ export async function saveSessionState() {
         lastUpdated: Date.now()
     };
 
-    // logger.session.info('[SAVE] Saving session state:', JSON.stringify(sessionState, null, 2));
+    logger.session.debug(`[SAVE] Saving session state: ${sessionWindows.length} window(s): ${sessionWindows.map((w) => w.workspacePath || w.filePath || w.mode).join(', ')}`);
     saveToStore(sessionState);
 
     // Verify the save by reading it back
     const verified = getSessionState();
-    // logger.session.info('[SAVE] Verified session state:', JSON.stringify(verified, null, 2));
+    logger.session.debug(`[SAVE] Verified session state: ${verified?.windows?.length ?? 0} window(s)`);
 }
 
 // Restore session state
@@ -171,6 +172,7 @@ export async function restoreSessionState(): Promise<boolean> {
                             // Yield before running background workspace matching so
                             // restored windows don't block the startup tick.
                             void autoMatchTeamForWorkspace(restoredWorkspacePath).catch(() => {});
+                            updateTrackerSchemaWorkspace(restoredWorkspacePath);
                         }, 0);
 
                         // Note: Workspace tabs will be restored by the workspace's own tab state management

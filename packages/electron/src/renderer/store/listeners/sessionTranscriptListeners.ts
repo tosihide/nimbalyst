@@ -26,6 +26,7 @@ import {
   sessionErrorAtom,
   sessionQueuedPromptsAtom,
   streamCompletionSignalAtom,
+  transcriptEventSignalAtom,
 } from '../atoms/sessionTranscript';
 
 /**
@@ -69,12 +70,13 @@ export function initSessionTranscriptListeners(): () => void {
       isAuthError?: boolean;
       isBedrockToolError?: boolean;
       isServerError?: boolean;
+      isCodexAuthRequired?: boolean;
     }) => {
-      const { sessionId, message, isAuthError, isBedrockToolError, isServerError } = data;
+      const { sessionId, message, isAuthError, isBedrockToolError, isServerError, isCodexAuthRequired } = data;
       if (!sessionId) return;
 
       // Set the error in the atom - SessionTranscript will read it and display
-      store.set(sessionErrorAtom(sessionId), { message, isAuthError, isBedrockToolError, isServerError });
+      store.set(sessionErrorAtom(sessionId), { message, isAuthError, isBedrockToolError, isServerError, isCodexAuthRequired });
 
       // Signal stream completion so awaiters (e.g. superLoopBlockedFeedback) unblock
       store.set(streamCompletionSignalAtom(sessionId), (prev) => prev + 1);
@@ -135,6 +137,27 @@ export function initSessionTranscriptListeners(): () => void {
         timestamp,
         messageIndex: lastUserIdx,
       });
+    })
+  );
+
+  // =========================================================================
+  // Transcript Event (per-session activity signal)
+  // Bumps a per-session signal atom so components (e.g. the kanban transcript
+  // peek) can react to new turns without subscribing to IPC themselves.
+  // =========================================================================
+  cleanups.push(
+    window.electronAPI.on('transcript:event', (event: { sessionId?: string }) => {
+      const sessionId = event?.sessionId;
+      if (!sessionId) return;
+      store.set(transcriptEventSignalAtom(sessionId), (prev) => prev + 1);
+    })
+  );
+
+  cleanups.push(
+    window.electronAPI.on('transcript:session-reparsed', (event: { sessionId?: string }) => {
+      const sessionId = event?.sessionId;
+      if (!sessionId) return;
+      store.set(transcriptEventSignalAtom(sessionId), (prev) => prev + 1);
     })
   );
 

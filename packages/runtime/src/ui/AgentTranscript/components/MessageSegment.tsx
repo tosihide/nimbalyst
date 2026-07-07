@@ -5,12 +5,15 @@ import { JSONViewer } from './JSONViewer';
 import { DiffViewer } from './DiffViewer';
 import { LoginRequiredWidget } from './LoginRequiredWidget';
 import { OpenAIAuthWidget } from './OpenAIAuthWidget';
+import { CodexAuthRequiredWidget } from './CodexAuthRequiredWidget';
 import { ContextLimitWidget } from './ContextLimitWidget';
 import { RateLimitWidget } from './RateLimitWidget';
+import { ApiServiceErrorWidget, isApiServiceError } from './ApiServiceErrorWidget';
 import { FullscreenModal } from './FullscreenModal';
 import { MaterialSymbol } from '../../icons/MaterialSymbol';
 import { formatToolDisplayName } from '../utils/toolNameFormatter';
 import { isCommitRequestMessage, parseCommitRequest, CommitRequestCard } from './CommitRequestCard';
+import { localAssetUrl } from '../../../utils/localAssetUrl';
 
 interface MessageSegmentProps {
   message: TranscriptViewMessage;
@@ -182,6 +185,15 @@ export const MessageSegment: React.FC<MessageSegmentProps> = ({
       return <RateLimitWidget content={message.text ?? ''} />;
     }
 
+    // Upstream Claude API service errors (api_error 5xx, overloaded_error)
+    // that the CLI / SDK forwards verbatim. Surface as a human-readable
+    // explanation with the request_id, status page link, and a "show raw
+    // payload" disclosure for support tickets. Conservative detection -
+    // see isApiServiceError for the signal definition.
+    if (!isUser && isApiServiceError(message.text ?? '')) {
+      return <ApiServiceErrorWidget content={message.text ?? ''} />;
+    }
+
     // Check if this is an OpenAI auth error in the message content
     if (!isUser && isOpenAIAuthError(message.text ?? '')) {
       return shouldShowLoginWidget ? <OpenAIAuthWidget /> : null;
@@ -228,6 +240,7 @@ export const MessageSegment: React.FC<MessageSegmentProps> = ({
           isSystemMessage={isSystemMessage}
           onOpenFile={onOpenFile}
           onOpenSession={onOpenSession}
+          messageId={message.id}
         />
         {isCollapsed && (
           <div className="absolute bottom-0 left-0 right-0 h-12 bg-gradient-to-t from-[var(--nim-bg-secondary)] to-transparent pointer-events-none" />
@@ -328,6 +341,17 @@ export const MessageSegment: React.FC<MessageSegmentProps> = ({
 
     const errorMessage = message.text || 'Error';
 
+    // Pre-flight Codex app-server auth failure -- prefer the structured CTA
+    // over the generic OpenAIAuthWidget so the user gets a one-click jump to
+    // the new Codex auth panel in Settings. shouldShowLoginWidget gates this
+    // for history rendering (same rule as other auth widgets).
+    if (message.isCodexAuthRequired && shouldShowLoginWidget) {
+      return <CodexAuthRequiredWidget fallbackMessage={errorMessage} />;
+    }
+    if (message.isCodexAuthRequired && !shouldShowLoginWidget) {
+      return null;
+    }
+
     // Check if this is an OpenAI authentication error
     if (isOpenAIAuthError(errorMessage) && shouldShowLoginWidget) {
       return <OpenAIAuthWidget />;
@@ -357,6 +381,13 @@ export const MessageSegment: React.FC<MessageSegmentProps> = ({
     // Check if this is a rate limit event
     if (isRateLimitContent(errorMessage)) {
       return <RateLimitWidget content={errorMessage} />;
+    }
+
+    // Upstream API service error (api_error 5xx, overloaded_error) -
+    // same detection as the text-content path, applied here too so an
+    // error-flagged message also gets the human-readable surface.
+    if (isApiServiceError(errorMessage)) {
+      return <ApiServiceErrorWidget content={errorMessage} />;
     }
 
     // Otherwise, render the generic error UI
@@ -411,7 +442,7 @@ export const MessageSegment: React.FC<MessageSegmentProps> = ({
           >
             {attachment.type === 'image' ? (
               <img
-                src={(attachment as any).thumbnail || `file://${attachment.filepath}`}
+                src={(attachment as any).thumbnail || localAssetUrl(attachment.filepath)}
                 alt={attachment.filename}
                 className="message-attachment-thumbnail w-12 h-12 object-cover rounded shrink-0"
               />
@@ -432,17 +463,20 @@ export const MessageSegment: React.FC<MessageSegmentProps> = ({
 
   // Render image lightbox modal
   const renderImageModal = () => {
-    // For enlarged view, use the full file path (not thumbnail)
-    // Convert file path to file:// URL for Electron
+    // For enlarged view, use the full file path (not thumbnail).
+    // Local file paths are routed through `localAssetUrl` so Electron can
+    // serve them via `nim-asset://` (the main window has `webSecurity: true`
+    // and cannot load `file://` directly).
     const getEnlargedSrc = () => {
       if (!enlargedImage) return '';
       if (enlargedImage.filepath) {
-        // If it's already a file:// URL or data URL, use as-is
-        if (enlargedImage.filepath.startsWith('file://') || enlargedImage.filepath.startsWith('data:')) {
+        if (enlargedImage.filepath.startsWith('data:')) {
           return enlargedImage.filepath;
         }
-        // Convert file path to file:// URL
-        return `file://${enlargedImage.filepath}`;
+        if (enlargedImage.filepath.startsWith('file://')) {
+          return localAssetUrl(enlargedImage.filepath.replace(/^file:\/\//, ''));
+        }
+        return localAssetUrl(enlargedImage.filepath);
       }
       // Fallback to thumbnail if no filepath
       return enlargedImage.thumbnail || '';

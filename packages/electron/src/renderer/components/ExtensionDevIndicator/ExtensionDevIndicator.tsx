@@ -150,7 +150,13 @@ export const ExtensionDevIndicator: React.FC<ExtensionDevIndicatorProps> = ({
             ...ext,
             // Get name from manifest if not provided directly
             name: ext.name || ext.manifest?.name || ext.id,
-          }));
+          }))
+          .sort((a, b) => {
+            const nameComparison = a.name.localeCompare(b.name, undefined, {
+              sensitivity: 'base',
+            });
+            return nameComparison !== 0 ? nameComparison : a.id.localeCompare(b.id);
+          });
         setExtensions(buildableExtensions);
       } catch (error) {
         console.error('[ExtensionDevIndicator] Failed to fetch extensions:', error);

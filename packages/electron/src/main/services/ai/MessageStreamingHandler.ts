@@ -13,12 +13,14 @@
  */
 
 import { BrowserWindow } from 'electron';
-import * as fs from 'fs';
 import * as path from 'path';
 import {
   ProviderFactory,
   ModelRegistry,
   isAgentProvider,
+  onAgentMessageBatch,
+  buildMetaAgentSystemPrompt,
+  buildDevAgentSystemPrompt,
   type AIProvider,
   type SessionManager,
 } from '@nimbalyst/runtime/ai/server';
@@ -33,10 +35,34 @@ import {
 } from '@nimbalyst/runtime/ai/server/types';
 import { getSessionStateManager } from '@nimbalyst/runtime/ai/server/SessionStateManager';
 import { isBedrockToolSearchError } from '@nimbalyst/runtime/ai/server/utils/errorDetection';
-import { parseEffortLevel } from '@nimbalyst/runtime/ai/server/effortLevels';
+import { resolveEffortLevel } from '@nimbalyst/runtime/ai/server/effortLevels';
 import type { RawDocumentContext, DocumentContextService } from '@nimbalyst/runtime';
 import { AISessionsRepository } from '@nimbalyst/runtime';
 import { toolRegistry } from './tools';
+import { resolveExtensionAgentRef } from './providerResolution';
+import { getAgentProviderRegistry } from '../../extensions/AgentProviderRegistry';
+
+/**
+ * Resolve the human-readable model name (e.g. "Gemini 3.5 Flash (High)") for an
+ * extension agent provider, so the system prompt can tell the model its real
+ * name instead of the raw internal id. Returns undefined for built-in providers.
+ */
+function resolveExtensionModelDisplayName(
+  provider: string,
+  model: string | null | undefined,
+): string | undefined {
+  if (!model) return undefined;
+  try {
+    const entry = getAgentProviderRegistry().findByContributionId(provider);
+    const match = entry?.contribution.models?.find(
+      (m) => m.id === model || m.id.endsWith(`:${model}`),
+    );
+    return match?.name;
+  } catch {
+    return undefined;
+  }
+}
+
 import { extractFilePath } from './tools/extractFilePath';
 import { SoundNotificationService } from '../SoundNotificationService';
 import { notificationService } from '../NotificationService';
@@ -44,16 +70,23 @@ import { TrayManager } from '../../tray/TrayManager';
 import { logger } from '../../utils/logger';
 import { windowStates, findWindowByWorkspace } from '../../window/WindowManager';
 import { sessionFileTracker } from '../SessionFileTracker';
+import { codexEditWindowRegistry, shouldOpenCodexEditWindow } from '../CodexEditWindowRegistry';
 import { toolCallMatcher, unwrapShellCommand } from '../ToolCallMatcher';
 import { FeatureUsageService, FEATURES } from '../FeatureUsageService.ts';
 import { historyManager } from '../../HistoryManager';
 import { addGitignoreBypass } from '../../file/WorkspaceEventBus';
 import { getSyncProvider, isDesktopTrulyAway } from '../SyncManager';
+import { setSessionPendingPrompt } from './pendingPromptPersistence';
+import { getAgentWorkflowService } from '../AgentWorkflowService';
+import { getMetaAgentOpenAITools } from '../../mcp/metaAgentServer';
+import { getDevAgentOpenAITools, resolveDevToolScope } from '../../mcp/devAgentTools';
+import { MetaAgentService } from '../MetaAgentService';
 import {
   shouldShowCommunityPopup,
   markCommunityPopupShown,
   wasCommunityPopupShownThisLaunch,
   incrementCompletedSessionsWithTools,
+  getDefaultEffortLevel,
 } from '../../utils/store';
 import {
   safeSend,
@@ -68,12 +101,11 @@ import {
   tagFileBeforeEdit,
   detectConfiguredAIProvider,
   detectNimbalystSlashCommand,
-  recoverBaselineFromHistory,
   readFileContentOrNull,
-  isCreateLikeChangeKind,
-  isBinaryFile,
   getFileExtensionForAnalytics,
 } from './aiServiceUtils';
+import { disableParentNotificationsAfterDirectTakeover } from './childSessionTakeover';
+import { installScopedProviderListener } from './providerListenerRegistry';
 import type Store from 'electron-store';
 import type { AIService } from './AIService';
 import type { HooklessAgentFileWatcher } from './HooklessAgentFileWatcher';
@@ -113,6 +145,12 @@ interface AIServiceInternal {
     targetWindow: Electron.BrowserWindow | null,
     source: string,
   ): Promise<void>;
+  tryDispatchNextQueuedPrompt(
+    sessionId: string,
+    workspacePath: string,
+    targetWindow: Electron.BrowserWindow | null,
+    source: string,
+  ): Promise<boolean>;
   runAutoContextCommand(
     session: SessionData,
     workspacePath: string,
@@ -162,11 +200,96 @@ async function getCurrentSessionTitle(sessionId: string, fallback = 'AI Session'
   return fallback;
 }
 
+// Cache of sessionId -> workspacePath so per-batch broadcast routing doesn't
+// hit the DB on every flush. A session's workspace is immutable, so the cache
+// never needs invalidation; it grows with the number of distinct sessions
+// seen. First lookup for an unknown session pays one AISessionsRepository.get;
+// subsequent lookups are O(1).
+const sessionWorkspaceCache = new Map<string, string>();
+
+async function getWorkspacePathForSession(sessionId: string): Promise<string | null> {
+  const cached = sessionWorkspaceCache.get(sessionId);
+  if (cached) return cached;
+  try {
+    const session = await AISessionsRepository.get(sessionId);
+    if (session?.workspacePath) {
+      sessionWorkspaceCache.set(sessionId, session.workspacePath);
+      return session.workspacePath;
+    }
+  } catch {
+    // Ignore — caller will skip the broadcast.
+  }
+  return null;
+}
+
 export class MessageStreamingHandler {
   private readonly svc: AIServiceInternal;
+  private readonly unsubscribeBatchListener: () => void;
+  // Per-provider map of event -> currently-installed listener. Used by
+  // installListener so handle() can re-wire its own subscriptions on every
+  // ai:sendMessage call without nuking listeners owned by other modules.
+  // WeakMap so a discarded provider instance is garbage-collected normally.
+  private readonly providerListeners = new WeakMap<
+    AIProvider,
+    Map<string, (...args: any[]) => void>
+  >();
 
   constructor(service: AIService) {
     this.svc = service as unknown as AIServiceInternal;
+
+    // The shared AgentMessageWriteQueue (in BaseAIProvider) coalesces streaming
+    // chunk writes to relieve PGLite writer-lock contention. Per-row
+    // 'message:logged' is still emitted from BaseAIProvider.logAgentMessage
+    // (awaited writes: user input, final output, errors, can_use_tool audit),
+    // but the streaming firehose no longer fires per-row. Forward one batch
+    // event per flush per session so any window viewing that session can
+    // refresh once instead of N times. The queue already excludes hidden rows
+    // from the count, so we don't filter again here.
+    this.unsubscribeBatchListener = onAgentMessageBatch((batch) => {
+      // Route to only the window owning this session's workspace. The previous
+      // BrowserWindow.getAllWindows() fan-out caused every window to react to
+      // every other window's session activity, which surfaced as
+      // [SessionManager] Rejecting session ... rejection logs because the
+      // receiving window's renderer would call aiLoadSession with its own
+      // workspace path. The session's workspace is immutable, so we cache the
+      // lookup. findWindowByWorkspace is rail-aware, so it correctly resolves
+      // a window that hosts the session's project as a rail-warm
+      // (additionalWorkspacePaths) entry, not just as the active one.
+      // See docs/IPC_GUIDE.md "Workspace-Scoped IPC".
+      void getWorkspacePathForSession(batch.sessionId).then((workspacePath) => {
+        if (!workspacePath) {
+          return;
+        }
+        const targetWindow = findWindowByWorkspace(workspacePath);
+        if (targetWindow && !targetWindow.isDestroyed()) {
+          targetWindow.webContents.send('ai:messages-logged-batch', {
+            ...batch,
+            workspacePath,
+          });
+        }
+      });
+    });
+  }
+
+  /** Used by AIService teardown to unwire the singleton batch listener. */
+  destroy(): void {
+    this.unsubscribeBatchListener();
+  }
+
+  /**
+   * Replace the previously-installed listener for this (provider, event) pair
+   * without touching listeners owned by other modules. handle() registers its
+   * subscriptions on every ai:sendMessage call against the same cached
+   * per-session provider instance, so it needs to remove its own prior
+   * listener but not the whole event channel (the old removeAllListeners
+   * pattern silently dropped any other module that started subscribing).
+   */
+  private installListener(
+    provider: AIProvider,
+    event: string,
+    listener: (...args: any[]) => void,
+  ): void {
+    installScopedProviderListener(this.providerListeners, provider, event, listener);
   }
 
   handle: SendMessageHandler = async (
@@ -247,6 +370,11 @@ export class MessageStreamingHandler {
       throw new Error(`Session mismatch: requested ${sessionId} but got ${session.id}`);
     }
 
+    const inputType = (documentContext as any)?.inputType as string | undefined;
+    if (inputType === 'user' && !queuedPromptId) {
+      await this.disableParentNotificationsAfterDirectTakeover(session);
+    }
+
     // CRITICAL: If session has a worktree, use its path instead of workspace path
     // This ensures Claude Code runs in the worktree directory
     let effectiveWorkspacePath = session.worktreePath || workspacePath;
@@ -255,7 +383,7 @@ export class MessageStreamingHandler {
     // This is passed through documentContext to avoid changing sendMessage signature
     let permissionsPath = session.worktreeProjectPath || effectiveWorkspacePath;
     if (isAgentProvider(session.provider)) {
-      await this.svc.hooklessWatcher.ensureForSession(session.id, effectiveWorkspacePath, event);
+      await this.svc.hooklessWatcher.ensureForSession(session.id, effectiveWorkspacePath);
     }
 
     // Comprehensive logging of what we're sending to Claude
@@ -269,8 +397,8 @@ export class MessageStreamingHandler {
       //   documentContext.content.substring(0, 500) +
       //   (documentContext.content.length > 500 ? '...' : ''));
 
-      // Check for frontmatter
-      const frontmatterMatch = documentContext.content.match(/^---\n([\s\S]*?)\n---/);
+      // Check for frontmatter (`\r?\n` tolerates Windows CRLF; nimbalyst#68)
+      const frontmatterMatch = documentContext.content.match(/^---\r?\n([\s\S]*?)\r?\n---/);
       if (frontmatterMatch) {
       } else {
       }
@@ -333,39 +461,57 @@ export class MessageStreamingHandler {
       let requiresApiKey = true;
       const effectiveWorkspacePath = session.workspacePath || workspacePath;
       apiKey = this.svc.getApiKeyForProvider(session.provider, effectiveWorkspacePath);
-      switch (session.provider) {
-        case 'claude':
-          errorMessage = 'Anthropic API key not configured';
-          break;
-        case 'claude-code':
-          // Claude Code: API key is optional and uses OAuth login when not configured.
-          requiresApiKey = false;
-          break;
-        case 'openai':
-          errorMessage = 'OpenAI API key not configured';
-          break;
-        case 'openai-codex':
-          // Codex SDK uses its own auth (codex auth login), API key is optional
-          requiresApiKey = false;
-          break;
-        case 'openai-codex-acp':
-          // Codex ACP uses the codex-acp binary's own auth, API key is optional
-          requiresApiKey = false;
-          break;
-        case 'opencode':
-          // OpenCode uses its own config, API key is optional
-          requiresApiKey = false;
-          break;
-        case 'copilot-cli':
-          // Copilot uses its own CLI auth, no API key needed
-          requiresApiKey = false;
-          break;
-        case 'lmstudio':
-          // LMStudio doesn't need an API key, just the base URL
-          apiKey = 'not-required'; // Dummy value since LMStudio doesn't need a key
-          break;
-        default:
-          throw new Error(`Unknown provider: ${session.provider}`);
+
+      // Resolve the extension-agent ref (null for built-in providers). The
+      // built-in switch below is the legacy path; the registry lookup is the
+      // shim that lets aiAgentProviders contributions ride the same streaming
+      // hot path until `session.provider` is widened to a discriminated union
+      // (flagged in the seed PR).
+      const extensionAgentRef = resolveExtensionAgentRef(session.provider);
+
+      if (extensionAgentRef) {
+        // Extension-agent providers defer auth to their own backend module
+        // (e.g. Antigravity rides ~/.gemini OAuth). No host-side apiKey check.
+        requiresApiKey = false;
+      } else {
+        switch (session.provider) {
+          case 'claude':
+            errorMessage = 'Anthropic API key not configured';
+            break;
+          case 'claude-code':
+            // Claude Code: API key is optional and uses OAuth login when not configured.
+            requiresApiKey = false;
+            break;
+          case 'claude-code-cli':
+            // Genuine `claude` CLI: uses its own login/subscription, no API key.
+            requiresApiKey = false;
+            break;
+          case 'openai':
+            errorMessage = 'OpenAI API key not configured';
+            break;
+          case 'openai-codex':
+            // Codex SDK uses its own auth (codex auth login), API key is optional
+            requiresApiKey = false;
+            break;
+          case 'openai-codex-acp':
+            // Codex ACP uses the codex-acp binary's own auth, API key is optional
+            requiresApiKey = false;
+            break;
+          case 'opencode':
+            // OpenCode uses its own config, API key is optional
+            requiresApiKey = false;
+            break;
+          case 'copilot-cli':
+            // Copilot uses its own CLI auth, no API key needed
+            requiresApiKey = false;
+            break;
+          case 'lmstudio':
+            // LMStudio doesn't need an API key, just the base URL
+            apiKey = 'not-required'; // Dummy value since LMStudio doesn't need a key
+            break;
+          default:
+            throw new Error(`Unknown provider: ${session.provider}`);
+        }
       }
 
       if (!apiKey && requiresApiKey) {
@@ -375,19 +521,42 @@ export class MessageStreamingHandler {
       // Create the provider
       if (isProviderClaudeCode) {
       }
-      provider = ProviderFactory.createProvider(session.provider, session.id);
+      if (extensionAgentRef) {
+        // Route to the extension-agent factory branch. createExtensionAgentProvider
+        // is a thin wrapper that defers lazy-spawn of the backend module to the
+        // first `initialize` call routed through the AgentBridge. Cache key is
+        // namespaced to avoid collision with built-in providers.
+        provider =
+          ProviderFactory.getExtensionAgentProvider({
+            extensionId: extensionAgentRef.extensionId,
+            contributionId: extensionAgentRef.contributionId,
+            sessionId: session.id,
+          }) ??
+          ProviderFactory.createExtensionAgentProvider({
+            extensionId: extensionAgentRef.extensionId,
+            contributionId: extensionAgentRef.contributionId,
+            sessionId: session.id,
+            model: session.model,
+          });
+      } else {
+        // The inner switch above is exhaustive over AIProviderType + throws on
+        // default, so by this point session.provider is statically narrowable
+        // to AIProviderType. The cast makes the narrowing explicit since the
+        // exhaustiveness sits inside a conditional block.
+        provider = ProviderFactory.createProvider(session.provider as AIProviderType, session.id);
+      }
 
       if (isProviderClaudeCode) {
       }
 
+      const reinitEffortLevel = resolveEffortLevel((session.metadata as any)?.effortLevel, getDefaultEffortLevel());
       const reinitConfig: any = {
         apiKey,
         maxTokens: (session.providerConfig as any)?.maxTokens,
         temperature: (session.providerConfig as any)?.temperature,
-        // Pass effort level from session metadata (Opus 4.6 adaptive reasoning)
-        ...((session.metadata as any)?.effortLevel && {
-          effortLevel: parseEffortLevel((session.metadata as any).effortLevel),
-        }),
+        // Effort level: explicit session value, else the app-wide default the
+        // selector displays (Opus 4.6 adaptive reasoning).
+        ...(reinitEffortLevel && { effortLevel: reinitEffortLevel }),
       };
 
       // Add baseUrl for LMStudio
@@ -538,15 +707,21 @@ export class MessageStreamingHandler {
     const toolHandler = this.svc.createToolHandler(event.sender, documentContext, session.id, effectiveWorkspacePath);
     provider.registerToolHandler(toolHandler);
 
-    // Listen for message:logged events and forward to renderer to trigger UI updates
-    // Skip hidden messages - they shouldn't trigger UI refreshes
+    // Listen for message:logged events and forward to renderer to trigger UI updates.
+    // Skip hidden messages - they shouldn't trigger UI refreshes.
+    //
+    // Multi-project rail: include the session's workspacePath in the payload
+    // so the renderer can route the reload to the correct workspace even
+    // when the session is in a project that is not currently visible. The
+    // renderer's session registry holds only the visible project's
+    // sessions, so it can't always resolve the path on its own.
     const onMessageLogged = (data: { sessionId: string; direction: string; hidden?: boolean }) => {
       if (data.hidden) return;
-      safeSend(event, 'ai:message-logged', data);
+      safeSend(event, 'ai:message-logged', { ...data, workspacePath: effectiveWorkspacePath });
     };
-    // Remove all previous listeners to avoid duplicates
-    provider.removeAllListeners('message:logged');
-    provider.on('message:logged', onMessageLogged);
+    // Replace this handler's previous 'message:logged' subscription only,
+    // so other modules subscribing to the same provider event stay wired.
+    this.installListener(provider, 'message:logged', onMessageLogged);
 
     // Forward provider-side title updates (from the SDK's generateSessionTitle
     // path) to all renderers so the session list updates in real time.
@@ -558,8 +733,7 @@ export class MessageStreamingHandler {
         }
       }
     };
-    provider.removeAllListeners('session:title-updated');
-    provider.on('session:title-updated', onSessionTitleUpdated);
+    this.installListener(provider, 'session:title-updated', onSessionTitleUpdated);
 
     // Forward provider-side metadata updates (e.g. tags/phase from the SDK's
     // out-of-band naming side-question and the default-phase fallback) to all
@@ -583,24 +757,21 @@ export class MessageStreamingHandler {
         });
       }
     };
-    provider.removeAllListeners('session:metadata-updated');
-    provider.on('session:metadata-updated', onSessionMetadataUpdated);
+    this.installListener(provider, 'session:metadata-updated', onSessionMetadataUpdated);
 
-    // Helper to sync pending prompt state to mobile
+    // Helper to persist pending-prompt state to ai_sessions.metadata AND
+    // push the change to mobile in one call. See pendingPromptPersistence.ts
+    // for why we persist locally: the in-memory atom can desync from reality
+    // if a resolve event is missed (renderer reload, HMR, late delivery),
+    // and the only recovery is rehydrating from the DB on next list refresh.
     const syncPendingPrompt = (sessionId: string, hasPendingPrompt: boolean) => {
-      const sp = getSyncProvider();
-      if (sp) {
-        sp.pushChange(sessionId, {
-          type: 'metadata_updated',
-          metadata: { hasPendingPrompt, updatedAt: Date.now() },
-        });
-      }
+      void setSessionPendingPrompt(sessionId, hasPendingPrompt);
     };
 
     // Listen for ExitPlanMode confirmation requests and forward to renderer
     const onExitPlanModeConfirm = async (data: { requestId: string; sessionId: string; planSummary: string; timestamp: number }) => {
       logger.main.info('[AIService] ExitPlanMode confirmation requested:', data.requestId);
-      safeSend(event, 'ai:exitPlanModeConfirm', data);
+      safeSend(event, 'ai:exitPlanModeConfirm', { ...data, workspacePath: effectiveWorkspacePath });
       syncPendingPrompt(data.sessionId, true);
       TrayManager.getInstance().onPromptCreated(data.sessionId);
 
@@ -621,13 +792,40 @@ export class MessageStreamingHandler {
         effectiveWorkspacePath
       );
     };
-    provider.removeAllListeners('exitPlanMode:confirm');
-    provider.on('exitPlanMode:confirm', onExitPlanModeConfirm);
+    this.installListener(provider, 'exitPlanMode:confirm', onExitPlanModeConfirm);
+
+    // Listen for ExitPlanMode resolutions (approve/deny) and flip session
+    // status back to 'running' so SessionStateManager emits session:streaming
+    // for every subscribed window. Required for the "Continued Planning"
+    // denial path in the multi-project rail: without this, state stays at
+    // waiting_for_input and the AGENT panel's "Thinking…" indicator does
+    // not re-appear when the SDK resumes streaming. Mirrors the
+    // askUserQuestion:answered and toolPermission:resolved patterns above.
+    const onExitPlanModeResolved = (data: {
+      requestId: string;
+      sessionId: string;
+      approved: boolean;
+      respondedBy?: 'desktop' | 'mobile';
+      timestamp: number;
+    }) => {
+      logger.main.info('[AIService] ExitPlanMode resolved:', data.requestId, 'approved=', data.approved);
+      syncPendingPrompt(data.sessionId, false);
+      TrayManager.getInstance().onPromptResolved(data.sessionId);
+
+      getSessionStateManager().updateActivity({
+        sessionId: data.sessionId,
+        status: 'running',
+        isStreaming: true,
+      }).catch((err) => {
+        logger.main.error('[AIService] Failed to update session status to running after ExitPlanMode resolve:', err);
+      });
+    };
+    this.installListener(provider, 'exitPlanMode:resolved', onExitPlanModeResolved);
 
     // Listen for AskUserQuestion requests and forward to renderer
     const onAskUserQuestion = async (data: { questionId: string; sessionId: string; questions: any[]; timestamp: number }) => {
       // logger.main.info('[AIService] AskUserQuestion requested:', data.questionId);
-      safeSend(event, 'ai:askUserQuestion', data);
+      safeSend(event, 'ai:askUserQuestion', { ...data, workspacePath: effectiveWorkspacePath });
       syncPendingPrompt(data.sessionId, true);
       TrayManager.getInstance().onPromptCreated(data.sessionId);
 
@@ -648,13 +846,12 @@ export class MessageStreamingHandler {
         effectiveWorkspacePath
       );
     };
-    provider.removeAllListeners('askUserQuestion:pending');
-    provider.on('askUserQuestion:pending', onAskUserQuestion);
+    this.installListener(provider, 'askUserQuestion:pending', onAskUserQuestion);
 
     // Listen for AskUserQuestion answers and forward to renderer to update tool call display
     const onAskUserQuestionAnswered = (data: { questionId: string; sessionId: string; questions: any[]; answers: Record<string, string>; timestamp: number }) => {
       // logger.main.info('[AIService] AskUserQuestion answered:', data.questionId);
-      safeSend(event, 'ai:askUserQuestionAnswered', data);
+      safeSend(event, 'ai:askUserQuestionAnswered', { ...data, workspacePath: effectiveWorkspacePath });
       syncPendingPrompt(data.sessionId, false);
       TrayManager.getInstance().onPromptResolved(data.sessionId);
 
@@ -665,8 +862,7 @@ export class MessageStreamingHandler {
         isStreaming: true,
       }).catch(() => {});
     };
-    provider.removeAllListeners('askUserQuestion:answered');
-    provider.on('askUserQuestion:answered', onAskUserQuestionAnswered);
+    this.installListener(provider, 'askUserQuestion:answered', onAskUserQuestionAnswered);
 
     // Listen for tool permission requests and forward to renderer
     const onToolPermissionPending = async (data: { requestId: string; sessionId: string; workspacePath: string; request: any; timestamp: number }) => {
@@ -696,13 +892,12 @@ export class MessageStreamingHandler {
         data.workspacePath
       );
     };
-    provider.removeAllListeners('toolPermission:pending');
-    provider.on('toolPermission:pending', onToolPermissionPending);
+    this.installListener(provider, 'toolPermission:pending', onToolPermissionPending);
 
     // Listen for tool permission resolved and forward to renderer
     const onToolPermissionResolved = (data: { requestId: string; sessionId: string; response: any; timestamp: number }) => {
       logger.main.info('[AIService] Tool permission resolved:', data.requestId);
-      safeSend(event, 'ai:toolPermissionResolved', data);
+      safeSend(event, 'ai:toolPermissionResolved', { ...data, workspacePath: effectiveWorkspacePath });
       syncPendingPrompt(data.sessionId, false);
       TrayManager.getInstance().onPromptResolved(data.sessionId);
 
@@ -713,8 +908,7 @@ export class MessageStreamingHandler {
         isStreaming: true,
       }).catch(() => {});
     };
-    provider.removeAllListeners('toolPermission:resolved');
-    provider.on('toolPermission:resolved', onToolPermissionResolved);
+    this.installListener(provider, 'toolPermission:resolved', onToolPermissionResolved);
 
     // Listen for prompt additions and forward to renderer for debug display
     const onPromptAdditions = (data: {
@@ -726,8 +920,7 @@ export class MessageStreamingHandler {
     }) => {
       safeSend(event, 'ai:promptAdditions', data);
     };
-    provider.removeAllListeners('promptAdditions');
-    provider.on('promptAdditions', onPromptAdditions);
+    this.installListener(provider, 'promptAdditions', onPromptAdditions);
 
     // Listen for expired session events and clear the providerSessionId from database
     // This ensures subsequent messages start fresh even after app restart
@@ -739,8 +932,7 @@ export class MessageStreamingHandler {
         logger.main.error('[AIService] Failed to clear expired providerSessionId:', error);
       }
     };
-    provider.removeAllListeners('session:providerSessionExpired');
-    provider.on('session:providerSessionExpired', onProviderSessionExpired);
+    this.installListener(provider, 'session:providerSessionExpired', onProviderSessionExpired);
 
     // Listen for provider session ID received and persist immediately
     // This ensures session can be resumed even if interrupted/cancelled
@@ -751,8 +943,7 @@ export class MessageStreamingHandler {
         logger.main.error('[AIService] Failed to persist providerSessionId:', error);
       }
     };
-    provider.removeAllListeners('session:providerSessionReceived');
-    provider.on('session:providerSessionReceived', onProviderSessionReceived);
+    this.installListener(provider, 'session:providerSessionReceived', onProviderSessionReceived);
 
     // Listen for teammate messages when the lead is idle (no active query).
     // When the lead is active, messages are delivered via interrupt + streamInput
@@ -806,8 +997,7 @@ export class MessageStreamingHandler {
         logger.main.error('[AIService] Failed to handle teammate message while idle:', error);
       }
     };
-    provider.removeAllListeners('teammate:messageWhileIdle');
-    provider.on('teammate:messageWhileIdle', onTeammateMessageWhileIdle);
+    this.installListener(provider, 'teammate:messageWhileIdle', onTeammateMessageWhileIdle);
 
     // Listen for all teammates completing. When the lead finished but teammates
     // were still active, endSession was deferred. Now that all teammates are
@@ -831,14 +1021,40 @@ export class MessageStreamingHandler {
         await stateManager.endSession(data.sessionId);
         // Stop file watcher - session is fully complete (teammates done)
         await this.svc.hooklessWatcher.stopForSession(data.sessionId);
+        codexEditWindowRegistry.clearSession(data.sessionId);
 
         // Play completion sound now that the session is truly done
         const soundService = SoundNotificationService.getInstance();
         soundService.playCompletionSound(workspacePath);
       }
     };
-    provider.removeAllListeners('teammates:allCompleted');
-    provider.on('teammates:allCompleted', onTeammatesAllCompleted);
+    this.installListener(provider, 'teammates:allCompleted', onTeammatesAllCompleted);
+
+    // Listen for a background sub-agent drain settling. When the lead finished but
+    // a native (non-teammate) sub-agent was still running, endSession was deferred
+    // (willResumeAfterCompletion). Once the drain settles with no continuation, end
+    // the deferred session. Mirrors onTeammatesAllCompleted. See NIM-1344 / #732.
+    const onSubagentsDrainSettled = async (data: { sessionId: string }) => {
+      if (!data.sessionId) return;
+      if (!stateManager.isSessionActive(data.sessionId)) return;
+      const isLeadBusy = typeof (provider as any).isLeadBusy === 'function'
+        && (provider as any).isLeadBusy();
+      if (isLeadBusy) {
+        logger.main.info(`[AIService] Sub-agent drain settled for ${data.sessionId}, but lead is busy — deferring endSession`);
+        return;
+      }
+      // A queued/continuation turn may already be taking over; let it own the end.
+      if (this.svc.sessionsProcessingQueue.has(data.sessionId)) return;
+
+      logger.main.info(`[AIService] Sub-agent drain settled for session ${data.sessionId}, ending deferred session`);
+      await stateManager.endSession(data.sessionId);
+      await this.svc.hooklessWatcher.stopForSession(data.sessionId);
+      codexEditWindowRegistry.clearSession(data.sessionId);
+
+      const soundService = SoundNotificationService.getInstance();
+      soundService.playCompletionSound(workspacePath);
+    };
+    this.installListener(provider, 'subagents:drainSettled', onSubagentsDrainSettled);
 
     // Track user @ mentions in the message
     try {
@@ -946,13 +1162,12 @@ export class MessageStreamingHandler {
       } else {
         // Refresh credentials every turn for all providers so key changes in settings apply immediately.
         const freshApiKey = this.svc.getApiKeyForProvider(session.provider, effectiveWorkspacePath);
+        const turnEffortLevel = resolveEffortLevel((session.metadata as any)?.effortLevel, getDefaultEffortLevel());
         await provider.initialize({
           apiKey: freshApiKey,
           maxTokens: (session.providerConfig as any)?.maxTokens,
           temperature: (session.providerConfig as any)?.temperature,
-          ...((session.metadata as any)?.effortLevel && {
-            effortLevel: parseEffortLevel((session.metadata as any).effortLevel),
-          }),
+          ...(turnEffortLevel && { effortLevel: turnEffortLevel }),
         });
       }
 
@@ -1025,6 +1240,11 @@ export class MessageStreamingHandler {
         // Pre-built prompts from DocumentContextService (for user message additions)
         documentContextPrompt: userMessageAdditions.documentContextPrompt,
         editingInstructions: userMessageAdditions.editingInstructions,
+
+        // Origin of this message (e.g. 'wakeup_resume' for ScheduleWakeup-triggered prompts).
+        // The transcript parser uses this to render wakeup resumes as a system marker
+        // instead of a user-lane message.
+        promptOrigin: documentContext?.promptOrigin,
       };
 
       // Update MCP document state for Claude Code provider so it knows which tools to show
@@ -1051,13 +1271,98 @@ export class MessageStreamingHandler {
         && effectiveWorkspacePath
       ) {
         try {
-          await this.svc.hooklessWatcher.ensureForSession(session.id, effectiveWorkspacePath, event);
+          await this.svc.hooklessWatcher.ensureForSession(session.id, effectiveWorkspacePath);
         } catch (watcherError) {
           logger.main.error('[AIService] Failed to start Codex file cache:', watcherError);
         }
       }
 
-      for await (const chunk of provider.sendMessage(messageToSend, contextWithSession, session.id, sessionMessages, effectiveWorkspacePath, attachments)) {
+      if (session.provider === 'openai-codex' && effectiveWorkspacePath) {
+        try {
+          await getAgentWorkflowService(effectiveWorkspacePath).ensureCodexExports();
+        } catch (workflowError) {
+          logger.main.error('[AIService] Failed to sync Codex workflow exports:', workflowError);
+        }
+      }
+
+      // Meta-agent tools for extension-agent providers (e.g. gemini-antigravity).
+      // Built-in providers (claude-code, openai-codex) discover these same tools
+      // over the SSE MCP server instead, so we ONLY thread JSON tool defs for the
+      // extension-agent branch. Gated on the meta-agent server being up plus a
+      // session + workspace, mirroring McpConfigService parity for built-ins.
+      // `undefined` for built-in providers, so their sendMessage call shape is
+      // unchanged.
+      // resolveExtensionAgentRef is recomputed here (the earlier binding from
+      // the provider-creation block is out of scope); it's a cheap pure lookup.
+      const isExtensionAgentSession = !!resolveExtensionAgentRef(session.provider);
+      // Only a meta-agent extension session may receive spawn tools. A standard
+      // child session (created agentRole='standard' by MetaAgentService) must
+      // NOT get spawn tools, otherwise it can spawn grandchildren and trigger
+      // exponential recursion. This mirrors claude-code/openai-codex, where only
+      // a button-created meta-agent gets the spawn tools over the SSE MCP server
+      // and its standard children cannot spawn. Gate tools and persona on the
+      // SAME condition so they stay in lockstep.
+      const isMetaAgentExtensionSession =
+        isExtensionAgentSession && session.agentRole === 'meta-agent';
+      // A standard (non-meta-agent) extension session gets the read-only dev
+      // toolset (read_file / list_files / search_files) so the model can
+      // investigate the workspace through the SAME simulated tool loop. This
+      // mirrors built-in providers: a standard session has file tools, only a
+      // meta-agent session has orchestration tools. The dev tools dispatch over
+      // the broker's `devToolExecutor` (gated workspace-files), not the
+      // meta-agent SSE MCP server, so they need no MetaAgentService port.
+      const isStandardExtensionSession =
+        isExtensionAgentSession && session.agentRole !== 'meta-agent';
+      const extensionAgentTools =
+        isMetaAgentExtensionSession &&
+        MetaAgentService.getInstance().getPort() !== null &&
+        session.id &&
+        effectiveWorkspacePath
+          ? getMetaAgentOpenAITools()
+          : isStandardExtensionSession && session.id && effectiveWorkspacePath
+            ? getDevAgentOpenAITools(
+                resolveDevToolScope((session.metadata as Record<string, unknown> | undefined)?.toolScope),
+              )
+            : undefined;
+
+      // Meta-agent persona for extension-agent providers (e.g. gemini-antigravity).
+      // Built-in providers (claude-code, openai-codex) build this same persona
+      // internally over their SDK system prompt; extension agents have no
+      // equivalent, so without this they receive ONLY tool schemas and reply as
+      // a generic chat assistant ("how would you like to proceed?") instead of
+      // proactively setting session meta, surveying worktrees/sessions, and
+      // spawning child sessions. We reuse the SAME buildMetaAgentSystemPrompt
+      // source the built-in providers use (no duplicated persona text), and gate
+      // it strictly on agentRole === 'meta-agent' so a normal gemini chat session
+      // is unaffected. 'codex' tool-reference style renders plain tool names,
+      // matching how the extension's tool loop presents tools in its JSON
+      // envelope (no `mcp__` SDK prefix).
+      // Workflow preset for the meta-agent persona. Read from session metadata
+      // (validated) with a 'default' fallback, mirroring how effortLevel is read
+      // above. Behavior is byte-identical until something writes
+      // metadata.workflowPreset (e.g. via update_session_meta); the 'research'
+      // and 'implement-review-test' presets become selectable once it does.
+      const rawWorkflowPreset = (session.metadata as Record<string, unknown> | undefined)?.workflowPreset;
+      const extensionWorkflowPreset =
+        rawWorkflowPreset === 'research' || rawWorkflowPreset === 'implement-review-test'
+          ? rawWorkflowPreset
+          : 'default';
+      const extensionAgentSystemPrompt =
+        isMetaAgentExtensionSession
+          ? buildMetaAgentSystemPrompt('codex', extensionWorkflowPreset, {
+              provider: session.provider,
+              model: session.model ?? undefined,
+              modelDisplayName: resolveExtensionModelDisplayName(session.provider, session.model),
+            })
+          : isStandardExtensionSession && session.id && effectiveWorkspacePath
+            ? buildDevAgentSystemPrompt({
+                provider: session.provider,
+                model: session.model ?? undefined,
+                modelDisplayName: resolveExtensionModelDisplayName(session.provider, session.model),
+              })
+            : undefined;
+
+      for await (const chunk of provider.sendMessage(messageToSend, contextWithSession, session.id, sessionMessages, effectiveWorkspacePath, attachments, extensionAgentTools, extensionAgentSystemPrompt)) {
         if (!chunk) continue;
         chunkCount++;
 
@@ -1072,6 +1377,50 @@ export class MessageStreamingHandler {
           });
         }
         switch (chunk.type) {
+          case 'context_usage': {
+            // Mid-turn context-fill snapshot (NIM-868). Updates ONLY
+            // currentContext so the indicator refreshes per assistant step
+            // during a long agentic turn. Must not touch cumulative
+            // input/output counters -- those settle on the 'complete' chunk.
+            const partialContextFill: number | undefined = chunk.contextFillTokens;
+            const partialContextWindow = selectedModelContextWindow || session.tokenUsage?.contextWindow;
+            if (partialContextFill !== undefined && partialContextWindow) {
+              const currentUsage = session.tokenUsage ?? {
+                inputTokens: 0,
+                outputTokens: 0,
+                totalTokens: 0,
+              };
+              const updatedUsage: NonNullable<SessionData['tokenUsage']> = {
+                ...currentUsage,
+                contextWindow: partialContextWindow,
+                currentContext: { tokens: partialContextFill, contextWindow: partialContextWindow },
+              };
+
+              await this.svc.sessionManager.updateSessionTokenUsage(session.id, updatedUsage);
+              safeSend(event, 'ai:tokenUsageUpdated', {
+                sessionId: session.id,
+                tokenUsage: updatedUsage,
+              });
+
+              // Push live context usage to mobile sync
+              const syncProvider = getSyncProvider();
+              if (syncProvider) {
+                syncProvider.pushChange(session.id, {
+                  type: 'metadata_updated',
+                  metadata: {
+                    currentContext: {
+                      tokens: partialContextFill,
+                      contextWindow: partialContextWindow,
+                    },
+                  } as any,
+                });
+              }
+
+              session.tokenUsage = updatedUsage;
+            }
+            break;
+          }
+
           case 'text':
             textChunks++;
             const chunkContent = chunk.content || '';
@@ -1093,6 +1442,157 @@ export class MessageStreamingHandler {
               partial: fullResponse,  // Send the full accumulated text
               isComplete: false
             });
+            break;
+
+          case 'pre_edit_snapshot':
+            // OpenAICodexProvider yields this on the first `item.started`
+            // observation of a `file_change` -- BEFORE Codex applies the
+            // patch on disk. The chunk carries each affected path's true
+            // pre-edit content, read from disk at the right moment. We
+            // write it as a local-history pre-edit tag so the diff
+            // renderer always has a real baseline (gitignored files,
+            // never-cached files, post-boot-created files all included).
+            // This replaces the watcher/cache/recoverBaseline fallback
+            // that previously ran at item.completed and produced
+            // empty-baseline diffs for any path the cache hadn't seen.
+            if (chunk.preEditSnapshot) {
+              const { toolUseId, entries, authoritative } = chunk.preEditSnapshot;
+
+              // Worktree adoption: any change path may live under a
+              // worktree the session hasn't adopted yet. Adopt before
+              // writing tags so they land in the correct workspace
+              // history.
+              for (const entry of entries) {
+                if (!entry?.path) continue;
+                const absPath = path.isAbsolute(entry.path)
+                  ? path.normalize(entry.path)
+                  : path.resolve(effectiveWorkspacePath, entry.path);
+                const inferredWorktreePath = this.svc.inferWorktreePathFromFilePath(workspacePath, absPath);
+                if (inferredWorktreePath) {
+                  await this.svc.adoptWorktreeForSession(session, inferredWorktreePath, event);
+                  effectiveWorkspacePath = session.worktreePath || effectiveWorkspacePath;
+                  permissionsPath = session.worktreeProjectPath || permissionsPath;
+                  break;
+                }
+              }
+
+              // Baseline source policy (per-transport):
+              // - SDK transport (authoritative === undefined/false): the
+              //   provider's disk-read at item.started races with Codex's
+              //   apply_patch, so for 'update' kinds we prefer
+              //   FileSnapshotCache (session-start snapshot, guaranteed
+              //   pre-edit). For 'add', the provider already forces empty.
+              // - App-server transport (authoritative === true): the
+              //   provider reverse-applies the codex diff against post-apply
+              //   disk content to recover pre-edit deterministically. That
+              //   content is authoritative; the cache lookup must NOT
+              //   override it (on fresh gitignored sessions chokidar may
+              //   only have observed the post-edit write, which would
+              //   clobber correct content with the post-edit body -- the
+              //   all-green diff regression the migration was built to fix).
+              const watcherEntryForBaseline = authoritative
+                ? null
+                : this.svc.hooklessWatcher.getEntry(session.id);
+              for (const entry of entries) {
+                if (!entry?.path) continue;
+                const absPath = path.isAbsolute(entry.path)
+                  ? path.normalize(entry.path)
+                  : path.resolve(effectiveWorkspacePath, entry.path);
+                addGitignoreBypass(effectiveWorkspacePath, absPath);
+                const tagId = `ai-edit-pending-${session.id}-${toolUseId}`;
+
+                let baselineContent: string = entry.content ?? '';
+                const isAddKind = entry.kind === 'add' || entry.kind === 'create' || entry.kind === 'new';
+                if (!authoritative && !isAddKind && watcherEntryForBaseline) {
+                  try {
+                    const cached = await watcherEntryForBaseline.cache.getBeforeState(absPath);
+                    if (typeof cached === 'string') {
+                      baselineContent = cached;
+                    }
+                  } catch {
+                    // Cache miss / cache error -- fall through to disk-read content.
+                  }
+                }
+
+                try {
+                  // replaceSpeculative: this is the authoritative
+                  // pre-edit baseline source for Codex `file_change` --
+                  // FileSnapshotCache is the primary source (captured at
+                  // session start, guaranteed pre-edit) with disk read as
+                  // fallback. Override any tag the bash-watcher /
+                  // workspace-watcher paths may have written speculatively
+                  // earlier this turn (their attribution can mis-score a
+                  // recent `sed` command higher than the still-being-stored
+                  // file_change in the same chokidar tick).
+                  await historyManager.createTag(
+                    effectiveWorkspacePath,
+                    absPath,
+                    tagId,
+                    baselineContent,
+                    session.id,
+                    toolUseId,
+                    { replaceSpeculative: true },
+                  );
+                  await sessionFileTracker.trackToolExecution(
+                    session.id,
+                    effectiveWorkspacePath,
+                    'file_change',
+                    { changes: [{ path: absPath, kind: entry.kind ?? 'update' }] },
+                    undefined,
+                    toolUseId,
+                    null,
+                  );
+                } catch (preEditError) {
+                  const errorStr = String(preEditError);
+                  if (
+                    !errorStr.includes('unique') &&
+                    !errorStr.includes('UNIQUE') &&
+                    !errorStr.includes('duplicate')
+                  ) {
+                    logger.ai.error(
+                      '[AIService] pre_edit_snapshot tag write failed',
+                      preEditError,
+                    );
+                  }
+                }
+              }
+            }
+            break;
+
+          case 'post_edit_snapshot':
+            // OpenAICodexProvider yields this on `item.completed` for a
+            // `file_change` -- AFTER Codex has applied the patch on disk. The
+            // chunk carries each affected path's post-edit content. We write
+            // it as an `ai-edit` history snapshot tagged with the session ID
+            // so session-aware diffs can render pre-edit -> post-edit even
+            // after the user later modifies the file (current-disk
+            // comparison would otherwise conflate AI and user changes).
+            // This is the codex analogue of Claude's
+            // AgentToolHooks.createTurnEndSnapshots, which the codex
+            // pipeline doesn't go through.
+            if (chunk.postEditSnapshot) {
+              const { toolUseId, entries } = chunk.postEditSnapshot;
+              for (const entry of entries) {
+                if (!entry?.path) continue;
+                const absPath = path.isAbsolute(entry.path)
+                  ? path.normalize(entry.path)
+                  : path.resolve(effectiveWorkspacePath, entry.path);
+                try {
+                  await historyManager.createSnapshot(
+                    absPath,
+                    entry.content,
+                    'ai-edit',
+                    `AI edit (session: ${session.id})`,
+                    { sessionId: session.id, toolUseId },
+                  );
+                } catch (postEditError) {
+                  logger.ai.error(
+                    '[AIService] post_edit_snapshot ai-edit write failed',
+                    postEditError,
+                  );
+                }
+              }
+            }
             break;
 
           case 'tool_call':
@@ -1134,16 +1634,58 @@ export class MessageStreamingHandler {
                     }
                   }
 
-                  // Codex reuses item IDs across turns, so we normally avoid storing
-                  // provider IDs as toolUseId. Exception: file_change events need
-                  // stable per-item IDs so `session-files:get-tool-call-diffs` can
-                  // resolve the exact file_change call that produced a diff.
-                  const providerToolUseId = typeof (chunk.toolCall as any)?.toolUseId === 'string'
-                    ? (chunk.toolCall as any).toolUseId
-                    : (typeof chunk.toolCall.id === 'string' ? chunk.toolCall.id : undefined);
-                  const toolUseId = session.provider === 'openai-codex'
-                    ? (trackToolName === 'file_change' ? providerToolUseId : undefined)
-                    : providerToolUseId;
+                  // Codex reuses raw item IDs (e.g. `item_0`) across turns, so we
+                  // never persist them as toolUseId directly. The provider stamps
+                  // a stable synthetic edit-group ID on the chunk via toolUseId
+                  // (`nimtc|<encoded>|<ts>|<idx>`), matching what CodexRawParser
+                  // mints on later reparse. Use that for ALL Codex tool calls --
+                  // not just `file_change` -- so file edits caused by other
+                  // write-capable tools attribute to the same edit group.
+                  const chunkSyntheticToolUseId =
+                    typeof (chunk.toolCall as any)?.toolUseId === 'string'
+                      ? ((chunk.toolCall as any).toolUseId as string)
+                      : undefined;
+                  const isCodexProvider = session.provider === 'openai-codex';
+                  const providerToolUseId = isCodexProvider
+                    ? chunkSyntheticToolUseId
+                    : (chunkSyntheticToolUseId ?? (typeof chunk.toolCall.id === 'string' ? chunk.toolCall.id : undefined));
+                  const toolUseId = providerToolUseId;
+
+                  // Open / close a Codex edit attribution window for write-capable
+                  // tool calls. Watcher events that fire while a window is open
+                  // (or within a short post-close grace period) attribute to the
+                  // canonical synthetic edit-group ID instead of falling back to
+                  // ToolCallMatcher's fuzzy time heuristics. We deliberately
+                  // exclude command_execution per the Phase 2 scope decision.
+                  if (isCodexProvider && chunkSyntheticToolUseId && shouldOpenCodexEditWindow(chunk.toolCall.name)) {
+                    let codexTargetFilePath: string | null = null;
+                    const argsRecord = chunk.toolCall.arguments as Record<string, unknown> | undefined;
+                    if (argsRecord) {
+                      if (typeof argsRecord.file_path === 'string') codexTargetFilePath = argsRecord.file_path;
+                      else if (typeof argsRecord.path === 'string') codexTargetFilePath = argsRecord.path;
+                    }
+                    codexEditWindowRegistry.open({
+                      sessionId: session.id,
+                      editGroupId: chunkSyntheticToolUseId,
+                      toolName: chunk.toolCall.name,
+                      workspacePath: effectiveWorkspacePath,
+                      targetFilePath: codexTargetFilePath,
+                    });
+                    // A tool_call carrying a result is terminal -- close the
+                    // window so attribution stops claiming new watcher events
+                    // after the post-close grace period elapses.
+                    const hasResult = chunk.toolCall.result !== undefined && chunk.toolCall.result !== null;
+                    if (hasResult) {
+                      const resultObj = chunk.toolCall.result as Record<string, unknown> | string | undefined;
+                      const looksError = typeof resultObj === 'object' && resultObj !== null
+                        && (('success' in resultObj && (resultObj as Record<string, unknown>).success === false)
+                          || 'error' in resultObj);
+                      codexEditWindowRegistry.close(
+                        chunkSyntheticToolUseId,
+                        looksError ? 'error' : 'completed',
+                      );
+                    }
+                  }
 
                   await sessionFileTracker.trackToolExecution(
                     session.id,
@@ -1203,13 +1745,19 @@ export class MessageStreamingHandler {
                         }
                         const editToolUseId = toolUseId || `${session.provider}-edit-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
                         const tagId = `ai-edit-pending-${session.id}-${editToolUseId}`;
+                        // OpenCode / Codex-ACP edit tools fire on the
+                        // `running` status of the actual write tool, so
+                        // this is the authoritative pre-edit moment for
+                        // their attribution -- override any speculative
+                        // bash-watcher tag written earlier this turn.
                         await historyManager.createTag(
                           effectiveWorkspacePath,
                           editFilePath,
                           tagId,
                           beforeContent,
                           session.id,
-                          editToolUseId
+                          editToolUseId,
+                          { replaceSpeculative: true },
                         );
                       } catch (preEditError) {
                         const errorStr = String(preEditError);
@@ -1231,6 +1779,27 @@ export class MessageStreamingHandler {
                     const seenCount = (bashCommandOccurrences.get(commandItemId) ?? 0) + 1;
                     bashCommandOccurrences.set(commandItemId, seenCount);
                     pendingBashCommands.set(commandItemId, trackArgs.command);
+
+                    // First observation == item.started: capture each
+                    // referenced file's current disk content into the cache
+                    // BEFORE the bash command runs. This is the only
+                    // deterministic moment to record a true pre-edit baseline
+                    // for command_execution. Without it, item.completed below
+                    // would compare post-command disk content against a
+                    // tier-2 git-`startSha` baseline, falsely attributing
+                    // read-only commands (`sed -n`, `cat`, `nl`) on
+                    // working-tree-modified files as edits.
+                    if (seenCount === 1) {
+                      try {
+                        await this.svc.hooklessWatcher.captureBashPreEditSnapshots(
+                          session.id,
+                          workspacePath,
+                          trackArgs.command,
+                        );
+                      } catch (snapshotError) {
+                        logger.ai.warn('[AIService] Failed to seed bash pre-edit snapshots:', snapshotError);
+                      }
+                    }
 
                     if (seenCount >= 2 && !processedBashCommandItemIds.has(commandItemId)) {
                       const tracked = await this.svc.hooklessWatcher.trackBashEditsFromCommand(
@@ -1283,156 +1852,14 @@ export class MessageStreamingHandler {
                 logger.ai.warn('[AIService] applyDiff payload missing replacements', previewForLog(rawArgs));
               }
 
-              // Snapshot file contents for file_change events before saving
-              if (toolName === 'file_change' && toolArgs?.changes) {
-                const rawChanges = toolArgs.changes as Array<{ path: string; kind?: string }>;
-
-                for (const change of rawChanges) {
-                  if (!change?.path) continue;
-                  const candidatePath = path.isAbsolute(change.path)
-                    ? path.normalize(change.path)
-                    : path.resolve(effectiveWorkspacePath, change.path);
-                  const inferredWorktreePath = this.svc.inferWorktreePathFromFilePath(workspacePath, candidatePath);
-                  if (inferredWorktreePath) {
-                    await this.svc.adoptWorktreeForSession(session, inferredWorktreePath, event);
-                    effectiveWorkspacePath = session.worktreePath || effectiveWorkspacePath;
-                    permissionsPath = session.worktreeProjectPath || permissionsPath;
-                    break;
-                  }
-                }
-
-                const changes = rawChanges
-                  .filter((change): change is { path: string; kind?: string } => !!change?.path)
-                  .map((change) => ({
-                    ...change,
-                    path: path.isAbsolute(change.path)
-                      ? path.normalize(change.path)
-                      : path.resolve(effectiveWorkspacePath, change.path),
-                  }));
-
-                // Register gitignore bypass for all changed files immediately.
-                // Codex writes files before emitting file_change events, so the
-                // fs.watch event may have already fired and been buffered. The bypass
-                // triggers replay of any buffered events.
-                for (const change of changes) {
-                  if (change?.path && effectiveWorkspacePath) {
-                    addGitignoreBypass(effectiveWorkspacePath, change.path);
-                  }
-                }
-
-                const fileSnapshots: Record<string, { content: string | null; error?: string; isBinary?: boolean; truncated?: boolean }> = {};
-                const MAX_SNAPSHOT_SIZE = 100_000; // 100KB per file
-
-                // Proactive pre-edit snapshot: capture the before-state from the
-                // FileSnapshotCache BEFORE reading current (post-edit) content.
-                // The file has already been modified by Codex, so disk reads give
-                // after-state. The cache holds the content as of session start.
-                const watcherEntry = this.svc.hooklessWatcher.getEntry(session.id);
-                if (watcherEntry) {
-                  for (const change of changes) {
-                    if (!change?.path || change.kind === 'delete') continue;
-                    try {
-                      const currentContentForCheck = await readFileContentOrNull(change.path);
-                      let beforeContent = await watcherEntry.cache.getBeforeState(change.path);
-                      if (beforeContent === null) {
-                        // Ensure apply_patch edits still create pending-review tags when
-                        // the snapshot cache has no baseline (new/ignored files).
-                        // Skip binary files to avoid invalid diff baselines.
-                        if (isBinaryFile(change.path)) {
-                          continue;
-                        }
-                        if (!isCreateLikeChangeKind(change.kind)) {
-                          const recoveredBaseline = await recoverBaselineFromHistory(change.path, currentContentForCheck);
-                          if (recoveredBaseline !== null) {
-                            beforeContent = recoveredBaseline;
-                          } else {
-                            // Last-resort fallback: keep diff mode functional even when we
-                            // cannot reconstruct precise pre-edit content (e.g. ignored files
-                            // with no prior snapshots).
-                            logger.ai.warn('[AIService] Missing baseline for non-create change; using empty fallback baseline', {
-                              filePath: change.path,
-                              kind: change.kind,
-                              sessionId: session.id,
-                            });
-                            beforeContent = '';
-                          }
-                        } else {
-                          beforeContent = '';
-                        }
-                      }
-
-                      // Guard against stale cache baselines that already match post-edit
-                      // disk content. In that case, watcher attribution will provide a
-                      // better before-state; creating a tag here would produce no visible diff.
-                      if (currentContentForCheck !== null && beforeContent === currentContentForCheck) {
-                        continue;
-                      }
-
-                      const toolUseId =
-                        typeof chunk.toolCall.id === 'string'
-                          ? chunk.toolCall.id
-                          : `codex-file-change-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-                      const tagId = `ai-edit-pending-${session.id}-${toolUseId}`;
-                      await historyManager.createTag(
-                        effectiveWorkspacePath,
-                        change.path,
-                        tagId,
-                        beforeContent,
-                        session.id,
-                        toolUseId
-                      );
-                      // Track the file edit so getDiffsFromToolCallContent can find it
-                      await sessionFileTracker.trackToolExecution(
-                        session.id,
-                        effectiveWorkspacePath,
-                        'file_change',
-                        { changes: [change] },
-                        undefined,
-                        toolUseId,
-                        null  // Watcher already running for this session
-                      );
-                    } catch (preEditError) {
-                      const errorStr = String(preEditError);
-                      if (!errorStr.includes('unique') && !errorStr.includes('UNIQUE') && !errorStr.includes('duplicate')) {
-                        logger.ai.error('[AIService] Failed to create pre-edit snapshot for file_change:', preEditError);
-                      }
-                    }
-                  }
-                }
-
-                for (const change of changes) {
-                  if (!change?.path) continue;
-                  if (change.kind === 'delete') {
-                    fileSnapshots[change.path] = { content: null };
-                    continue;
-                  }
-                  try {
-                    const buffer = fs.readFileSync(change.path);
-                    // Binary detection: check for null bytes in first 8KB
-                    const sampleSize = Math.min(buffer.length, 8192);
-                    let isBinary = false;
-                    for (let i = 0; i < sampleSize; i++) {
-                      if (buffer[i] === 0) { isBinary = true; break; }
-                    }
-                    if (isBinary) {
-                      fileSnapshots[change.path] = { content: null, isBinary: true };
-                    } else if (buffer.length > MAX_SNAPSHOT_SIZE) {
-                      fileSnapshots[change.path] = { content: buffer.toString('utf-8', 0, MAX_SNAPSHOT_SIZE), truncated: true };
-                    } else {
-                      fileSnapshots[change.path] = { content: buffer.toString('utf-8') };
-                    }
-                  } catch (err) {
-                    fileSnapshots[change.path] = { content: null, error: err instanceof Error ? err.message : String(err) };
-                  }
-                }
-
-                // Attach snapshots to the tool call result
-                if (typeof chunk.toolCall.result === 'object' && chunk.toolCall.result !== null) {
-                  (chunk.toolCall.result as any).fileSnapshots = fileSnapshots;
-                } else {
-                  chunk.toolCall.result = { success: true, fileSnapshots };
-                }
-              }
+              // file_change handling moved to the `pre_edit_snapshot` chunk
+              // (yielded by OpenAICodexProvider on item.started, before Codex
+              // applies the patch). That handler does worktree adoption,
+              // gitignore bypass, history-tag creation, and session_files
+              // tracking with the real pre-edit baseline -- no watcher,
+              // no cache, no recoverBaseline fallback. By the time this
+              // tool_call arrives at item.completed, the diff record is
+              // already correctly populated.
 
               // Agent providers (claude-code, codex, opencode) render tool calls
               // through the canonical transcript pipeline. The legacy addMessage +
@@ -1638,8 +2065,38 @@ export class MessageStreamingHandler {
               message: errorMsg,
               isAuthError: chunk.isAuthError || false,
               isBedrockToolError,
-              isServerError
+              isServerError,
+              isCodexAuthRequired: chunk.isCodexAuthRequired || false,
             });
+
+            // An in-band 'error' chunk from an extension agent (the gemini
+            // backend's only failure-settle path) does NOT throw, so the outer
+            // catch never runs and the session would never move off 'running'.
+            // Without a terminal transition no session:error fires, a spawned
+            // child stays 'running' forever and a meta-agent waits on it
+            // indefinitely while it holds a spawn-cap slot. Settle it here,
+            // mirroring the outer catch. Scoped to extension agents; built-in
+            // providers throw or settle via their SDK terminal handling.
+            // Only DIRECT (non-queued) extension-agent sessions need settling
+            // here. A queued meta-agent child is already settled by the
+            // queued-prompt chain (onChainSettled -> endSession); adding our own
+            // terminal transition on top would emit a second, contradictory
+            // notification to the parent. A direct gemini chat that errors
+            // in-band has no other settle path (its only failure signal is this
+            // non-throwing error chunk), so without this it stays 'running'.
+            if (
+              isExtensionAgentSession
+              && session?.id
+              && !this.svc.sessionsProcessingQueue.has(session.id)
+            ) {
+              try {
+                await stateManager.updateActivity({ sessionId: session.id, status: 'error' });
+                await stateManager.endSession(session.id);
+                await this.svc.hooklessWatcher.stopForSession(session.id);
+              } catch (settleErr) {
+                logger.main.error('[AIService] Failed to settle extension-agent error chunk:', settleErr);
+              }
+            }
             break;
 
           case 'complete':
@@ -1667,24 +2124,24 @@ export class MessageStreamingHandler {
             // }
             // if (modelUsage) {
             // }
-            if (fullResponse) {
-              logger.ai.info('[AIService] Assistant final response', {
-                length: fullResponse.length,
-                preview: previewForLog(fullResponse)
-              });
-            } else {
-              logger.ai.info('[AIService] Assistant response empty', {
-                edits: edits.length,
-                streamed: hasStreamingContent,
-                toolCalls: toolCallCount
-              });
-            }
-            if (edits.length > 0) {
-              logger.ai.info('[AIService] Collected edits', {
-                editCount: edits.length,
-                replacementCounts: edits.map(edit => Array.isArray(edit.replacements) ? edit.replacements.length : 0)
-              });
-            }
+            // if (fullResponse) {
+            //   logger.ai.info('[AIService] Assistant final response', {
+            //     length: fullResponse.length,
+            //     preview: previewForLog(fullResponse)
+            //   });
+            // } else {
+            //   logger.ai.info('[AIService] Assistant response empty', {
+            //     edits: edits.length,
+            //     streamed: hasStreamingContent,
+            //     toolCalls: toolCallCount
+            //   });
+            // }
+            // if (edits.length > 0) {
+            //   logger.ai.info('[AIService] Collected edits', {
+            //     editCount: edits.length,
+            //     replacementCounts: edits.map(edit => Array.isArray(edit.replacements) ? edit.replacements.length : 0)
+            //   });
+            // }
 
             // Send completion metrics with token usage if available
             safeSend(event, 'ai:performanceMetrics', {
@@ -1709,12 +2166,7 @@ export class MessageStreamingHandler {
               responseType,
               toolsUsed,
               usedChartTool,
-              responseTime: bucketResponseTime(perfLog.totalTime)
-            });
-
-            // Track ai_response_streamed analytics event (for streaming characteristics)
-            this.svc.analytics.sendEvent('ai_response_streamed', {
-              provider: session.provider,
+              responseTime: bucketResponseTime(perfLog.totalTime),
               chunkCount: bucketChunkCount(chunkCount),
               totalLength: bucketContentLength(fullResponse.length)
             });
@@ -1730,17 +2182,16 @@ export class MessageStreamingHandler {
                 totalTokens: 0
               };
 
-              // Sum up tokens from all models in modelUsage.
-              // Note: modelUsage tokens are CUMULATIVE across all steps (for billing).
-              // For context window display, use contextFillTokens from last assistant message.
-              let newInputTokens = 0;
-              let newOutputTokens = 0;
+              // Cumulative input/output come from result.usage (chunk.usage), which Anthropic
+              // deduplicates by message.id. Do NOT sum modelUsage tokens for these -- the SDK
+              // over-counts them from duplicated assistant events (each message is emitted 2-3x,
+              // one event per content block), inflating the tooltip totals. See NIM-689.
+              // Cost still derives from modelUsage (the only per-model cost source; not displayed).
+              const newInputTokens = tokenUsage?.input_tokens || 0;
+              const newOutputTokens = tokenUsage?.output_tokens || 0;
               let newCostUSD = 0;
               for (const modelName of Object.keys(modelUsage)) {
-                const modelStats = modelUsage[modelName];
-                newInputTokens += modelStats.inputTokens || 0;
-                newOutputTokens += modelStats.outputTokens || 0;
-                newCostUSD += modelStats.costUSD || 0;
+                newCostUSD += modelUsage[modelName].costUSD || 0;
               }
 
               // Use the selected model's context window (resolved from model registry at session start).
@@ -1784,7 +2235,6 @@ export class MessageStreamingHandler {
                         tokens: contextFillTokens,
                         contextWindow: contextWindowForDisplay,
                       },
-                      updatedAt: Date.now(),
                     } as any,
                   });
                 }
@@ -1894,7 +2344,6 @@ export class MessageStreamingHandler {
                         tokens: contextFillTokens,
                         contextWindow: codexContextWindow,
                       },
-                      updatedAt: Date.now(),
                     } as any,
                   });
                 }
@@ -2027,8 +2476,25 @@ export class MessageStreamingHandler {
             const willResume = session.provider === 'claude-code'
               && typeof (provider as any).willResumeAfterCompletion === 'function'
               && (provider as any).willResumeAfterCompletion();
-            if (hasTeammates || willResume) {
-              logger.main.info(`[AIService] Deferring endSession for ${session.id} - ${hasTeammates ? 'teammates still active' : 'lead resuming'}`);
+            const queuedChainAlreadyActive = this.svc.sessionsProcessingQueue.has(session.id);
+            let queuedContinuationScheduled = false;
+            if (!hasTeammates && !willResume && !queuedChainAlreadyActive) {
+              queuedContinuationScheduled = await this.svc.tryDispatchNextQueuedPrompt(
+                session.id,
+                workspacePath,
+                BrowserWindow.fromWebContents(event.sender),
+                'completion-handler queue',
+              );
+            }
+            if (hasTeammates || willResume || queuedChainAlreadyActive || queuedContinuationScheduled) {
+              const reason = hasTeammates
+                ? 'teammates still active'
+                : willResume
+                ? 'lead resuming'
+                : queuedChainAlreadyActive
+                ? 'queued continuation already active'
+                : 'queued continuation scheduled';
+              // logger.main.info(`[AIService] Deferring endSession for ${session.id} - ${reason}`);
             } else {
               await stateManager.endSession(session.id);
               // Stop file watcher after a brief delay to let pending
@@ -2049,17 +2515,17 @@ export class MessageStreamingHandler {
                 : 'Response complete';
               const sessionLabel = session.title || session.provider;
 
-              logger.ai.info('[AIService] Notification content', {
-                sessionId: session.id,
-                lastTextPreview: previewForLog(lastTextSection.trim()),
-                prevTextPreview: previewForLog(prevTextSection),
-                fullResponsePreview: previewForLog(fullResponse),
-                selectedSource: lastTextSection.trim()
-                  ? 'lastTextSection'
-                  : prevTextSection
-                  ? 'prevTextSection'
-                  : 'fullResponse',
-              });
+              // logger.ai.info('[AIService] Notification content', {
+              //   sessionId: session.id,
+              //   lastTextPreview: previewForLog(lastTextSection.trim()),
+              //   prevTextPreview: previewForLog(prevTextSection),
+              //   fullResponsePreview: previewForLog(fullResponse),
+              //   selectedSource: lastTextSection.trim()
+              //     ? 'lastTextSection'
+              //     : prevTextSection
+              //     ? 'prevTextSection'
+              //     : 'fullResponse',
+              // });
 
               await notificationService.showNotification({
                 title: `${sessionLabel} -- Response Ready`,
@@ -2163,75 +2629,11 @@ export class MessageStreamingHandler {
       }
 
       // Clear executing and pending prompt flags for mobile sync
-      if (syncProvider) {
+      if (syncProvider && !this.svc.sessionsProcessingQueue.has(session.id)) {
         syncProvider.pushChange(session.id, {
           type: 'metadata_updated',
           metadata: { isExecuting: false, hasPendingPrompt: false, updatedAt: Date.now() },
         });
-      }
-
-      // TESTING: Queue processing from main process instead of renderer
-      // OLD: Queue processing is handled by the renderer (AgenticPanel) to keep SDK instantiation in one place
-      try {
-        // Check the per-session guard before processing - triggerQueueProcessing IPC may already be handling this
-        if (!this.svc.sessionsProcessingQueue.has(session.id)) {
-          const { getQueuedPromptsStore } = await import('../RepositoryManager');
-          const queueStore = getQueuedPromptsStore();
-          const pendingPrompts = await queueStore.listPending(session.id);
-
-          if (pendingPrompts.length > 0) {
-            const nextPrompt = pendingPrompts[0];
-            logger.main.info(`[AIService] Processing next queued prompt from main process: ${nextPrompt.id} for session ${session.id}`);
-
-            // Claim the prompt atomically
-            const claimed = await queueStore.claim(nextPrompt.id);
-            if (claimed) {
-              // Mark session as processing before the setImmediate
-              this.svc.sessionsProcessingQueue.add(session.id);
-
-              // Notify renderer that prompt was claimed (so UI removes it from queue list)
-              safeSend(event, 'ai:promptClaimed', {
-                sessionId: session.id,
-                promptId: claimed.id,
-              });
-
-              // Recursively call sendMessage with the queued prompt
-              const docContext = {
-                ...claimed.documentContext,
-                queuedPromptId: claimed.id,
-                attachments: claimed.attachments,
-              };
-
-              // Use setImmediate to avoid stack overflow and let this response complete first
-              setImmediate(async () => {
-                try {
-                  await this.svc.sendMessageHandler!(event, claimed.prompt, docContext as any, session.id, workspacePath);
-                  // Mark as completed
-                  await queueStore.complete(claimed.id);
-                } catch (queueError) {
-                  logger.main.error(`[AIService] Failed to process queued prompt ${claimed.id}:`, queueError);
-                  await queueStore.fail(claimed.id, queueError instanceof Error ? queueError.message : 'Unknown error');
-                } finally {
-                  this.svc.sessionsProcessingQueue.delete(session.id);
-                  try {
-                    await this.svc.continueQueuedPromptChain(
-                      session.id,
-                      workspacePath,
-                      BrowserWindow.fromWebContents(event.sender),
-                      'completion-handler queue finally'
-                    );
-                  } catch (chainErr) {
-                    logger.main.error('[AIService] completion-handler queue finally: error checking for pending prompts:', chainErr);
-                  }
-                }
-              });
-            }
-          }
-        } else {
-          logger.main.info(`[AIService] Skipping completion-handler queue processing for session ${session.id} - already processing`);
-        }
-      } catch (queueError) {
-        logger.main.error('[AIService] Error checking queued prompts:', queueError);
       }
 
       // Clean up queued prompt tracking
@@ -2294,16 +2696,34 @@ export class MessageStreamingHandler {
         const willResumeOnError = session.provider === 'claude-code'
           && typeof (provider as any).willResumeAfterCompletion === 'function'
           && (provider as any).willResumeAfterCompletion();
-        if (hasTeammatesOnError || willResumeOnError) {
-          logger.main.info(`[AIService] Deferring endSession for ${session.id} on error - ${hasTeammatesOnError ? 'teammates still active' : 'lead resuming'}`);
+        const queuedChainAlreadyActiveOnError = this.svc.sessionsProcessingQueue.has(session.id);
+        let queuedContinuationScheduledOnError = false;
+        if (!hasTeammatesOnError && !willResumeOnError && !queuedChainAlreadyActiveOnError) {
+          queuedContinuationScheduledOnError = await this.svc.tryDispatchNextQueuedPrompt(
+            session.id,
+            workspacePath,
+            BrowserWindow.fromWebContents(event.sender),
+            'error-handler queue',
+          );
+        }
+        if (hasTeammatesOnError || willResumeOnError || queuedChainAlreadyActiveOnError || queuedContinuationScheduledOnError) {
+          const reason = hasTeammatesOnError
+            ? 'teammates still active'
+            : willResumeOnError
+            ? 'lead resuming'
+            : queuedChainAlreadyActiveOnError
+            ? 'queued continuation already active'
+            : 'queued continuation scheduled';
+          logger.main.info(`[AIService] Deferring endSession for ${session.id} on error - ${reason}`);
         } else {
           await stateManager.endSession(session.id);
           // Stop file watcher - session ended on error
           await this.svc.hooklessWatcher.stopForSession(session.id);
+          codexEditWindowRegistry.clearSession(session.id);
         }
 
         // Clear executing and pending prompt flags for mobile sync on error
-        if (syncProvider) {
+        if (syncProvider && !this.svc.sessionsProcessingQueue.has(session.id)) {
           syncProvider.pushChange(session.id, {
             type: 'metadata_updated',
             metadata: { isExecuting: false, hasPendingPrompt: false, updatedAt: Date.now() },
@@ -2341,68 +2761,11 @@ export class MessageStreamingHandler {
         logger.main.info(`[AIService] Cleared prompt tracking for ${queuedPromptId} (error path)`);
       }
 
-      // Process next queued prompt even on error/abort
-      // This ensures queued prompts fire when user cancels a question
-      if (session?.id && event?.sender && !this.svc.sessionsProcessingQueue.has(session.id)) {
-        try {
-          const { getQueuedPromptsStore } = await import('../RepositoryManager');
-          const queueStore = getQueuedPromptsStore();
-          const pendingPrompts = await queueStore.listPending(session.id);
-
-          if (pendingPrompts.length > 0) {
-            const nextPrompt = pendingPrompts[0];
-            logger.main.info(`[AIService] Processing next queued prompt after error/abort: ${nextPrompt.id} for session ${session.id}`);
-
-            // Claim the prompt atomically
-            const claimed = await queueStore.claim(nextPrompt.id);
-            if (claimed) {
-              // Mark session as processing before the setImmediate
-              this.svc.sessionsProcessingQueue.add(session.id);
-
-              // Notify renderer that prompt was claimed (so UI removes it from queue list)
-              safeSend(event, 'ai:promptClaimed', {
-                sessionId: session.id,
-                promptId: claimed.id,
-              });
-
-              // Recursively call sendMessage with the queued prompt
-              const docContext = {
-                ...claimed.documentContext,
-                queuedPromptId: claimed.id,
-                attachments: claimed.attachments,
-              };
-
-              // Use setImmediate to avoid stack overflow and let this response complete first
-              setImmediate(async () => {
-                try {
-                  await this.svc.sendMessageHandler!(event, claimed.prompt, docContext as any, session.id, workspacePath);
-                  // Mark as completed
-                  await queueStore.complete(claimed.id);
-                } catch (queueError) {
-                  logger.main.error(`[AIService] Failed to process queued prompt ${claimed.id}:`, queueError);
-                  await queueStore.fail(claimed.id, queueError instanceof Error ? queueError.message : 'Unknown error');
-                } finally {
-                  this.svc.sessionsProcessingQueue.delete(session.id);
-                  try {
-                    await this.svc.continueQueuedPromptChain(
-                      session.id,
-                      workspacePath,
-                      BrowserWindow.fromWebContents(event.sender),
-                      'error-handler queue finally'
-                    );
-                  } catch (chainErr) {
-                    logger.main.error('[AIService] error-handler queue finally: error checking for pending prompts:', chainErr);
-                  }
-                }
-              });
-            }
-          }
-        } catch (queueError) {
-          logger.main.error('[AIService] Error checking queued prompts after error/abort:', queueError);
-        }
-      }
-
       throw error;
     }
   };
+
+  private async disableParentNotificationsAfterDirectTakeover(session: SessionData): Promise<void> {
+    await disableParentNotificationsAfterDirectTakeover(session);
+  }
 }

@@ -8,9 +8,13 @@ import { ipcMain } from 'electron';
 import simpleGit, { SimpleGit } from 'simple-git';
 import log from 'electron-log/main';
 import { existsSync } from 'fs';
-import { join, relative, isAbsolute } from 'path';
+import { dirname, join, relative, isAbsolute, resolve } from 'path';
 import { gitOperationLock } from '../services/GitOperationLock';
+import { executeGitCommit } from '../services/GitCommitService';
+import { getGitSubprocessEnv, simpleGitWithHookEnv } from '../services/gitEnv';
 import { safeHandle } from '../utils/ipcRegistry';
+import { findGitRootForFile } from '../services/GitStatusService';
+import { isFileInWorkspaceOrWorktree } from '../utils/workspaceDetection';
 
 function isGitRepository(workspacePath: string): boolean {
   try {
@@ -31,6 +35,71 @@ async function hasCommits(git: SimpleGit): Promise<boolean> {
   } catch {
     return false;
   }
+}
+
+function findNearestGitRoot(filePath: string): string | null {
+  let dir = dirname(resolve(filePath));
+
+  while (true) {
+    try {
+      if (existsSync(join(dir, '.git'))) {
+        return dir;
+      }
+    } catch {
+      // Ignore filesystem errors and continue walking up.
+    }
+
+    const parent = dirname(dir);
+    if (parent === dir) {
+      return null;
+    }
+    dir = parent;
+  }
+}
+
+export function isDetachedHeadState(branch: string | null | undefined): boolean {
+  const normalized = branch?.trim();
+  if (!normalized) return false;
+
+  return normalized === 'HEAD'
+    || normalized === '(no branch)'
+    || normalized.startsWith('(HEAD detached')
+    || normalized.startsWith('HEAD detached')
+    || normalized.includes('no branch');
+}
+
+export function normalizeCurrentBranch(branch: string | null | undefined): string {
+  const normalized = branch?.trim() || '';
+  if (!normalized) return '';
+  return isDetachedHeadState(normalized) ? 'HEAD' : normalized;
+}
+
+export function normalizeBranchSelection(branch: string | null | undefined): string | undefined {
+  const normalized = branch?.trim();
+  if (!normalized) return undefined;
+  return isDetachedHeadState(normalized) ? 'HEAD' : normalized;
+}
+
+export function resolveGitDiffTarget(
+  workspacePath: string,
+  filePath: string
+): { gitWorkspacePath: string; gitFilePath: string } {
+  const resolvedWorkspacePath = resolve(workspacePath);
+  const absoluteFilePath = isAbsolute(filePath)
+    ? resolve(filePath)
+    : resolve(resolvedWorkspacePath, filePath);
+
+  const relatedAbsolutePath = isAbsolute(filePath) && isFileInWorkspaceOrWorktree(absoluteFilePath, resolvedWorkspacePath)
+    ? absoluteFilePath
+    : null;
+  const gitWorkspacePath = relatedAbsolutePath
+    ? findNearestGitRoot(relatedAbsolutePath) ?? resolvedWorkspacePath
+    : findGitRootForFile(filePath, resolvedWorkspacePath) ?? resolvedWorkspacePath;
+
+  return {
+    gitWorkspacePath,
+    gitFilePath: relative(gitWorkspacePath, absoluteFilePath).replace(/\\/g, '/'),
+  };
 }
 
 interface GitStatusResult {
@@ -72,7 +141,7 @@ export function registerGitHandlers(): void {
     try {
       const git: SimpleGit = simpleGit(workspacePath, { config: ['core.optionalLocks=false'] });
       const status = await git.status();
-      const branch = status.current || 'HEAD';
+      const branch = normalizeCurrentBranch(status.current) || 'HEAD';
 
       return {
         branch,
@@ -136,8 +205,9 @@ export function registerGitHandlers(): void {
         }
 
         // Branch must be a positional arg after options
-        if (options?.branch) {
-          rawArgs.push(options.branch);
+        const branchArg = normalizeBranchSelection(options?.branch);
+        if (branchArg) {
+          rawArgs.push(branchArg);
         }
 
         const rawOutput = await git.raw(['log', ...rawArgs]);
@@ -181,14 +251,14 @@ export function registerGitHandlers(): void {
     try {
       const git: SimpleGit = simpleGit(workspacePath);
       const summary = await git.branch();
-      let current = summary.current;
+      let current = normalizeCurrentBranch(summary.current);
       let branches = summary.all;
 
       // In a freshly initialized repo with no commits, `git branch` reports no
       // branches even though `git status` knows the unborn branch name.
       if (!current) {
         const status = await git.status();
-        current = status.current || '';
+        current = normalizeCurrentBranch(status.current);
       }
       if (current && branches.length === 0) {
         branches = [current];
@@ -216,9 +286,15 @@ export function registerGitHandlers(): void {
 
       return gitOperationLock.withLock(workspacePath, 'git:push', async () => {
         try {
-          const git: SimpleGit = simpleGit(workspacePath);
+          const git: SimpleGit = simpleGitWithHookEnv(workspacePath);
           const status = await git.status();
-          const branch = status.current || '';
+          const branch = normalizeCurrentBranch(status.current);
+          if (!branch || branch === 'HEAD') {
+            return {
+              success: false,
+              error: 'You are in detached HEAD. Checkout a branch before pushing.',
+            };
+          }
 
           const pushArgs: string[] = [];
           const remote = options?.remote || 'origin';
@@ -251,7 +327,15 @@ export function registerGitHandlers(): void {
 
       return gitOperationLock.withLock(workspacePath, 'git:pull', async () => {
         try {
-          const git: SimpleGit = simpleGit(workspacePath);
+          const git: SimpleGit = simpleGitWithHookEnv(workspacePath);
+          const status = await git.status();
+          const branch = normalizeCurrentBranch(status.current);
+          if (!branch || branch === 'HEAD') {
+            return {
+              success: false,
+              error: 'You are in detached HEAD. Checkout a branch before pulling.',
+            };
+          }
           const pullArgs: string[] = [];
           if (options?.rebase) {
             pullArgs.push('--rebase');
@@ -310,7 +394,7 @@ export function registerGitHandlers(): void {
 
       return gitOperationLock.withLock(workspacePath, 'git:rebase', async () => {
         try {
-          const git: SimpleGit = simpleGit(workspacePath);
+          const git: SimpleGit = simpleGitWithHookEnv(workspacePath);
 
           if (options.action === 'continue') {
             await git.rebase(['--continue']);
@@ -386,9 +470,15 @@ export function registerGitHandlers(): void {
       if (!isGitRepository(workspacePath)) return { success: false, error: 'Not a git repository' };
 
       try {
-        const git: SimpleGit = simpleGit(workspacePath);
+        const git: SimpleGit = simpleGitWithHookEnv(workspacePath);
         const status = await git.status();
-        const targetBranch = branch || status.current || '';
+        const targetBranch = branch || normalizeCurrentBranch(status.current);
+        if (!targetBranch || targetBranch === 'HEAD') {
+          return {
+            success: false,
+            error: 'You are in detached HEAD. Checkout a branch before setting upstream.',
+          };
+        }
         await git.push(['--set-upstream', remote, targetBranch]);
         return { success: true };
       } catch (error) {
@@ -435,7 +525,7 @@ export function registerGitHandlers(): void {
 
       return gitOperationLock.withLock(workspacePath, 'git:cherry-pick', async () => {
         try {
-          const git: SimpleGit = simpleGit(workspacePath);
+          const git: SimpleGit = simpleGitWithHookEnv(workspacePath);
           await git.raw(['cherry-pick', hash]);
           return { success: true };
         } catch (error) {
@@ -768,21 +858,22 @@ export function registerGitHandlers(): void {
         return { unifiedDiff: '', isBinary: false };
       }
 
-      const git: SimpleGit = simpleGit(workspacePath);
       const filePath = args.path;
       const group = args.group;
+      const { gitWorkspacePath, gitFilePath } = resolveGitDiffTarget(workspacePath, filePath);
+      const git: SimpleGit = simpleGit(gitWorkspacePath);
       const repoHasCommits = await hasCommits(git);
 
       try {
         if (group === 'staged') {
           const diff = repoHasCommits
-            ? await git.diff(['--cached', '--', filePath])
-            : await git.diff(['--cached', '--', filePath]);
+            ? await git.diff(['--cached', '--', gitFilePath])
+            : await git.diff(['--cached', '--', gitFilePath]);
           return { unifiedDiff: diff, isBinary: /\bBinary files\b/.test(diff) };
         }
 
         if (group === 'unstaged' || group === 'conflicted') {
-          const diff = await git.diff(['--', filePath]);
+          const diff = await git.diff(['--', gitFilePath]);
           return { unifiedDiff: diff, isBinary: /\bBinary files\b/.test(diff) };
         }
 
@@ -791,19 +882,19 @@ export function registerGitHandlers(): void {
           // HEAD, so synthesize against /dev/null. For deleted files HEAD has the
           // content and the working tree doesn't — `git diff HEAD` handles this.
           if (repoHasCommits) {
-            const diff = await git.diff(['HEAD', '--', filePath]);
+            const diff = await git.diff(['HEAD', '--', gitFilePath]);
             if (diff && diff.trim().length > 0) {
               return { unifiedDiff: diff, isBinary: /\bBinary files\b/.test(diff) };
             }
           }
           // Fall through to untracked-file synthesis if HEAD diff was empty
           // (e.g. file is brand-new and not staged).
-          const absolute = isAbsolute(filePath) ? filePath : join(workspacePath, filePath);
+          const absolute = isAbsolute(filePath) ? filePath : join(gitWorkspacePath, gitFilePath);
           if (!existsSync(absolute)) {
             return { unifiedDiff: '', isBinary: false };
           }
           try {
-            const diff = await git.raw(['diff', '--no-index', '--', '/dev/null', filePath]);
+            const diff = await git.raw(['diff', '--no-index', '--', '/dev/null', gitFilePath]);
             return { unifiedDiff: diff, isBinary: /\bBinary files\b/.test(diff) };
           } catch (err) {
             const diff = (err as { stdout?: string })?.stdout ?? '';
@@ -816,7 +907,7 @@ export function registerGitHandlers(): void {
 
         if (group === 'untracked') {
           // Synthesize a unified diff from the working-tree file contents.
-          const absolute = isAbsolute(filePath) ? filePath : join(workspacePath, filePath);
+          const absolute = isAbsolute(filePath) ? filePath : join(gitWorkspacePath, gitFilePath);
           if (!existsSync(absolute)) {
             return { unifiedDiff: '', isBinary: false };
           }
@@ -824,7 +915,7 @@ export function registerGitHandlers(): void {
           // for an untracked file. This handles binary detection naturally and respects
           // the user's diff config (e.g. mnemonicPrefix).
           try {
-            const diff = await git.raw(['diff', '--no-index', '--', '/dev/null', filePath]);
+            const diff = await git.raw(['diff', '--no-index', '--', '/dev/null', gitFilePath]);
             return { unifiedDiff: diff, isBinary: /\bBinary files\b/.test(diff) };
           } catch (err) {
             // git diff --no-index exits 1 when files differ; simple-git treats this as success
@@ -846,6 +937,38 @@ export function registerGitHandlers(): void {
   );
 
   /**
+   * Get the unified diff for a single file in a specific commit.
+   * Uses `git show --format=` so the output contains only the per-file diff
+   * (no commit metadata header). Works for the initial commit too --
+   * git show synthesizes a diff against /dev/null in that case.
+   */
+  safeHandle(
+    'git:commit-file-diff',
+    async (
+      _event,
+      workspacePath: string,
+      hash: string,
+      filePath: string
+    ): Promise<{ unifiedDiff: string; isBinary: boolean }> => {
+      if (!workspacePath) throw new Error('workspacePath is required');
+      if (!hash) throw new Error('hash is required');
+      if (!filePath) throw new Error('filePath is required');
+      if (!isGitRepository(workspacePath)) {
+        return { unifiedDiff: '', isBinary: false };
+      }
+
+      try {
+        const git: SimpleGit = simpleGit(workspacePath);
+        const diff = await git.raw(['show', '--no-color', '--format=', hash, '--', filePath]);
+        return { unifiedDiff: diff, isBinary: /\bBinary files\b/.test(diff) };
+      } catch (error) {
+        log.error(`[git:commit-file-diff] Failed for ${hash}/${filePath}:`, error);
+        throw error;
+      }
+    }
+  );
+
+  /**
    * Execute git commit
    */
   ipcMain.handle(
@@ -856,196 +979,9 @@ export function registerGitHandlers(): void {
       message: string,
       filesToStage: string[]
     ): Promise<{ success: boolean; commitHash?: string; commitDate?: string; error?: string }> => {
-      if (!workspacePath) {
-        throw new Error('workspacePath is required');
-      }
-      if (!message) {
-        throw new Error('message is required');
-      }
-
-      if (!isGitRepository(workspacePath)) {
-        return { success: false, error: 'Not a git repository' };
-      }
-
-      // Use centralized lock to prevent concurrent commit/staging operations
-      return gitOperationLock.withLock(workspacePath, 'git:commit', async () => {
-        try {
-          const git: SimpleGit = simpleGit(workspacePath);
-          const repoHasCommits = await hasCommits(git);
-          log.info(`[git:commit] Starting commit in ${workspacePath} with ${filesToStage?.length || 0} files (hasCommits: ${repoHasCommits})`);
-
-          // Convert a file path (possibly absolute) to a git-relative path with forward slashes.
-          // git.status() returns relative paths with forward slashes, but filesToStage
-          // may contain absolute paths (from renderer). On Windows, path.relative()
-          // returns backslashes, so normalize to forward slashes.
-          const toGitPath = (f: string) => {
-            const rel = isAbsolute(f) ? relative(workspacePath, f) : f;
-            return rel.replace(/\\/g, '/');
-          };
-
-          // When filesToStage is empty/null, commit whatever is already in the index.
-          // This is the "index-as-is" path used by the ChangesTab where the user
-          // has already staged files via git:stage. We do NOT touch the index.
-          if (!filesToStage || filesToStage.length === 0) {
-            const preStatus = await git.status();
-            const stagedCount = preStatus.staged.length + preStatus.created.length;
-            if (stagedCount === 0) {
-              return {
-                success: false,
-                error: 'No files are staged for commit.',
-              };
-            }
-            log.info(`[git:commit] Index-as-is mode: committing ${stagedCount} staged files`);
-
-            const result = await git.commit(message);
-            if (!result.commit) {
-              return {
-                success: false,
-                error: 'No changes were committed.',
-              };
-            }
-
-            log.info(`[git:commit] Successfully committed: ${result.commit}`);
-            let commitDate: string | undefined;
-            try {
-              const showResult = await git.show([result.commit, '--no-patch', '--format=%aI']);
-              commitDate = showResult.trim();
-            } catch {
-              // Non-critical
-            }
-
-            return { success: true, commitHash: result.commit, commitDate };
-          }
-
-          // Track originally staged files so we can restore them after commit
-          const initialStatus = await git.status();
-          const originallyStaged = new Set([...initialStatus.staged, ...initialStatus.created]);
-          log.info(`[git:commit] Originally staged files: ${originallyStaged.size}`);
-
-          // Stage-and-commit path: used by AgentMode/AI commit where we need to
-          // atomically select which files to include.
-          if (filesToStage.length > 0) {
-            // First, unstage all files to ensure we only commit what the user selected
-            // This prevents previously-staged files from being included in the commit
-            log.info(`[git:commit] Resetting staging area before staging selected files`);
-            if (repoHasCommits) {
-              await git.reset(['HEAD']);
-            } else {
-              // In a fresh repo with no commits, HEAD doesn't exist.
-              // Use `git rm --cached` to unstage files instead.
-              if (originallyStaged.size > 0) {
-                await git.raw(['rm', '--cached', '-r', '.']);
-              }
-            }
-
-            const filesToStageRelative = filesToStage.map(toGitPath);
-            log.info(`[git:commit] Staging files (raw): ${filesToStage.join(', ')}`);
-            log.info(`[git:commit] Staging files (git-relative): ${filesToStageRelative.join(', ')}`);
-
-            // Check which files actually exist on disk before staging
-            const fileExistence = filesToStage.map((f) => {
-              const absPath = isAbsolute(f) ? f : join(workspacePath, f);
-              return { path: f, exists: existsSync(absPath) };
-            });
-            const missingOnDisk = fileExistence.filter((f) => !f.exists);
-            if (missingOnDisk.length > 0) {
-              log.warn(`[git:commit] Files missing on disk: ${missingOnDisk.map((f) => f.path).join(', ')}`);
-            }
-
-            await git.add(filesToStage);
-
-            // Verify only the selected files are staged
-            const status = await git.status();
-            const stagedFiles = new Set([...status.staged, ...status.created]);
-            log.info(`[git:commit] After staging - staged files: [${[...status.staged].join(', ')}], created files: [${[...status.created].join(', ')}]`);
-            log.info(`[git:commit] Full status - modified: [${status.modified.join(', ')}], not_added: [${status.not_added.join(', ')}], deleted: [${status.deleted.join(', ')}], renamed: [${status.renamed.map((r) => `${r.from}->${r.to}`).join(', ')}], conflicted: [${status.conflicted.join(', ')}]`);
-
-            if (stagedFiles.size === 0) {
-              log.warn(`[git:commit] No files were staged despite add() succeeding. Requested: [${filesToStage.join(', ')}], git-relative: [${filesToStageRelative.join(', ')}]`);
-              // Restore originally staged files before returning
-              if (originallyStaged.size > 0) {
-                await git.add(Array.from(originallyStaged));
-              }
-              return {
-                success: false,
-                error: 'No files were staged. The files may not exist or have no changes.',
-              };
-            }
-
-            const filesToStageRelSet = new Set(filesToStageRelative);
-            const unexpectedFiles = Array.from(stagedFiles).filter(f => !filesToStageRelSet.has(f));
-            const missingFiles = filesToStageRelative.filter(f => !stagedFiles.has(f));
-
-            if (unexpectedFiles.length > 0) {
-              log.error(`[git:commit] Unexpected files staged: ${unexpectedFiles.join(', ')}`);
-              // Restore original state and abort
-              if (repoHasCommits) {
-                await git.reset(['HEAD']);
-              } else {
-                await git.raw(['rm', '--cached', '-r', '.']);
-              }
-              if (originallyStaged.size > 0) {
-                await git.add(Array.from(originallyStaged));
-              }
-              return {
-                success: false,
-                error: `Unexpected files were staged: ${unexpectedFiles.join(', ')}. Commit aborted.`,
-              };
-            }
-
-            if (missingFiles.length > 0) {
-              log.warn(`[git:commit] Some selected files were not staged: ${missingFiles.join(', ')}`);
-            }
-          }
-
-          // Commit
-          const result = await git.commit(message);
-          log.info(`[git:commit] Commit result: hash=${result.commit || 'empty'}, changes=${result.summary?.changes || 0}`);
-
-          // simple-git returns empty commit hash if nothing was committed
-          if (!result.commit) {
-            log.warn(`[git:commit] Commit returned empty hash - nothing was committed`);
-            // Restore originally staged files before returning
-            if (originallyStaged.size > 0) {
-              await git.add(Array.from(originallyStaged));
-            }
-            return {
-              success: false,
-              error: 'No changes were committed. Files may not have been staged correctly.',
-            };
-          }
-
-          // Restore originally staged files that weren't part of this commit
-          const committedFilesSet = new Set((filesToStage || []).map(toGitPath));
-          const filesToRestage = Array.from(originallyStaged).filter(f => !committedFilesSet.has(f));
-          if (filesToRestage.length > 0) {
-            log.info(`[git:commit] Restoring ${filesToRestage.length} originally staged files`);
-            await git.add(filesToRestage);
-          }
-
-          log.info(`[git:commit] Successfully committed: ${result.commit}`);
-
-          // Get the actual commit date from git
-          let commitDate: string | undefined;
-          try {
-            const showResult = await git.show([result.commit, '--no-patch', '--format=%aI']);
-            commitDate = showResult.trim();
-          } catch {
-            // Non-critical - fall through without date
-          }
-
-          return {
-            success: true,
-            commitHash: result.commit,
-            commitDate,
-          };
-        } catch (error) {
-          log.error('[git:commit] Failed to commit:', error);
-          return {
-            success: false,
-            error: error instanceof Error ? error.message : String(error),
-          };
-        }
+      return executeGitCommit(workspacePath, message, filesToStage, {
+        logContext: '[git:commit]',
+        env: getGitSubprocessEnv(),
       });
     }
   );

@@ -41,9 +41,24 @@ export interface CustomEditorRegistration {
   // Optional: Whether to show the host-provided document header above the editor
   showDocumentHeader?: boolean;
 
+  // Optional: Whether this editor renders inline in the agent transcript for AI edits
+  supportsTranscriptEmbed?: boolean;
+
+  // Optional: Preferred height (px) for the inline transcript embed (default 360)
+  transcriptEmbedHeight?: number;
+
   // Optional: Extension ID for error attribution (added automatically for extension-provided editors)
   extensionId?: string;
 
   // Optional: Component name for error attribution
   componentName?: string;
+
+  // Optional: Collaboration support, mirrors the manifest contribution. When
+  // `supported: true`, opening this file via a `collab://` URI routes through
+  // `CollaborativeTabEditor` and the editor receives a populated
+  // `host.collaboration` (extension uses `useCollaborativeEditor` from the SDK).
+  collaboration?: {
+    supported: boolean;
+    awarenessFields?: string[];
+  };
 }

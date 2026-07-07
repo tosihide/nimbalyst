@@ -19,7 +19,7 @@ import type { SettingsCategory } from '../../components/Settings/SettingsSidebar
 // Types
 // ============================================================
 
-export type SettingsScope = 'user' | 'project';
+export type SettingsScope = 'user' | 'organization' | 'project';
 
 export interface SettingsNavigationState {
   /** Initial category to navigate to */
@@ -142,5 +142,7 @@ export const incrementSettingsKeyAtom = atom(
 export const openSettingsCommandAtom = atom<{
   category: SettingsCategory;
   scope?: SettingsScope;
+  /** Optional data-testid to scrollIntoView once the selected panel renders. */
+  anchor?: string;
   timestamp: number;
 } | null>(null);

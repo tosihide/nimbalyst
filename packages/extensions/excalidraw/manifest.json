@@ -1,13 +1,14 @@
 {
   "id": "com.nimbalyst.excalidraw",
   "name": "Excalidraw",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Excalidraw diagram editor with AI-assisted editing",
   "author": "Nimbalyst",
   "main": "dist/index.js",
   "styles": "dist/index.css",
   "apiVersion": "1.0.0",
   "marketplace": {
+    "changelog": "1.0.1: Shared-document collaboration fixes, Mermaid image import fix, and more reliable AI edits to open diagrams.",
     "categories": ["diagrams"],
     "tags": ["excalidraw", "diagram", "flowchart", "architecture", "drawing", "whiteboard"],
     "icon": "brush",
@@ -41,7 +42,12 @@
         "displayName": "Excalidraw Editor",
         "component": "ExcalidrawEditor",
         "supportsSourceMode": true,
-        "supportsDiffMode": false
+        "supportsDiffMode": false,
+        "supportsTranscriptEmbed": true,
+        "collaboration": {
+          "supported": true,
+          "awarenessFields": ["pointer", "button", "selectedElementIds"]
+        }
       }
     ],
     "aiTools": [
@@ -82,13 +88,7 @@
       "path": "claude-plugin",
       "displayName": "Excalidraw Diagrams",
       "description": "Create flowcharts, architecture diagrams, and visual drawings",
-      "enabledByDefault": true,
-      "commands": [
-        {
-          "name": "excalidraw",
-          "description": "Create a diagram using Excalidraw"
-        }
-      ]
+      "enabledByDefault": true
     }
   }
 }

@@ -10,6 +10,7 @@
 import { atom } from 'jotai';
 
 export const newMockupRequestAtom = atom(0);
+export const newBrowserTabRequestAtom = atom(0);
 export const toggleAIChatPanelRequestAtom = atom(0);
 export const fileSaveRequestAtom = atom(0);
 
@@ -37,6 +38,26 @@ export interface ExtensionMarketplaceInstallRequest {
   request: { extensionId: string; requestedAt?: string };
 }
 export const extensionMarketplaceInstallRequestAtom = atom<ExtensionMarketplaceInstallRequest | null>(null);
+
+/**
+ * Per-stage progress for the "Install from GitHub" flow. The listener bumps
+ * `version` on every `extension-marketplace:install-progress` event so the
+ * panel can update its status toast as the install advances through stages
+ * (checking release, downloading, cloning, installing).
+ */
+export type InstallProgressStage =
+  | 'checking-release'
+  | 'downloading-release'
+  | 'cloning'
+  | 'installing'
+  | 'done';
+
+export interface MarketplaceInstallProgress {
+  version: number;
+  stage: InstallProgressStage;
+  message: string;
+}
+export const marketplaceInstallProgressAtom = atom<MarketplaceInstallProgress | null>(null);
 
 export interface SetContentModeRequest {
   version: number;

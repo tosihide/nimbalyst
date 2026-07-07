@@ -8,8 +8,10 @@
 import { ipcMain, BrowserWindow } from 'electron';
 import log from 'electron-log/main';
 import simpleGit from 'simple-git';
+import { FeatureUsageService, FEATURES } from '../services/FeatureUsageService';
 import { GitWorktreeService } from '../services/GitWorktreeService';
 import { WorktreeStore, createWorktreeStore } from '../services/WorktreeStore';
+import { createSuperLoopStore } from '../services/SuperLoopStore';
 import { getDatabase } from '../database/initialize';
 import { archiveProgressManager } from '../services/ArchiveProgressManager';
 import { AISessionsRepository } from '@nimbalyst/runtime/storage/repositories/AISessionsRepository';
@@ -70,6 +72,25 @@ function emitTerminalListChanged(workspacePath: string): void {
   }
 }
 
+async function archiveSessionsForWorktree(
+  worktreeId: string,
+  sessionIds: string[],
+  archiveLogger: ReturnType<typeof log.scope>
+): Promise<number> {
+  let failedSessions = 0;
+
+  for (const sessionId of sessionIds) {
+    try {
+      await AISessionsRepository.updateMetadata(sessionId, { isArchived: true });
+    } catch (err) {
+      failedSessions++;
+      archiveLogger.error('Failed to archive session', { sessionId, worktreeId, error: err });
+    }
+  }
+
+  return failedSessions;
+}
+
 /**
  * Archive a single worktree and its sessions.
  *
@@ -100,6 +121,7 @@ export async function archiveWorktree(worktreeId: string, workspacePath: string)
     }
 
     const worktreeStore = createWorktreeStore(db);
+    const superLoopStore = createSuperLoopStore(db);
     const worktree = await worktreeStore.get(worktreeId);
 
     if (!worktree) {
@@ -113,9 +135,21 @@ export async function archiveWorktree(worktreeId: string, workspacePath: string)
       );
     }
 
-    // Already archived - but only skip if the directory is actually gone
+    const sessionIds = await worktreeStore.getWorktreeSessions(worktreeId);
+
+    // Already archived - but only skip if the directory is actually gone.
+    // We still reconcile linked sessions because older partial failures could
+    // leave the worktree archived while one or more sessions remain visible.
     if (worktree.isArchived) {
       if (!fs.existsSync(worktree.path)) {
+        const failedSessions = await archiveSessionsForWorktree(worktreeId, sessionIds, archiveLogger);
+        if (failedSessions > 0) {
+          throw new Error(`Failed to archive ${failedSessions} lingering session(s) for archived worktree ${worktreeId}`);
+        }
+        const existingLoop = await superLoopStore.getLoopByWorktreeId(worktreeId);
+        if (existingLoop && !existingLoop.isArchived) {
+          await superLoopStore.updateLoop(existingLoop.id, { isArchived: true });
+        }
         archiveLogger.info('Worktree already archived and directory removed, skipping', { worktreeId });
         return { success: true };
       }
@@ -128,7 +162,6 @@ export async function archiveWorktree(worktreeId: string, workspacePath: string)
     const gitWorktreeService = new GitWorktreeService();
 
     // Step 1: Get all sessions for this worktree
-    const sessionIds = await worktreeStore.getWorktreeSessions(worktreeId);
     archiveLogger.info('Found sessions for worktree', { worktreeId, sessionCount: sessionIds.length });
 
     // Get worktree git status for analytics (before archiving)
@@ -176,16 +209,7 @@ export async function archiveWorktree(worktreeId: string, workspacePath: string)
     // Step 3: Archive all sessions for this worktree immediately (fast feedback)
     archiveLogger.info('Archiving sessions for worktree', { worktreeId, sessionCount: sessionIds.length });
 
-    let failedSessions = 0;
-    for (const sessionId of sessionIds) {
-      try {
-        await AISessionsRepository.updateMetadata(sessionId, { isArchived: true });
-      } catch (err) {
-        failedSessions++;
-        archiveLogger.error('Failed to archive session', { sessionId, worktreeId, error: err });
-        // Continue archiving remaining sessions
-      }
-    }
+    const failedSessions = await archiveSessionsForWorktree(worktreeId, sessionIds, archiveLogger);
 
     if (failedSessions > 0) {
       archiveLogger.warn('Some sessions failed to archive', { worktreeId, failedCount: failedSessions, totalCount: sessionIds.length });
@@ -222,6 +246,10 @@ export async function archiveWorktree(worktreeId: string, workspacePath: string)
 
         // Only mark as archived AFTER disk deletion is confirmed
         await worktreeStore.updateArchived(worktreeId, true);
+        const existingLoop = await superLoopStore.getLoopByWorktreeId(worktreeId);
+        if (existingLoop && !existingLoop.isArchived) {
+          await superLoopStore.updateLoop(existingLoop.id, { isArchived: true });
+        }
 
         archiveLogger.info('Worktree marked as archived in database', { worktreeId });
 
@@ -295,9 +323,15 @@ export function registerWorktreeHandlers(): void {
    * @param name - Optional custom name for the worktree
    * @returns Worktree data including id, path, branch, etc.
    */
-  ipcMain.handle('worktree:create', async (_event, workspacePath: string, name?: string): Promise<WorktreeCreateResult> => {
+  ipcMain.handle('worktree:create', async (
+    _event,
+    workspacePath: string,
+    options?: { name?: string; baseBranch?: string }
+  ): Promise<WorktreeCreateResult> => {
     const startTime = Date.now();
     const MAX_RETRIES = 3;
+    const name = options?.name;
+    const baseBranch = options?.baseBranch;
 
     // Retry loop for handling race conditions where concurrent requests pick the same name
     for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
@@ -310,7 +344,7 @@ export function registerWorktreeHandlers(): void {
           throw new Error('workspacePath is required');
         }
 
-        logger.info('Creating worktree', { workspacePath, name, attempt });
+        logger.info('Creating worktree', { workspacePath, name, baseBranch, attempt });
 
         // Get database early for de-duplication
         const db = getDatabase();
@@ -354,7 +388,7 @@ export function registerWorktreeHandlers(): void {
 
         // Create the git worktree
         const gitCreateStartTime = Date.now();
-        const worktree = await gitWorktreeService.createWorktree(workspacePath, { name: finalName });
+        const worktree = await gitWorktreeService.createWorktree(workspacePath, { name: finalName, baseBranch });
         timings.gitWorktreeCreate = Date.now() - gitCreateStartTime;
 
         // Track the created worktree for potential cleanup
@@ -385,9 +419,11 @@ export function registerWorktreeHandlers(): void {
 
         // Track worktree creation
         const analyticsService = AnalyticsService.getInstance();
+        FeatureUsageService.getInstance().recordUsage(FEATURES.WORKTREE_CREATED);
         analyticsService.sendEvent('worktree_created', {
           duration_ms: totalDuration,
           retry_count: attempt - 1,
+          base_branch_source: baseBranch ? 'picker' : 'default',
         });
 
         return {
@@ -463,13 +499,13 @@ export function registerWorktreeHandlers(): void {
     // Deduplicate: if a request for this path is already in flight, reuse it
     const existing = inFlightStatusRequests.get(worktreePath);
     if (existing) {
-      logger.info('Reusing in-flight worktree:get-status request', { worktreePath });
+      // logger.info('Reusing in-flight worktree:get-status request', { worktreePath });
       return existing;
     }
 
     const requestPromise = (async () => {
       try {
-        logger.info('Getting worktree status', { worktreePath, fetchFirst: options?.fetchFirst });
+        // logger.info('Getting worktree status', { worktreePath, fetchFirst: options?.fetchFirst });
 
         // Look up the worktree to get the stored base branch
         const db = getDatabase();
@@ -478,7 +514,7 @@ export function registerWorktreeHandlers(): void {
           const worktreeStore = createWorktreeStore(db);
           const worktree = await worktreeStore.getByPath(worktreePath);
           baseBranch = worktree?.baseBranch;
-          logger.info('Found worktree base branch for status', { worktreePath, baseBranch: baseBranch || 'not found' });
+          // logger.info('Found worktree base branch for status', { worktreePath, baseBranch: baseBranch || 'not found' });
         }
 
         // Fetch latest remote refs for accurate merge detection
@@ -687,7 +723,7 @@ export function registerWorktreeHandlers(): void {
         throw new Error('worktreePath is required');
       }
 
-      logger.info('Getting worktree by path', { worktreePath });
+      // logger.info('Getting worktree by path', { worktreePath });
 
       const db = getDatabase();
       if (!db) {
@@ -889,7 +925,7 @@ export function registerWorktreeHandlers(): void {
         throw new Error('worktreePath is required');
       }
 
-      logger.info('Getting changed files', { worktreePath });
+      // logger.info('Getting changed files', { worktreePath });
 
       const changedFiles = await gitWorktreeService.getChangedFiles(worktreePath);
 
@@ -961,7 +997,7 @@ export function registerWorktreeHandlers(): void {
         throw new Error('worktreePath is required');
       }
 
-      logger.info('Getting worktree commits', { worktreePath });
+      // logger.info('Getting worktree commits', { worktreePath });
 
       // Look up the worktree to get the stored base branch
       const db = getDatabase();
@@ -970,7 +1006,7 @@ export function registerWorktreeHandlers(): void {
         const worktreeStore = createWorktreeStore(db);
         const worktree = await worktreeStore.getByPath(worktreePath);
         baseBranch = worktree?.baseBranch;
-        logger.info('Found worktree base branch', { worktreePath, baseBranch: baseBranch || 'not found' });
+        // logger.info('Found worktree base branch', { worktreePath, baseBranch: baseBranch || 'not found' });
       }
 
       const commits = await gitWorktreeService.getWorktreeCommits(worktreePath, baseBranch);
@@ -1057,7 +1093,7 @@ export function registerWorktreeHandlers(): void {
         throw new Error('repoPath is required');
       }
 
-      logger.info('Getting current branch for repo', { repoPath });
+      // logger.info('Getting current branch for repo', { repoPath });
 
       const currentBranch = await gitWorktreeService.getRepoCurrentBranch(repoPath);
 

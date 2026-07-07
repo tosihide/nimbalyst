@@ -61,11 +61,9 @@ All events include `$session_id` property automatically. Dev users are marked wi
 | `file_opened` | `FileHandlers.ts:85`<br/>`WorkspaceHandlers.ts:804` | User opens file via dialog or workspace tree | `source` (dialog/workspace)<br/>`fileType`<br/>`hasWorkspace` | v0.45.25 (2025-11-14) |  |
 | `file_saved` | `FileHandlers.ts:199` | User manually saves file (Cmd+S) | `saveType` (manual)<br/>`fileType`<br/>`hasFrontmatter`<br/>`wordCount` | v0.45.25 (2025-11-14) |  |
 | `file_save_failed` | `FileHandlers.ts:212, 277` | File save operation fails | `errorType`<br/>`fileType`<br/>`isAutoSave` | v0.45.25 (2025-11-14) |  |
-| `file_conflict_detected` | `FileHandlers.ts:138` | File changed on disk since last load | `fileType`<br/>`conflictResolution` (pending) | v0.45.25 (2025-11-14) |  |
 | `file_created` | `FileHandlers.ts:399`<br/>`WorkspaceHandlers.ts:154` | User creates new file | `creationType` (new_file_menu/ai_tool)<br/>`fileType` (markdown/mockup/text/other) | v0.45.25 (2025-11-14) | v0.47.2 (2025-12-10): Added mockup fileType |
 | `file_renamed` | `WorkspaceHandlers.ts:592` | User renames file in workspace | None | v0.45.25 (2025-11-14) |  |
 | `file_deleted` | `WorkspaceHandlers.ts:618` | User deletes file from workspace | None | v0.45.25 (2025-11-14) |  |
-| `file_save_blocked_after_delete` | `FileHandlers.ts` (recently-deleted IPC branch + `telemetry:file-save-blocked-after-delete` forwarder) | A save was blocked because the file was previously deleted (and possibly recreated by an external process). Emitted by any of the four-layer defenses against autosave overwrite of recreated files. | `layer` (`recently-deleted` / `document-model-deleted` / `conflict-mismatch`)<br/>`fileType`<br/>`wasAutosave` | (pending release) |  |
 
 ### Workspace Operations
 
@@ -80,7 +78,7 @@ All events include `$session_id` property automatically. Dev users are marked wi
 
 | Event Name | File(s) | Trigger | Properties | First Added (Public) | Significant Changes |
 | --- | --- | --- | --- | --- | --- |
-| `worktree_created` | `WorktreeHandlers.ts:115` | User creates a new git worktree | `duration_ms` | (pending release) |  |
+| `worktree_created` | `WorktreeHandlers.ts:115` | User creates a new git worktree | `duration_ms`<br/>`retry_count`<br/>`base_branch_source` (`default` \| `picker`) | (pending release) | (pending release): Added base_branch_source (#264) |
 | `worktree_archived` | `WorktreeHandlers.ts:897` | User archives a worktree (sessions archived immediately, cleanup queued) | `session_count`<br/>`worktree_age_days`<br/>`failed_sessions`<br/>`has_uncommitted_changes`<br/>`has_unmerged_changes` | (pending release as of 6d0b51b5) | (pending release): Added has_uncommitted_changes and has_unmerged_changes |
 | `worktree_archive_completed` | `WorktreeHandlers.ts:921` | Worktree cleanup completes successfully | `session_count`<br/>`duration_ms` | (pending release as of 6d0b51b5) |  |
 | `worktree_archive_failed` | `WorktreeHandlers.ts:937, 961` | Worktree archive fails | `error_type`<br/>`stage` (archiving-sessions/removing-worktree) | (pending release as of 6d0b51b5) |  |
@@ -98,9 +96,10 @@ All events include `$session_id` property automatically. Dev users are marked wi
 | Event Name | File(s) | Trigger | Properties | First Added (Public) | Significant Changes |
 | --- | --- | --- | --- | --- | --- |
 | `content_mode_switched` | `NavigationGutter.tsx:111` | User switches between Files and Agent modes via navigation gutter | `fromMode` (files/agent/settings)<br/>`toMode` (files/agent/settings) | v0.48.13 (2025-12-17) |  |
-| `editor_type_opened` | `TabEditor.tsx:242` | User opens a file in an editor tab | `editorCategory` (markdown/monaco/image or extension name like "Spreadsheet Editor", "PDF Viewer", "Excalidraw Editor", "Data Model Editor")<br/>`fileExtension` (e.g., .md, .csv, .prisma, .mockup.html)<br/>`hasMermaid` (boolean, for markdown)<br/>`hasDataModel` (boolean, for markdown) | v0.48.13 (2025-12-17) | (pending release): Renamed editorType to editorCategory; editorCategory now uses extension displayName for custom editors; fileExtension contains actual extension |
+| `editor_type_opened` | `TabEditor.tsx:277` | User opens a file in an editor tab | `editorCategory` (markdown/monaco/image or extension name like "Spreadsheet Editor", "PDF Viewer", "Excalidraw Editor", "Data Model Editor")<br/>`fileExtension` (e.g., .md, .csv, .prisma, .mockup.html)<br/>`hasMermaid` (boolean, for markdown)<br/>`hasDataModel` (boolean, for markdown) | v0.48.13 (2025-12-17) | (pending release): Renamed editorType to editorCategory; editorCategory now uses extension displayName for custom editors; fileExtension contains actual extension<br/>(pending release): Defer emit until the editor type settles and re-arm on registry changes, so late-registering extension editors (e.g. .mockup.html, .calc.md) report their compound key/displayName instead of the fallback (.html/.md/monaco) |
 | `markdown_view_mode_switched` | `TabEditor.tsx:1556, 1606` | User switches between rich text (lexical) and raw markdown (monaco) view modes | `fromMode` (lexical/monaco)<br/>`toMode` (lexical/monaco) | v0.48.13 (2025-12-17) |  |
 | `session_view_mode_switched` | `SessionHistory.tsx` | User switches between list and kanban views for session history | `fromMode` (list/card/kanban)<br/>`toMode` (list/card/kanban) | (pending release) |  |
+| `session_list_filter_applied` | `SessionHistory.tsx` | User applies a tag filter or searches in the sessions list panel | `filterType` (tag/search)<br/>`activeTagCount` (number of active tag filters) | (pending release) |  |
 
 ### Session Kanban Board
 
@@ -127,8 +126,7 @@ All events include `$session_id` property automatically. Dev users are marked wi
 | `create_ai_session` | `AIService.ts:1860`<br/>`SessionHandlers.ts:323, 672` | User creates new AI chat session | `provider`<br/>`is_worktree_session` (boolean)<br/>`is_workstream_child` (boolean)<br/>`is_meta_agent_session` (boolean) | v0.45.25 (2025-11-14) | v0.52.14: Added is_worktree_session and is_workstream_child properties<br/>(pending release): Also emitted from SessionHandlers so Files and Agent mode session creation paths are tracked<br/>(pending release): Added is_meta_agent_session property |
 | `ai_message_sent` | `AIService.ts:1822` | User sends message in AI chat | `provider`<br/>`hasDocumentContext`<br/>`hasAttachments`<br/>`contentMode` (files/agent/unknown)<br/>`sessionMode` (optional, planning/agent)<br/>`fileExtension` (optional, when document open)<br/>`usedSlashCommand` (optional)<br/>`slashCommandName` (optional)<br/>`slashCommandPackageId` (optional) | v0.45.25 (2025-11-14) | v0.47.2 (2025-12-10): Added usedSlashCommand, slashCommandName, slashCommandPackageId properties<br/>(pending release as of 5698aa25): Added fileExtension property<br/>(pending release): Added sessionMode property |
 | `ai_message_queued` | `AIService.ts:2517, 640` | User queues message while AI is busy processing | `provider`<br/>`source` (local/mobile)<br/>`hasDocumentContext`<br/>`hasAttachments`<br/>`fileExtension` (optional, local only when document open) | (pending release as of f891af91) | (pending release as of 5698aa25): Added fileExtension property |
-| `ai_response_received` | `AIService.ts:1092, 1326` | AI provider returns response | `provider`<br/>`responseType` (text/tool_use/error)<br/>`toolsUsed`<br/>`usedChartTool` | v0.45.25 (2025-11-14) | (pending release as of f74f38fb): Added usedChartTool property |
-| `ai_response_streamed` | `AIService.ts:1100` | AI response finishes streaming | `provider`<br/>`chunkCount` (0-9, 10-49, 50-99, 100+)<br/>`totalLength` (0-99, 100-499, 500-999, 1000+) | v0.45.25 (2025-11-14) |  |
+| `ai_response_received` | `MessageStreamingHandler.ts:1913, 2477` | AI provider returns response | `provider`<br/>`responseType` (text/tool_use/error)<br/>`toolsUsed`<br/>`usedChartTool`<br/>`responseTime`<br/>`chunkCount` (0-9, 10-49, 50-99, 100+, success only)<br/>`totalLength` (0-99, 100-499, 500-999, 1000+, success only) | v0.45.25 (2025-11-14) | (pending release): Merged `ai_response_streamed` fields (`chunkCount`, `totalLength`) into this event to remove the 1:1 duplicate |
 | `ai_stream_interrupted` | `AIService.ts:1024, 1483` | AI streaming stops prematurely | `provider`<br/>`chunksReceived`<br/>`reason` (error/user_cancel)<br/>`errorCategory` (resume_mismatch/stream_closed/network/auth/timeout/rate_limit/overloaded/unknown, only when reason=error) | v0.45.25 (2025-11-14) | (pending release): Added `errorCategory` so NIM-838 resume-mismatch and other Claude Code failures can be separated from the generic error bucket |
 | `ai_request_failed` | `AIService.ts:1319` | AI API request fails | `provider`<br/>`errorType` (resume_mismatch/stream_closed/network/auth/timeout/rate_limit/overloaded/unknown)<br/>`retryAttempt` | v0.45.25 (2025-11-14) | (pending release): Added `resume_mismatch` and `stream_closed` buckets to `errorType` |
 | `ai_session_resumed` | `AIService.ts:2016` | User intentionally opens session from history (not app startup, tab switching, or session reload) | `provider`<br/>`messageCount` (0, 1, 2-4, 5-9, 10+)<br/>`ageInDays` (today/1-day/2-6-days/1-4-weeks/1-3-months/3-months-plus) | v0.45.25 (2025-11-14) | v0.48.13 (2025-12-17): Fixed to no longer fire on app startup, tab switching, or session reload |
@@ -137,6 +135,7 @@ All events include `$session_id` property automatically. Dev users are marked wi
 | `ai_diff_rejected` | `DiffApprovalBar.tsx:380, 450`<br/>`TabEditor.tsx:1442` | User rejects diff or all diffs (markdown/code/mockup) | `rejectType` (partial/all)<br/>`replacementCount`<br/>`fileType` (mockup, optional) | v0.45.25 (2025-11-14) |  |
 | `session_reparented` | `SessionListItem.tsx:290` | User drags session to change parent (workstream reassignment) | `had_previous_parent`<br/>`workspace_path` | (pending release) |  |
 | `ai_effort_level_changed` | `SessionTranscript.tsx` | User changes effort level for Opus 4.6 adaptive reasoning | `effort_level` (low/medium/high/max)<br/>`previous_level` (low/medium/high/max) | (pending release) |  |
+| `ai_mode_changed` | `SessionTranscript.tsx` | User switches session mode via ModeTag or Shift+Tab | `from` (planning/agent)<br/>`to` (planning/agent)<br/>`provider` (string)<br/>`session_id` (string) | (pending release) | Auto mode is no longer user-selectable; it activates transparently via the "Allow All" trust level for supported providers |
 | `exit_plan_mode_response` | `SessionTranscript.tsx:923, 943, 974, 1060` | User responds to plan completion confirmation | `decision` (approved/denied/start_new_session/cancelled)<br/>`has_feedback` (boolean, for denied only)<br/>`is_worktree` (boolean, for start_new_session only) | (pending release) |  |
 | `ask_user_question_answered` | `SessionTranscript.tsx:1081` | User answers an AskUserQuestion prompt from Claude | `numQuestions` (number of questions answered) | (pending release) |  |
 | `ask_user_question_cancelled` | `SessionTranscript.tsx:1087` | User cancels an AskUserQuestion prompt | None | (pending release) |  |
@@ -148,6 +147,7 @@ All events include `$session_id` property automatically. Dev users are marked wi
 | --- | --- | --- | --- | --- | --- |
 | `claude_code_session_started` | `AIService.ts:2579` | Claude Code provider initializes session | `mcpServerCount`<br/>`slashCommandCount`<br/>`agentCount`<br/>`skillCount`<br/>`pluginCount`<br/>`toolCount`<br/>`helperMethod` (electron/standalone)<br/>`configuredProvider` (optional: anthropic/aws-bedrock/google-vertex/xai/openai/azure-openai/gemini/mistral/groq/cohere) | v0.45.25 (2025-11-14) | (pending release): Added helperMethod property to track which executable method is used for spawning Claude Code subprocess<br/>(pending release): Added configuredProvider property to track which AI provider is configured via environment variables |
 | `slash_command_suggestion_clicked` | `SlashCommandSuggestions.tsx:117` | User clicks a slash command suggestion pill in empty session | `commandName`<br/>`packageId` | v0.47.2 (2025-12-10) |  |
+| `action_prompt_inserted` | `ActionPromptsDropdown.tsx` | User picks an action from the composer Actions dropdown, inserting its body into the AI draft | `actionCount` (number of actions in the workspace's ai-actions.md)<br/>`bodyLength` (length of the inserted prompt body) | (pending release) |  |
 
 ### OpenAI Codex
 
@@ -266,6 +266,11 @@ All events include `$session_id` property automatically. Dev users are marked wi
 | `database_init_failed_recovery_choice` | `PGLiteDatabaseWorker.ts:343, 399, 408` | User makes a choice in init failure recovery dialog | `choice` (restore_from_backup/start_fresh)<br/>`confirmed` (for start_fresh) | (pending release) |  |
 | `known_error` | Various (see Known Error IDs below) | A recognized error condition occurs that we want to track and monitor | `errorId` (see Known Error IDs)<br/>`context` (where the error occurred)<br/>`errorMessage` (optional, truncated) | (pending release as of c597008b) |  |
 | `feature_first_use` | `AIService.ts:406`<br/>`WindowManager.ts:230`<br/>`AnalyticsHandlers.ts:45` | User uses a feature for the first time | `feature`<br/>`daysSinceInstall` | v0.45.25 (2025-11-14) |  |
+| `migration_completed` | `MigrationOrchestrator.ts` | PGLite → SQLite migration finished successfully | `pglite_dir_size_bytes` (gauge of pre-migration store size)<br/>`target_row_count` (total rows migrated)<br/>`duration_ms`<br/>`tables_migrated`<br/>`spot_check_count`<br/>`foreign_key_violations`<br/>`integrity_check` ("ok") | (pending release) |  |
+| `migration_failed` | `MigrationOrchestrator.ts` | PGLite → SQLite migration aborted before cutover | `phase` (closing-pglite / opening-pglite / opening-sqlite / migrating / verifying-* / cutover)<br/>`message` (first 500 chars of error) | (pending release) |  |
+| `pglite_legacy_dir_present` | `database/initialize.ts` | Heartbeat fired at startup when a `pglite-db.migrated-*` directory still exists; gates the decision to retire the PGLite reader | `active_backend` (sqlite/pglite) | (pending release) |  |
+| `migration_dry_run_completed` | `ipc/MigrationHandlers.ts` | Alpha-grade preview: migration ran against a live PGLite to a throwaway SQLite dir without cutover | `target_row_count`<br/>`duration_ms`<br/>`tables_migrated`<br/>`sqlite_file_bytes` (estimated post-cutover footprint)<br/>`pglite_dir_bytes` (current PGLite footprint)<br/>`foreign_key_violations`<br/>`integrity_check` | (pending release) |  |
+| `migration_dry_run_failed` | `ipc/MigrationHandlers.ts` | Dry-run aborted before completion (schema open / read / verification failure) | `message` (first 500 chars of error) | (pending release) |  |
 
 #### Known Error IDs
 
@@ -285,8 +290,8 @@ The `known_error` event uses an `errorId` property to identify specific error co
 | --- | --- | --- | --- | --- | --- |
 | `developer_mode_changed` | `App.tsx`<br/>`AdvancedPanel.tsx` | User changes developer mode setting (initial or subsequent) | `developer_mode` (boolean)<br/>`source` (onboarding/settings)<br/>`is_initial` (boolean) | (pending release) |  |
 | `unified_onboarding_skipped` | `App.tsx` | User skips the unified onboarding flow | None | (pending release) | Replaces `onboarding_skipped` |
-| ~~`feature_walkthrough_completed`~~ | ~~`FeatureWalkthrough.tsx`~~ | ~~User completes or skips the feature walkthrough~~ | ~~`total_time_ms`~~~~<br/>~~~~`slide_times`~~~~ (object with editor/mockup/agent keys)<br/>~~~~`skipped`~~~~ (boolean)<br/>~~~~`skipped_at_slide`~~~~ (editor/mockup/agent, only if skipped)~~ | v0.45.25 (2025-11-14) | **DEPRECATED**: No longer sent; walkthrough slides removed in unified onboarding |
-| ~~`onboarding_completed`~~ | ~~`OnboardingDialog.tsx`~~ | ~~User completes the role/email onboarding dialog~~ | ~~`user_role`~~~~<br/>~~~~`custom_role_provided`~~~~<br/>~~~~`custom_role_text`~~~~<br/>~~~~`email_provided`~~ | v0.45.25 (2025-11-14) | **DEPRECATED**: Replaced by `unified_onboarding_completed`, then re-used (see below) |
+| ~~`feature_walkthrough_completed`~~ | ~~`FeatureWalkthrough.tsx`~~ | ~~User completes or skips the feature walkthrough~~ | ~~`total_time_ms`<br/>`slide_times` (object with editor/mockup/agent keys)<br/>`skipped` (boolean)<br/>`skipped_at_slide` (editor/mockup/agent, only if skipped)~~ | v0.45.25 (2025-11-14) | **DEPRECATED**: No longer sent; walkthrough slides removed in unified onboarding |
+| ~~`onboarding_completed`~~ | ~~`OnboardingDialog.tsx`~~ | ~~User completes the role/email onboarding dialog~~ | ~~`user_role`<br/>`custom_role_provided`<br/>`custom_role_text`<br/>`email_provided`~~ | v0.45.25 (2025-11-14) | **DEPRECATED**: Replaced by `unified_onboarding_completed`, then re-used (see below) |
 | `onboarding_completed` | `useOnboarding.ts` | User completes the unified onboarding dialog (has role or referral data) | `user_role` (raw value, e.g. `developer`, `product_manager`, `other`)<br/>`custom_role_text` (only when user typed a custom role)<br/>`referral_source` (raw value, e.g. `search`, `social`, `ai`, `other`)<br/>`referral_ai_detail` (only for `ai` referral)<br/>`referral_other_detail` (only for `other` referral)<br/>`referral_social_detail` (only for `social` referral)<br/>`developer_mode` (boolean)<br/>`email_provided` (boolean) | (pending release) | Replaces programmatic `survey sent` for the Onboarding Profile Survey. Property names and raw values match the existing `Devs` / `Product Managers` / `role_other` cohorts. |
 | ~~`onboarding_deferred`~~ | ~~`App.tsx`~~ | ~~User clicks "Ask me later" on onboarding dialog~~ | ~~None~~ | v0.45.25 (2025-11-14) | **DEPRECATED**: Removed in unified onboarding |
 | ~~`onboarding_skipped`~~ | ~~`App.tsx`~~ | ~~User clicks "Never ask again" on onboarding dialog~~ | ~~None~~ | v0.45.25 (2025-11-14) | **DEPRECATED**: Replaced by `unified_onboarding_skipped` |
@@ -318,12 +323,12 @@ The `known_error` event uses an `errorId` property to identify specific error co
 
 | Event Name | File(s) | Trigger | Properties | First Added (Public) | Significant Changes |
 | --- | --- | --- | --- | --- | --- |
-| `update_toast_shown` | `updateListeners.ts` -> `AnalyticsHandlers.ts` | Update available toast actually displayed to user (after suppression checks pass). Fires from the renderer once per (version, display) -- not on every electron-updater 'update-available' callback, which re-fires hourly even when the toast is suppressed. | `release_channel` (stable/alpha)<br/>`new_version` | (pending release) | (pending release): Moved fire site from `autoUpdater.ts` (main) to `updateListeners.ts` (renderer) so the count reflects real toast displays instead of every hourly re-check. Drops volume by ~14x. |
+| `update_toast_shown` | `updateListeners.ts` -> `AnalyticsHandlers.ts` | Update available toast actually displayed to user (after suppression checks pass). Fires at most once per distinct `newVersion` per app run -- not on every electron-updater 'update-available' callback, which re-fires hourly. | `release_channel` (stable/alpha)<br/>`new_version` | (pending release) | (pending release): Moved fire site from `autoUpdater.ts` (main) to `updateListeners.ts` (renderer); (pending release): Tightened dedup to once-per-version-per-run because the prior state-based guard still re-fired after the toast dismissed back to 'idle'. |
 | `update_toast_action` | `UpdateToast.tsx` | User clicks button on update toast | `action` (download_clicked/release_notes_clicked/remind_later_clicked)<br/>`new_version` | (pending release) |  |
 | `update_download_started` | `autoUpdater.ts` | User initiates update download | `release_channel` (stable/alpha)<br/>`new_version` | (pending release) |  |
 | `update_download_completed` | `autoUpdater.ts` | Update download finishes successfully | `release_channel` (stable/alpha)<br/>`new_version`<br/>`duration_category` (fast/medium/slow) | (pending release) |  |
 | `update_install_initiated` | `autoUpdater.ts` | User clicks relaunch to install update | `new_version` | (pending release) |  |
-| `update_error` | `autoUpdater.ts` | Error during update check, download, or install | `stage` (check/download/install)<br/>`error_type` (network/permission/disk_space/signature/unknown)<br/>`release_channel` (stable/alpha) | (pending release) |  |
+| `update_error` | `autoUpdater.ts` | Error during update check, download, or install. Background-check path is deduped to once per distinct (`stage`, `error_type`) per app run; the key resets on a successful `update-available` or `update-not-available` so a transient error that recurs after the network heals is still captured. The download-failure branch in the manual toast flow is not deduped. | `stage` (check/download/install)<br/>`error_type` (network/permission/disk_space/signature/unknown)<br/>`release_channel` (stable/alpha) | (pending release) | (pending release): Added (`stage`, `error_type`) dedup on the background path because hourly auto-checks were re-firing the same network/check error every poll. |
 
 ### Special System Events
 
@@ -357,6 +362,9 @@ The `known_error` event uses an `errorId` property to identify specific error co
 | `voice_mode_disabled` | `appSettings.ts:135` | User disables voice mode in settings | None | (pending release) |  |
 | `voice_session_started` | `VoiceModeService.ts:479` | User starts a voice session (clicks mic button) | None | (pending release) |  |
 | `voice_session_ended` | `VoiceModeService.ts:36` | Voice session ends | `reason` (user_stopped/timeout/error)<br/>`durationCategory` (short < 1min / medium 1-5min / long > 5min) | (pending release) |  |
+| `voice_prompt_submitted` | `RealtimeAPIClient.ts` | Voice agent calls submit_agent_prompt | None (no content for privacy) | (pending release) |  |
+| `voice_model_fallback` | `RealtimeAPIClient.ts` | gpt-realtime-2 unavailable; fell back to gpt-realtime | `from`, `to` | (pending release) |  |
+| `voice_voice_mismatch` | `RealtimeAPIClient.ts` | Server output voice diverged from requested voice (drift guardrail) | `requested`, `server`, `model` | (pending release) |  |
 
 ### Mobile App
 
@@ -367,8 +375,10 @@ The `known_error` event uses an `errorId` property to identify specific error co
 | `mobile_project_selected` | `ProjectListScreen.tsx:74` | User taps on a project | None (privacy - no project names) | (pending release) |  |
 | `mobile_ai_message_sent` | `SessionDetailScreen.tsx:648` | User sends a message to AI from mobile | `hasAttachments` (boolean) | (pending release) |  |
 | `mobile_pairing_completed` | `SettingsScreen.tsx:134` | QR code scan successful | None | (pending release) |  |
+| `mobile_login_started` | `LoginScreen.kt` | User initiates sign-in (Google or magic link) | `method` (google/magic_link) | (pending release) |  |
 | `mobile_login_completed` | `SettingsScreen.tsx:63` | User completes Stytch authentication | None | (pending release) |  |
 | `mobile_analytics_opt_out` | `AnalyticsService.ts:93` | User opts out of analytics | None | (pending release) |  |
+| `mobile_meta_agent_created` | `SessionListView.swift` | User creates a Meta Agent from the create menu (alpha-gated) | `model` (string) | (pending release) |  |
 
 ### Mobile App (Capacitor)
 

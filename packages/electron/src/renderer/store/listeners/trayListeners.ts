@@ -10,10 +10,13 @@
 import { atom } from 'jotai';
 import { store } from '../index';
 import {
+  sessionLastReadAtom,
   sessionRegistryAtom,
   sessionStoreAtom,
+  sessionUnreadAtom,
   setSelectedWorkstreamAtom,
 } from '../atoms/sessions';
+import { clearSessionUnreadAtom } from '../atoms/sessionActivity';
 import { workstreamStateAtom, setWorkstreamActiveChildAtom, setWorktreeActiveSessionAtom } from '../atoms/workstreamState';
 import { setWindowModeAtom } from '../atoms/windowMode';
 import { syncConfigAtom, type SyncConfig } from '../atoms/appSettings';
@@ -102,6 +105,23 @@ export function initTrayListeners(): () => void {
 
   cleanups.push(
     window.electronAPI.on('tray:navigate-to-session', handleNavigateToSession)
+  );
+
+  const handleClearUnread = (data: {
+    sessions: Array<{ sessionId: string; workspacePath: string; lastReadAt: number }>;
+  }) => {
+    for (const session of data.sessions) {
+      store.set(sessionUnreadAtom(session.sessionId), false);
+      store.set(sessionLastReadAtom(session.sessionId), session.lastReadAt);
+      store.set(clearSessionUnreadAtom, {
+        sessionId: session.sessionId,
+        workspacePath: session.workspacePath,
+      });
+    }
+  };
+
+  cleanups.push(
+    window.electronAPI.on('tray:clear-unread', handleClearUnread)
   );
 
   // Handle tray:new-session from main process

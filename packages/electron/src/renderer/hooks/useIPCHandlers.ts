@@ -12,6 +12,7 @@ import {
 import { editorRegistry } from '@nimbalyst/runtime/ai/EditorRegistry';
 import { SearchReplaceStateManager } from '@nimbalyst/runtime';
 import { store } from '@nimbalyst/runtime/store';
+import { DocumentModelRegistry } from '../services/document-model/DocumentModelRegistry';
 import { aiApi } from '../services/aiApi';
 import { getFileName } from '../utils/pathUtils';
 import { isCollabUri } from '../utils/collabUri';
@@ -97,6 +98,9 @@ interface UseIPCHandlersProps {
   getContentRef: React.MutableRefObject<(() => string) | null>;
   searchCommandRef: React.MutableRefObject<LexicalCommand<undefined> | null>;
   editorModeRef: React.RefObject<any>; // EditorModeRef from EditorMode component
+  collabModeRef: React.RefObject<{
+    getActiveDocumentPath?: () => string | null;
+  } | null>;
   currentFilePathRef: React.MutableRefObject<string | null>;
   currentFileNameRef: React.MutableRefObject<string | null>;
 
@@ -153,6 +157,7 @@ export function useIPCHandlers(props: UseIPCHandlersProps) {
     getContentRef,
     searchCommandRef,
     editorModeRef,
+    collabModeRef,
     currentFilePathRef,
     currentFileNameRef,
 
@@ -409,6 +414,14 @@ export function useIPCHandlers(props: UseIPCHandlersProps) {
     // Listen for show preferences event
     cleanupFns.push(window.electronAPI.onFileRenamed((data) => {
       // console.log('File renamed:', data);
+
+      // Migrate the DocumentModel to the new path BEFORE updating the tab.
+      // useDocumentModel() re-runs synchronously when TabEditor re-renders with
+      // the new filePath prop -- if the registry still has the old path at that
+      // point, it releases the old model (losing the dirty buffer) and creates a
+      // fresh one that loads from disk. By re-keying first, the hook finds the
+      // existing model and reuses it, preserving unsaved edits.
+      DocumentModelRegistry.rename(data.oldPath, data.newPath);
 
       // Update the tab for this file
       if (editorModeRef.current?.tabs) {
@@ -788,7 +801,8 @@ export function useIPCHandlers(props: UseIPCHandlersProps) {
           const normalizedUpdates: Record<string, unknown> = { ...updates };
           const mergedData = mergeFrontmatterData(existingData ?? {}, normalizedUpdates as Partial<FrontmatterData>);
 
-          const frontmatterMatch = currentContent.match(/^---\n([\s\S]*?)\n---\n?/);
+          // `\r?\n` tolerates Windows CRLF (nimbalyst#68).
+          const frontmatterMatch = currentContent.match(/^---\r?\n([\s\S]*?)\r?\n---\r?\n?/);
           const newFrontmatterBlockBase = serializeWithFrontmatter('', mergedData);
 
           let replacements: Array<{ oldText: string; newText: string }>;
@@ -1046,14 +1060,21 @@ export function useIPCHandlers(props: UseIPCHandlersProps) {
     if (menuFindVersion === menuFindInitialRef.current) return;
     const mode = propsRef.current.activeMode;
     if (mode === 'files') {
-      const activeFilePath = editorRegistry.getActiveFilePath();
+      const activeFilePath =
+        (window as unknown as { __currentDocumentPath?: string | null }).__currentDocumentPath ||
+        editorRegistry.getActiveFilePath();
       if (activeFilePath) {
         SearchReplaceStateManager.toggle(activeFilePath);
+      }
+    } else if (mode === 'collab') {
+      const activeDocumentPath = collabModeRef.current?.getActiveDocumentPath?.();
+      if (activeDocumentPath) {
+        SearchReplaceStateManager.toggle(activeDocumentPath);
       }
     } else if (mode === 'agent') {
       window.dispatchEvent(new CustomEvent('menu:find'));
     }
-  }, [menuFindVersion]);
+  }, [collabModeRef, menuFindVersion]);
 
   useEffect(() => {
     if (menuFindNextVersion === menuFindNextInitialRef.current) return;

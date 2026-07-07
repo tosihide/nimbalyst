@@ -10,11 +10,21 @@
  */
 
 import React, { useState, useEffect, useRef, useCallback, forwardRef } from 'react';
-import { useEditorLifecycle, type EditorHostProps } from '@nimbalyst/extension-sdk';
+import {
+  useEditorLifecycle,
+  useCollaborativeEditor,
+  type EditorHostProps,
+} from '@nimbalyst/extension-sdk';
 import { captureMockupComposite } from '../utils/screenshotUtils';
 import { renderMockupHtml } from '../utils/mockupDomUtils';
 import { MockupDiffViewer } from './MockupDiffViewer';
 import { injectTheme, type MockupTheme } from '../utils/themeEngine';
+import { MockupBinding } from '../collab/mockupBinding';
+import {
+  getYMockupText,
+  isMockupYDocEmpty,
+  seedMockupYDoc,
+} from '../collab/seed';
 
 // Import shared types for mockup annotations from runtime package
 import type { DrawingPath, MockupSelection } from '@nimbalyst/runtime';
@@ -25,6 +35,16 @@ import '@nimbalyst/runtime';
 
 export const MockupEditor = forwardRef<any, EditorHostProps>(function MockupEditor({ host }, ref) {
   const { filePath, fileName, isActive } = host;
+  // Reactive read-only state so the inline embed's View/Edit chrome toggle
+  // can flip us between the bare iframe viewer and the full editing UI
+  // without remounting (the iframe + drawing canvas keep their state).
+  const [isReadOnlyViewer, setIsReadOnlyViewer] = useState<boolean>(host.readOnly === true);
+  useEffect(() => {
+    setIsReadOnlyViewer(host.readOnly === true);
+    return host.onReadOnlyChanged?.((next) => {
+      setIsReadOnlyViewer(next);
+    });
+  }, [host]);
 
   // Refs for clearAllAnnotations (defined early so hook can reference)
   const iframeRef = useRef<HTMLIFrameElement>(null);
@@ -66,9 +86,23 @@ export const MockupEditor = forwardRef<any, EditorHostProps>(function MockupEdit
   // Track content version to trigger iframe re-render
   const [contentVersion, setContentVersion] = useState(0);
 
+  // Collab binding ref, populated by useCollaborativeEditor when collab is
+  // active. Held in a ref (not state) so applyContent's stable closure can
+  // schedule syncs without re-creating the lifecycle hook.
+  const collabBindingRef = useRef<MockupBinding | null>(null);
+
   // useEditorLifecycle handles: loading, saving, echo detection, file changes, theme, diff mode
   const { markDirty, isLoading, error, theme, diffState } = useEditorLifecycle<string>(host, {
     applyContent: (html: string) => {
+      // In collab mode the binding's createBinding is the single source of
+      // truth for initial content. host.loadContent() returns only the
+      // share-flow seed (or '' for a recipient), so applying it here would
+      // either be redundant (matches Y.Text) or actively wrong: a late
+      // resolution of loadContent() would arrive AFTER createBinding has
+      // already populated contentRef, and the resulting scheduleSync() would
+      // push the seed/empty string back into Y.Text and clobber whatever
+      // remote teammates have done in the meantime.
+      if (host.collaboration) return;
       contentRef.current = html;
       setContentVersion((v) => v + 1);
       clearAllAnnotations();
@@ -81,13 +115,70 @@ export const MockupEditor = forwardRef<any, EditorHostProps>(function MockupEdit
     },
   });
 
+  // ---- Collaborative wiring (no-op when host.collaboration is undefined) ----
+  // Single Y.Text carries the canonical HTML. Local edits arrive through
+  // applyContent (source-mode round-trips, AI tool writes) and the binding
+  // diffs against its last-synced baseline to emit minimal Y.Text ops.
+  // Remote edits come back via onRemoteContent, which sets contentRef +
+  // bumps the iframe render trigger.
+  useCollaborativeEditor(host, {
+    isEmpty: isMockupYDocEmpty,
+    initializeFromContent: seedMockupYDoc,
+    createBinding: ({ yDoc, awareness }) => {
+      const initial = getYMockupText(yDoc).toString();
+      // Editor may not have run applyContent yet if collab beat the load.
+      // Seed contentRef from Y.Text so getCurrentHtml has the right baseline.
+      if (!contentRef.current) {
+        contentRef.current = initial;
+        setContentVersion((v) => v + 1);
+      }
+      const binding = new MockupBinding(
+        yDoc,
+        initial,
+        {
+          getCurrentHtml: () => contentRef.current ?? '',
+          onRemoteContent: (content: string) => {
+            contentRef.current = content;
+            setContentVersion((v) => v + 1);
+            clearAllAnnotations();
+            collabBindingRef.current?.noteAppliedRemote(content);
+          },
+        },
+        awareness,
+      );
+      collabBindingRef.current = binding;
+      return {
+        destroy: () => {
+          // Flush any pending edit so a closing tab doesn't drop the last
+          // sync interval; the binding is about to be destroyed either way.
+          binding.syncNow();
+          binding.destroy();
+          collabBindingRef.current = null;
+        },
+      };
+    },
+  });
+
+  // Publish selection to awareness so remote clients can render "X is
+  // looking at this element" indicators.
+  useEffect(() => {
+    collabBindingRef.current?.setLocalAwareness({
+      selection: selectedElement
+        ? {
+            selector: selectedElement.selector,
+            tagName: selectedElement.tagName,
+          }
+        : null,
+    });
+  }, [selectedElement]);
+
   // Check if this mockup was opened from a project (for back-link)
   const projectOrigin = (window.__mockupProjectOrigin || {})[filePath] as string | undefined;
 
   // Additional UI state
   const [isCapturing, setIsCapturing] = useState(false);
   const [isDrawingMode, setIsDrawingMode] = useState(false);
-  const [isInteractive, setIsInteractive] = useState(false);
+  const [isInteractive, setIsInteractive] = useState(isReadOnlyViewer);
   const [mockupTheme, setMockupTheme] = useState<MockupTheme>('dark');
   const [drawingColor, setDrawingColor] = useState('#FF0000');
   const [scrollOffset, setScrollOffset] = useState({ x: 0, y: 0 });
@@ -172,6 +263,24 @@ export const MockupEditor = forwardRef<any, EditorHostProps>(function MockupEdit
       });
     }
   }, []);
+
+  useEffect(() => {
+    if (!isReadOnlyViewer) {
+      return;
+    }
+
+    setIsInteractive(true);
+    setIsDrawingMode(false);
+    handleDeselectElement();
+  }, [isReadOnlyViewer, handleDeselectElement]);
+
+  useEffect(() => {
+    if (!isReadOnlyViewer) {
+      return;
+    }
+
+    setMockupTheme(theme === 'light' ? 'light' : 'dark');
+  }, [isReadOnlyViewer, theme]);
 
   // Update iframe when content changes or when exiting diff mode
   useEffect(() => {
@@ -477,6 +586,11 @@ export const MockupEditor = forwardRef<any, EditorHostProps>(function MockupEdit
 
   // Handle MCP screenshot requests
   useEffect(() => {
+    const electronAPI = window.electronAPI;
+    if (!electronAPI?.on || !electronAPI?.invoke) {
+      return;
+    }
+
     const handleCaptureRequest = async (data: { requestId: string; filePath: string }) => {
       if (data.filePath !== filePath) return;
 
@@ -490,7 +604,7 @@ export const MockupEditor = forwardRef<any, EditorHostProps>(function MockupEdit
         const paths = drawingPathsRef.current.length > 0 ? drawingPathsRef.current : undefined;
         const base64Data = await captureMockupComposite(iframeRef.current, null, paths);
 
-        await window.electronAPI.invoke('mockup:screenshot-result', {
+        await electronAPI.invoke('mockup:screenshot-result', {
           requestId: data.requestId,
           success: true,
           imageBase64: base64Data,
@@ -498,7 +612,7 @@ export const MockupEditor = forwardRef<any, EditorHostProps>(function MockupEdit
         });
       } catch (err) {
         const errorMessage = err instanceof Error ? err.message : String(err);
-        await window.electronAPI.invoke('mockup:screenshot-result', {
+        await electronAPI.invoke('mockup:screenshot-result', {
           requestId: data.requestId,
           success: false,
           error: errorMessage,
@@ -506,7 +620,7 @@ export const MockupEditor = forwardRef<any, EditorHostProps>(function MockupEdit
       }
     };
 
-    const cleanup = window.electronAPI.on('mockup:capture-screenshot', handleCaptureRequest);
+    const cleanup = electronAPI.on('mockup:capture-screenshot', handleCaptureRequest);
     return cleanup;
   }, [filePath]);
 
@@ -636,6 +750,19 @@ export const MockupEditor = forwardRef<any, EditorHostProps>(function MockupEdit
     );
   }
 
+  if (isReadOnlyViewer) {
+    return (
+      <div className="h-full overflow-hidden bg-white relative">
+        <iframe
+          ref={iframeRef}
+          className="w-full h-full border-none absolute top-0 left-0"
+          sandbox="allow-scripts allow-same-origin"
+          title={`Mockup: ${fileName}`}
+        />
+      </div>
+    );
+  }
+
   // Render preview mode
   return (
     <div className="flex flex-col h-full bg-nim relative">
@@ -676,7 +803,7 @@ export const MockupEditor = forwardRef<any, EditorHostProps>(function MockupEdit
             }}
             className={`px-3 py-1 text-xs border rounded cursor-pointer ${
               isInteractive
-                ? 'bg-nim-primary text-white border-nim-primary font-bold'
+                ? 'bg-nim-primary text-nim-on-primary border-nim-primary font-bold'
                 : 'bg-nim border-nim text-nim font-normal'
             }`}
             title={isInteractive ? 'Switch to Select mode (click to select elements)' : 'Switch to Interactive mode (click to interact with mockup)'}
@@ -726,7 +853,7 @@ export const MockupEditor = forwardRef<any, EditorHostProps>(function MockupEdit
             onClick={handleToggleDrawing}
             className={`px-3 py-1 text-xs border border-nim rounded cursor-pointer ${
               isDrawingMode
-                ? 'bg-nim-primary text-white font-bold'
+                ? 'bg-nim-primary text-nim-on-primary font-bold'
                 : 'bg-nim text-nim font-normal'
             }`}
             title={isDrawingMode ? 'Exit drawing mode' : 'Draw annotations for AI'}

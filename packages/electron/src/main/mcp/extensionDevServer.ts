@@ -31,46 +31,56 @@ import { ExtensionLogService } from "../services/ExtensionLogService";
 import { database } from "../database/initialize";
 import { findWindowByWorkspace } from "../window/WindowManager";
 import { getRestartSignalPath, getPackageRoot } from "../utils/appPaths";
+import { requireMcpAuth } from "./mcpAuth";
+import { selectFocusedRestartSessions } from "./restartContinuationSelection";
+import { tailFile, grepTailFile } from "./logTail";
 
 // ============================================================================
-// File Utilities
+// Restart continuation
 // ============================================================================
 
 /**
- * Efficiently read the last N lines from a file.
- * Reads from the end of the file in chunks to avoid loading entire file into memory.
+ * Of the running/streaming agent sessions, return only the one the FOCUSED
+ * window is viewing, so /restart resumes just that session (NIM-813). Reuses the
+ * renderer's existing `notifications:check-active-session` answerer (it replies
+ * from `activeSessionIdAtom`), so no new renderer plumbing. A window views one
+ * agent session, so the result is 0 or 1 id; returns `[]` when no window is
+ * focused or none of the running sessions is the focused one.
  */
-function tailFile(filePath: string, maxLines: number): string[] {
-  const stats = fs.statSync(filePath);
-  const fileSize = stats.size;
+async function selectFocusedRestartContinuationSessions(
+  runningSessionIds: string[]
+): Promise<string[]> {
+  if (runningSessionIds.length === 0) return [];
 
-  if (fileSize === 0) {
-    return [];
-  }
+  const { BrowserWindow, ipcMain } = require("electron");
+  const focused = BrowserWindow.getFocusedWindow();
+  if (!focused || focused.isDestroyed()) return [];
 
-  // For small files, just read the whole thing
-  if (fileSize < 1024 * 1024) {
-    // 1MB
-    const content = fs.readFileSync(filePath, "utf-8");
-    const lines = content.split("\n").filter((line) => line.length > 0);
-    return lines.slice(-maxLines);
-  }
+  const viewingBySession: Record<string, boolean> = {};
+  await Promise.all(
+    runningSessionIds.map(
+      (sessionId) =>
+        new Promise<void>((resolve) => {
+          const requestId = `restart-continuation-${Date.now()}-${Math.random()}`;
+          const channel = `notifications:session-check-response:${requestId}`;
+          const timeout = setTimeout(() => {
+            ipcMain.removeAllListeners(channel);
+            resolve();
+          }, 500);
+          ipcMain.once(channel, (_event: unknown, isViewing: boolean) => {
+            clearTimeout(timeout);
+            viewingBySession[sessionId] = isViewing === true;
+            resolve();
+          });
+          focused.webContents.send("notifications:check-active-session", {
+            requestId,
+            sessionId,
+          });
+        })
+    )
+  );
 
-  // For larger files, read from the end in chunks
-  const chunkSize = Math.min(1024 * 1024, fileSize); // 1MB or file size
-  const fd = fs.openSync(filePath, "r");
-  const buffer = Buffer.alloc(chunkSize);
-
-  try {
-    const position = Math.max(0, fileSize - chunkSize);
-    fs.readSync(fd, buffer, 0, chunkSize, position);
-
-    const content = buffer.toString("utf-8");
-    const lines = content.split("\n").filter((line) => line.length > 0);
-    return lines.slice(-maxLines);
-  } finally {
-    fs.closeSync(fd);
-  }
+  return selectFocusedRestartSessions(runningSessionIds, viewingBySession);
 }
 
 // ============================================================================
@@ -317,7 +327,21 @@ function validateManifest(manifestPath: string): {
               severity: "error",
             });
           }
-          if (typeof item.defaultContent !== "string") {
+          if (item.action === "openVirtualTab") {
+            // Action items open a fileless virtual tab instead of writing a
+            // file, so they need a virtualScheme rather than defaultContent.
+            if (
+              typeof item.virtualScheme !== "string" ||
+              !item.virtualScheme.startsWith("virtual://")
+            ) {
+              warnings.push({
+                field: `contributions.newFileMenu[${idx}].virtualScheme`,
+                message:
+                  'newFileMenu item with action "openVirtualTab" must have a "virtualScheme" starting with "virtual://"',
+                severity: "error",
+              });
+            }
+          } else if (typeof item.defaultContent !== "string") {
             warnings.push({
               field: `contributions.newFileMenu[${idx}].defaultContent`,
               message: 'newFileMenu item must have a "defaultContent" string',
@@ -398,6 +422,33 @@ function validateManifest(manifestPath: string): {
               });
             }
           });
+        }
+      }
+
+      // Validate agentWorkflows
+      if (manifest.contributions.agentWorkflows !== undefined) {
+        const agentWorkflows = manifest.contributions.agentWorkflows as any;
+        if (!agentWorkflows || typeof agentWorkflows !== 'object') {
+          warnings.push({
+            field: 'contributions.agentWorkflows',
+            message: 'agentWorkflows must be an object',
+            severity: 'error',
+          });
+        } else {
+          if (!agentWorkflows.path) {
+            warnings.push({
+              field: 'contributions.agentWorkflows.path',
+              message: 'agentWorkflows must have a "path" field',
+              severity: 'error',
+            });
+          }
+          if (!agentWorkflows.displayName) {
+            warnings.push({
+              field: 'contributions.agentWorkflows.displayName',
+              message: 'agentWorkflows must have a "displayName" field',
+              severity: 'error',
+            });
+          }
         }
       }
     }
@@ -1027,7 +1078,7 @@ function createExtensionDevMcpServer(
               searchTerm: {
                 type: "string",
                 description:
-                  "Search for specific text in logs (case-insensitive)",
+                  "Search for specific text in logs (case-insensitive substring). When set, the ENTIRE log file is scanned (grep-parity), and lastLines becomes the max number of matches returned (most recent).",
               },
             },
           },
@@ -1061,7 +1112,7 @@ function createExtensionDevMcpServer(
               searchTerm: {
                 type: "string",
                 description:
-                  "Search for specific text in logs (case-insensitive)",
+                  "Search for specific text in logs (case-insensitive substring). When set, the ENTIRE session log file is scanned (grep-parity), and lastLines becomes the max number of matches returned (most recent).",
               },
             },
           },
@@ -1567,25 +1618,28 @@ function createExtensionDevMcpServer(
             "@nimbalyst/runtime/ai/server/SessionStateManager"
           );
           const stateManager = getSessionStateManager();
-          const activeSessionIds = stateManager.getActiveSessionIds();
+          // Only sessions whose turn is actually in progress need to be resumed
+          // after restart (NIM-846: getTrackedSessionIds would also return idle
+          // claude-code-cli sessions retained in the map between turns).
+          const agentSessionIds = stateManager.getRunningSessionIds();
 
-          // Filter to only agent sessions that are running or streaming
-          const agentSessionIds: string[] = [];
-          for (const sessionId of activeSessionIds) {
-            const state = stateManager.getSessionState(sessionId);
-            if (state && (state.status === "running" || state.isStreaming)) {
-              agentSessionIds.push(sessionId);
-            }
-          }
+          // Resume only the session the FOCUSED window is viewing, not every
+          // running session across every window. Auto-resuming all of them
+          // re-creates the launch stampede that rate-limits the subscription
+          // (NIM-813); the user only expects the window they were working in to
+          // pick back up. Background sessions stay paused until interacted with.
+          const focusedSessionIds = await selectFocusedRestartContinuationSessions(
+            agentSessionIds
+          );
 
-          if (agentSessionIds.length > 0) {
+          if (focusedSessionIds.length > 0) {
             const userData = app.getPath("userData");
             const restartContinuationPath = path.join(
               userData,
               "restart-continuation.json"
             );
             const continuationData = {
-              sessionIds: agentSessionIds,
+              sessionIds: focusedSessionIds,
               timestamp: Date.now(),
             };
             fs.writeFileSync(
@@ -1594,8 +1648,12 @@ function createExtensionDevMcpServer(
               "utf8"
             );
             console.log(
-              `[Extension Dev MCP] Saved restart continuation for ${agentSessionIds.length} active session(s):`,
-              agentSessionIds
+              `[Extension Dev MCP] Saved restart continuation for focused session(s):`,
+              focusedSessionIds
+            );
+          } else {
+            console.log(
+              `[Extension Dev MCP] No focused running session to continue (had ${agentSessionIds.length} running)`
             );
           }
         } catch (error) {
@@ -1804,7 +1862,12 @@ function createExtensionDevMcpServer(
         );
 
         try {
-          const result = await database.query(sql);
+          // Route through the read-only path so the database enforces
+          // SELECT-only at the engine level (PGLite SET TRANSACTION READ ONLY
+          // + statement_timeout; SQLite PRAGMA query_only = ON + interrupt).
+          // The prefix check above is defense in depth — the engine is the
+          // real authority.
+          const result = await database.queryReadOnly(sql, [], 30_000);
 
           // Format results for display
           const rowCount = result.rows.length;
@@ -1904,44 +1967,40 @@ function createExtensionDevMcpServer(
         }
 
         try {
-          // Read and tail the file efficiently
-          const lines = tailFile(mainLogPath, lastLines * 2); // Read extra for filtering
+          const levelPatterns: Record<string, string[]> = {
+            error: ["[error]"],
+            warn: ["[error]", "[warn]"],
+            info: ["[error]", "[warn]", "[info]"],
+            debug: ["[error]", "[warn]", "[info]", "[debug]"],
+          };
+          const componentPattern = component
+            ? `[${component.toUpperCase()}]`
+            : undefined;
+          const levelMatch = logLevel ? levelPatterns[logLevel] || [] : undefined;
+          const lowerSearch = searchTerm ? searchTerm.toLowerCase() : undefined;
 
-          // Filter lines
-          let filteredLines = lines;
+          const matchesFilters = (line: string): boolean => {
+            if (componentPattern && !line.includes(componentPattern)) {
+              return false;
+            }
+            if (levelMatch) {
+              const lower = line.toLowerCase();
+              if (!levelMatch.some((p) => lower.includes(p))) {
+                return false;
+              }
+            }
+            if (lowerSearch && !line.toLowerCase().includes(lowerSearch)) {
+              return false;
+            }
+            return true;
+          };
 
-          // Filter by component (e.g., [FILE_WATCHER])
-          if (component) {
-            const componentPattern = `[${component.toUpperCase()}]`;
-            filteredLines = filteredLines.filter((line) =>
-              line.includes(componentPattern)
-            );
-          }
-
-          // Filter by log level
-          if (logLevel) {
-            const levelPatterns: Record<string, string[]> = {
-              error: ["[error]"],
-              warn: ["[error]", "[warn]"],
-              info: ["[error]", "[warn]", "[info]"],
-              debug: ["[error]", "[warn]", "[info]", "[debug]"],
-            };
-            const patterns = levelPatterns[logLevel] || [];
-            filteredLines = filteredLines.filter((line) =>
-              patterns.some((p) => line.toLowerCase().includes(p))
-            );
-          }
-
-          // Filter by search term
-          if (searchTerm) {
-            const lowerSearch = searchTerm.toLowerCase();
-            filteredLines = filteredLines.filter((line) =>
-              line.toLowerCase().includes(lowerSearch)
-            );
-          }
-
-          // Take last N lines after filtering
-          filteredLines = filteredLines.slice(-lastLines);
+          // When a filter/search is active, scan the WHOLE file for the last
+          // N matches (grep-parity); otherwise just tail the recent lines.
+          const hasFilter = !!(componentPattern || levelMatch || lowerSearch);
+          const filteredLines = hasFilter
+            ? grepTailFile(mainLogPath, matchesFilters, lastLines)
+            : tailFile(mainLogPath, lastLines);
 
           // Build header
           const filterDesc = [
@@ -2042,44 +2101,36 @@ function createExtensionDevMcpServer(
         }
 
         try {
-          // Read and tail the file efficiently
-          const lines = tailFile(logPath, lastLines * 2); // Read extra for filtering
+          const levelPatterns: Record<string, string[]> = {
+            error: ["[ERROR]"],
+            warn: ["[ERROR]", "[WARN]"],
+            info: ["[ERROR]", "[WARN]", "[INFO]"],
+            debug: ["[ERROR]", "[WARN]", "[INFO]", "[DEBUG]"],
+          };
+          const windowPattern =
+            windowId !== undefined ? `[Window ${windowId}]` : undefined;
+          const levelMatch = logLevel ? levelPatterns[logLevel] || [] : undefined;
+          const lowerSearch = searchTerm ? searchTerm.toLowerCase() : undefined;
 
-          // Filter lines
-          let filteredLines = lines;
+          const matchesFilters = (line: string): boolean => {
+            if (windowPattern && !line.includes(windowPattern)) {
+              return false;
+            }
+            if (levelMatch && !levelMatch.some((p) => line.includes(p))) {
+              return false;
+            }
+            if (lowerSearch && !line.toLowerCase().includes(lowerSearch)) {
+              return false;
+            }
+            return true;
+          };
 
-          // Filter by window ID (format: [Window N])
-          if (windowId !== undefined) {
-            const windowPattern = `[Window ${windowId}]`;
-            filteredLines = filteredLines.filter((line) =>
-              line.includes(windowPattern)
-            );
-          }
-
-          // Filter by log level
-          if (logLevel) {
-            const levelPatterns: Record<string, string[]> = {
-              error: ["[ERROR]"],
-              warn: ["[ERROR]", "[WARN]"],
-              info: ["[ERROR]", "[WARN]", "[INFO]"],
-              debug: ["[ERROR]", "[WARN]", "[INFO]", "[DEBUG]"],
-            };
-            const patterns = levelPatterns[logLevel] || [];
-            filteredLines = filteredLines.filter((line) =>
-              patterns.some((p) => line.includes(p))
-            );
-          }
-
-          // Filter by search term
-          if (searchTerm) {
-            const lowerSearch = searchTerm.toLowerCase();
-            filteredLines = filteredLines.filter((line) =>
-              line.toLowerCase().includes(lowerSearch)
-            );
-          }
-
-          // Take last N lines after filtering
-          filteredLines = filteredLines.slice(-lastLines);
+          // When a filter/search is active, scan the WHOLE file for the last
+          // N matches (grep-parity); otherwise just tail the recent lines.
+          const hasFilter = !!(windowPattern || levelMatch || lowerSearch);
+          const filteredLines = hasFilter
+            ? grepTailFile(logPath, matchesFilters, lastLines)
+            : tailFile(logPath, lastLines);
 
           // Build header
           const sessionDesc =
@@ -2754,22 +2805,32 @@ async function tryCreateExtensionDevServer(port: number): Promise<any> {
         const pathname = parsedUrl.pathname;
         const mcpSessionIdHeader = getMcpSessionIdHeader(req);
 
-        // Handle CORS preflight
+        // Handle CORS preflight.
+        // Issue #146: drop `Access-Control-Allow-Origin: *`; bearer token is
+        // the sole gate. SDK subprocesses don't care about CORS.
         if (req.method === "OPTIONS") {
           res.writeHead(200, {
-            "Access-Control-Allow-Origin": "*",
             "Access-Control-Allow-Methods": "GET, POST, DELETE, OPTIONS",
             "Access-Control-Allow-Headers":
-              "Content-Type, mcp-session-id, mcp-protocol-version",
+              "Authorization, Content-Type, mcp-session-id, mcp-protocol-version",
           });
           res.end();
           return;
         }
 
-        // Health check endpoint
+        // Health check endpoint (intentionally unauthenticated -- only returns
+        // a static {status:"ok"} payload, no side effects).
         if (pathname === "/health" && req.method === "GET") {
           res.writeHead(200, { "Content-Type": "application/json" });
           res.end(JSON.stringify({ status: "ok" }));
+          return;
+        }
+
+        // Issue #146: every non-OPTIONS request to /mcp must carry the
+        // per-launch bearer token.
+        if (pathname === "/mcp" && !requireMcpAuth(req)) {
+          res.writeHead(401);
+          res.end("Unauthorized");
           return;
         }
 

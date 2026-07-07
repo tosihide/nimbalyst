@@ -27,61 +27,75 @@ import {
   removeTrackerItemAtom,
   trackerDataLoadedAtom,
 } from '@nimbalyst/runtime';
-import type { TrackerItem, TrackerItemChangeEvent, TrackerItemType } from '@nimbalyst/runtime';
-import {
-  globalRegistry,
-  convertFullDocumentToTrackerItems,
-} from '@nimbalyst/runtime/plugins/TrackerPlugin';
+import type { TrackerItem, TrackerItemChangeEvent } from '@nimbalyst/runtime';
 import { trackerItemToRecord, type TrackerRecord } from '@nimbalyst/runtime/core/TrackerRecord';
+import { globalRegistry, isRelationshipField } from '@nimbalyst/runtime/plugins/TrackerPlugin/models';
+import { trackerSyncConfigChangeAtom, trackerSyncRejectionAtom, type TrackerSyncRejectionCode } from '../atoms/trackerSync';
+import { activeWorkspacePathAtom } from '../atoms/openProjects';
 
-/**
- * Load full-document tracker items from frontmatter metadata.
- * These are items like plans, decisions, blog posts where the entire
- * document IS the tracker item (identified by frontmatter, not inline syntax).
- */
-async function loadFrontmatterTrackerItems(): Promise<TrackerRecord[]> {
-  try {
-    const metadata = await window.electronAPI.invoke('document-service:metadata-list');
-    if (!metadata?.length) return [];
+/** Auto-clear delay for transient rotation locks. Matches the typical
+ *  team rotation window -- by 30s the org-wide write freeze should have
+ *  lifted, so the user can stop seeing the banner without manual action. */
+const ROTATION_LOCKED_TTL_MS = 30_000;
 
-    const trackerTypes = globalRegistry.getAll();
-    const fullDocumentTrackers = trackerTypes.filter(t => t.modes.fullDocument);
+/** Trailing debounce for the relationship-field reconcile (NIM-1305). A bulk
+ *  relationship import emits a burst of granular `tracker-items-changed`
+ *  events; collapsing them into one authoritative reload after the burst
+ *  settles avoids reloading per item. */
+const RELATIONSHIP_RECONCILE_DEBOUNCE_MS = 300;
 
-    let records: TrackerRecord[] = [];
-    for (const tracker of fullDocumentTrackers) {
-      const converted = convertFullDocumentToTrackerItems(metadata, tracker.type as TrackerItemType);
-      records = [...records, ...converted];
-    }
-
-    // Ensure each frontmatter record has a stable ID (keyed by doc path + type)
-    return records.map(record => ({
-      ...record,
-      id: record.id || `fm:${record.primaryType}:${record.system.documentPath}`,
-    }));
-  } catch (err) {
-    console.error('[trackerSyncListeners] Failed to load frontmatter items:', err);
-    return [];
-  }
+/** A relationship value serializes as a non-empty array of objects each bearing
+ *  an `itemId` (or a single such object). Used as a fallback shape check when the
+ *  item's tracker type is not yet registered in the renderer's `globalRegistry`. */
+function looksLikeRelationshipValue(value: unknown): boolean {
+  const hasItemId = (v: unknown): boolean =>
+    typeof v === 'object' && v !== null && 'itemId' in (v as Record<string, unknown>);
+  if (Array.isArray(value)) return value.length > 0 && value.every(hasItemId);
+  return hasItemId(value);
 }
 
 /**
- * Fetch all tracker items from PGLite via IPC and frontmatter metadata,
- * then merge and load into atoms.
+ * Whether an incoming tracker item belongs to a type that declares relationship
+ * fields and carries a value for one of them. Granular `tracker-items-changed`
+ * events don't say which field changed and the last-write-wins upsert can be
+ * clobbered by an out-of-order/partial event during a burst, so any
+ * relationship-bearing change triggers a debounced full reconcile from the
+ * authoritative read model (NIM-1305).
+ */
+function itemCarriesRelationshipField(item: TrackerItem): boolean {
+  const fields = globalRegistry.get(item.type)?.fields;
+  if (!fields) {
+    // Custom/workspace tracker types register asynchronously (loadCustomTrackers),
+    // so a relationship change can arrive before the schema is known. Without this
+    // fallback the reconcile would silently no-op for custom types and leave the
+    // panel stale — the exact NIM-1305 symptom. Detect by value shape instead.
+    const custom = item.customFields;
+    if (custom) {
+      for (const value of Object.values(custom)) {
+        if (looksLikeRelationshipValue(value)) return true;
+      }
+    }
+    return false;
+  }
+  for (const def of fields) {
+    if (!isRelationshipField(def)) continue;
+    const name = def.name;
+    const onItem = (item as unknown as Record<string, unknown>)[name];
+    const onCustom = item.customFields?.[name];
+    if (onItem !== undefined || onCustom !== undefined) return true;
+  }
+  return false;
+}
+
+/**
+ * Fetch all tracker items from the main-process tracker read model and load
+ * them into atoms.
  */
 async function loadAllTrackerItems(): Promise<void> {
   try {
-    const [pgliteItems, frontmatterRecords] = await Promise.all([
-      window.electronAPI.invoke('document-service:tracker-items-list') as Promise<TrackerItem[]>,
-      loadFrontmatterTrackerItems(),
-    ]);
-
-    // Convert PGLite items (legacy TrackerItem shape) to TrackerRecord
-    const pgliteRecords = (pgliteItems || []).map(trackerItemToRecord);
-    // Merge: frontmatter records first, then PGLite records overwrite by ID.
-    // replaceAllTrackerItemsAtom uses Map.set() so last-write-wins -- PGLite
-    // records are richer (have sync status, issue keys, etc.) and take priority.
-    const allRecords = [...frontmatterRecords, ...pgliteRecords];
-    store.set(replaceAllTrackerItemsAtom, allRecords);
+    const items = await window.electronAPI.invoke('document-service:tracker-items-list') as TrackerItem[];
+    const records = (items || []).map(trackerItemToRecord);
+    store.set(replaceAllTrackerItemsAtom, records);
   } catch (err) {
     console.error('[trackerSyncListeners] Failed to load tracker items:', err);
     // Mark as loaded even on error so UI doesn't stay in loading state
@@ -114,6 +128,88 @@ export function initTrackerSyncListeners(): () => void {
   const cleanups: Array<() => void> = [];
   let disposed = false;
   let initialScanTimer: ReturnType<typeof setTimeout> | null = null;
+  let rotationLockedClearTimer: ReturnType<typeof setTimeout> | null = null;
+  let relationshipReconcileTimer: ReturnType<typeof setTimeout> | null = null;
+
+  // Debounced safety net: after a relationship-bearing change event, reload the
+  // full tracker read model so a partial/out-of-order granular upsert can't
+  // leave relationship fields stale in the panel (NIM-1305).
+  const scheduleRelationshipReconcile = () => {
+    if (disposed) return;
+    if (relationshipReconcileTimer) clearTimeout(relationshipReconcileTimer);
+    relationshipReconcileTimer = setTimeout(() => {
+      relationshipReconcileTimer = null;
+      if (disposed) return;
+      void loadAllTrackerItems();
+    }, RELATIONSHIP_RECONCILE_DEBOUNCE_MS);
+  };
+
+  // `tracker-sync:mutation-rejected` is broadcast when the server rejects
+  // a write. `staleKeyEpoch + refreshKey succeeds` is silently retried by
+  // the engine; the only events that reach the renderer are the unrecovered
+  // ones the user needs to see. `forbidden` and `malformed` are bugs
+  // (not user-facing) and stay off the banner -- log them and let the
+  // optimistic-rollback surface the failure indirectly.
+  cleanups.push(
+    window.electronAPI.on(
+      'tracker-sync:mutation-rejected',
+      (data: {
+        workspacePath: string;
+        itemId: string;
+        clientMutationId?: string;
+        code: TrackerSyncRejectionCode | 'forbidden' | 'malformed';
+        message?: string;
+      }) => {
+        if (!data) return;
+        if (data.code !== 'staleKeyEpoch' && data.code !== 'rotationLocked') {
+          console.error('[trackerSyncListeners] tracker-sync rejection (non-banner)', data);
+          return;
+        }
+        const rejection = {
+          workspacePath: data.workspacePath,
+          code: data.code,
+          itemId: data.itemId,
+          message: data.message,
+          timestamp: Date.now(),
+        };
+        store.set(trackerSyncRejectionAtom, (prev) => ({
+          ...prev,
+          [data.code as TrackerSyncRejectionCode]: rejection,
+        }));
+        if (data.code === 'rotationLocked') {
+          // Each fresh rotationLocked event resets the TTL -- writes
+          // during an extended freeze should not surprise the user with
+          // an empty banner mid-rotation.
+          if (rotationLockedClearTimer) clearTimeout(rotationLockedClearTimer);
+          rotationLockedClearTimer = setTimeout(() => {
+            rotationLockedClearTimer = null;
+            store.set(trackerSyncRejectionAtom, (prev) => ({ ...prev, rotationLocked: null }));
+          }, ROTATION_LOCKED_TTL_MS);
+        }
+      },
+    ),
+  );
+
+  // `tracker-sync:config-changed` is broadcast by the main process whenever a
+  // tracker-sync subscription updates its config (e.g. issueKeyPrefix) -- can
+  // happen on any workspace. Bumped into a request atom so the Settings >
+  // Tracker Config panel can mirror the change without subscribing to IPC
+  // itself. Registered outside the workspace-mode block below because this
+  // event is workspace-tagged in the payload.
+  let configChangeVersion = 0;
+  cleanups.push(
+    window.electronAPI.on(
+      'tracker-sync:config-changed',
+      (data: { workspacePath: string; config: { issueKeyPrefix: string } }) => {
+        if (!data?.workspacePath || !data.config) return;
+        configChangeVersion += 1;
+        store.set(trackerSyncConfigChangeAtom, {
+          version: configChangeVersion,
+          payload: data,
+        });
+      },
+    ),
+  );
 
   // console.log('[trackerSyncListeners] Initializing tracker data listeners');
 
@@ -136,7 +232,8 @@ export function initTrackerSyncListeners(): () => void {
 
       currentWorkspacePath = state.workspacePath;
 
-      // Initial load from PGLite + frontmatter (shows cached data from previous session)
+      // Initial load from the shared tracker read model (DB projection +
+      // frontmatter-backed full-document items).
       await loadAllTrackerItems();
       if (disposed) return;
 
@@ -173,16 +270,19 @@ export function initTrackerSyncListeners(): () => void {
             };
 
             // Apply granular updates to the atom map (convert to TrackerRecord)
+            let sawRelationshipChange = false;
             if (change.added?.length) {
               for (const item of change.added) {
                 if (!belongsToThisWorkspace(item)) continue;
                 store.set(upsertTrackerItemAtom, trackerItemToRecord(item));
+                if (itemCarriesRelationshipField(item)) sawRelationshipChange = true;
               }
             }
             if (change.updated?.length) {
               for (const item of change.updated) {
                 if (!belongsToThisWorkspace(item)) continue;
                 store.set(upsertTrackerItemAtom, trackerItemToRecord(item));
+                if (itemCarriesRelationshipField(item)) sawRelationshipChange = true;
               }
             }
             if (change.removed?.length) {
@@ -190,20 +290,38 @@ export function initTrackerSyncListeners(): () => void {
                 store.set(removeTrackerItemAtom, id);
               }
             }
+
+            // Relationship-bearing changes can land via inverse propagation as a
+            // burst of out-of-order partial events; reconcile from the read model
+            // so the detail panel never sticks on stale `No links` (NIM-1305).
+            if (sawRelationshipChange) scheduleRelationshipReconcile();
           }
         )
       );
 
-      // Also subscribe to metadata changes (for full-document trackers like plans/decisions)
+      // Metadata changes can add/remove/update full-document tracker items, so
+      // re-fetch the merged read model whenever frontmatter changes.
       window.electronAPI.send('document-service:metadata-watch');
 
       cleanups.push(
         window.electronAPI.on('document-service:metadata-changed', () => {
-          // Full-document tracker items come from frontmatter metadata.
-          // Re-fetch all items (PGLite + frontmatter) when metadata changes.
           void loadAllTrackerItems();
         })
       );
+
+      // Refetch when the user switches projects in the multi-project rail.
+      // Without this, `currentWorkspacePath` stays pinned to the startup
+      // workspace and the panel keeps showing the wrong project's items
+      // (see GitHub #441). The IPC handlers resolve to the window's active
+      // workspace, so a plain refetch after updating the filter is enough.
+      const unsubscribeActivePath = store.sub(activeWorkspacePathAtom, () => {
+        if (disposed) return;
+        const nextPath = store.get(activeWorkspacePathAtom);
+        if (!nextPath || nextPath === currentWorkspacePath) return;
+        currentWorkspacePath = nextPath;
+        void loadAllTrackerItems();
+      });
+      cleanups.push(unsubscribeActivePath);
     })
     .catch(() => {
       currentWorkspacePath = null;
@@ -213,6 +331,12 @@ export function initTrackerSyncListeners(): () => void {
     disposed = true;
     if (initialScanTimer) {
       clearTimeout(initialScanTimer);
+    }
+    if (rotationLockedClearTimer) {
+      clearTimeout(rotationLockedClearTimer);
+    }
+    if (relationshipReconcileTimer) {
+      clearTimeout(relationshipReconcileTimer);
     }
     cleanups.forEach((cleanup) => cleanup());
   };

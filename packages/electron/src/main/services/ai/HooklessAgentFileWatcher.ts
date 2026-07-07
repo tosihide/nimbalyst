@@ -18,6 +18,13 @@
  *     stop and tears down the watcher + cache)
  *   - `getEntry` — read access for code that needs the cache (e.g.
  *     `advanceDiffBaseline`, `trackBashEditsFromCommand`)
+ *   - `captureBashPreEditSnapshots` — call at `item.started` for a Bash
+ *     command to seed the FileSnapshotCache with current disk content for
+ *     each file referenced in the command. This guarantees that
+ *     `trackBashEditsFromCommand` (run later at `item.completed`) compares
+ *     against a true pre-command baseline, so read-only commands like
+ *     `sed -n` no longer false-attribute when the working tree differs from
+ *     `HEAD`/`startSha`.
  *   - `trackBashEditsFromCommand` — when an agent runs a Bash command,
  *     attempt to discover edited files in the command and create pre-edit
  *     tags + session file links the same way the watcher would
@@ -25,8 +32,6 @@
  *     shutdown)
  */
 
-import { execFile } from 'child_process';
-import { promisify } from 'util';
 import * as fs from 'fs';
 import * as path from 'path';
 import { type SessionData } from '@nimbalyst/runtime/ai/server/types';
@@ -37,15 +42,15 @@ import { FileSnapshotCache } from '../../file/FileSnapshotCache';
 import { SessionFileWatcher } from '../../file/SessionFileWatcher';
 import { addGitignoreBypass } from '../../file/WorkspaceEventBus';
 import { workspaceFileEditAttributionService } from '../WorkspaceFileEditAttributionService';
+import { sessionEditQuota } from '../SessionEditQuota';
+import { notifySessionFilesUpdated } from '../sessionFilesNotify';
+import { pathContainsExcludedDir } from '../../utils/fileFilters';
 import { isFileInWorkspaceOrWorktree } from '../../utils/workspaceDetection';
 import {
-  safeSend,
   readFileContentOrNull,
   recoverBaselineFromHistory,
   isBinaryFile,
 } from './aiServiceUtils';
-
-const execFileAsync = promisify(execFile);
 
 interface WatcherEntry {
   cache: FileSnapshotCache;
@@ -65,7 +70,6 @@ export class HooklessAgentFileWatcher {
   async ensureForSession(
     sessionId: string,
     workspacePath: string,
-    event: Electron.IpcMainInvokeEvent,
   ): Promise<void> {
     // Cancel any pending delayed-stop timer so it doesn't destroy the watcher
     // we're about to reuse (race: new turn starts within the 500ms drain delay).
@@ -126,7 +130,12 @@ export class HooklessAgentFileWatcher {
           timestamp: watchEvent.timestamp,
           beforeContent: watchEvent.beforeContent,
         });
-        safeSend(event, 'session-files:updated', sessionId);
+        // NIM-816: notify through the shared helper so the session-files IPC
+        // cache is invalidated alongside the broadcast. Note this ping races
+        // the (async) attribution row write above — the attribution service
+        // sends its own post-write notification, this one just keeps the
+        // sidebar snappy for already-written rows.
+        notifySessionFilesUpdated(sessionId);
       },
     );
     this.watchers.set(sessionId, { cache, watcher, workspacePath });
@@ -195,6 +204,46 @@ export class HooklessAgentFileWatcher {
 
   /**
    * For Bash tool calls in agent sessions: scan the command for plausible file
+   * paths and seed `FileSnapshotCache` with each file's current disk content
+   * so the cache holds a real pre-command baseline before the bash command
+   * runs. Skips files already in the cache so we don't clobber an in-flight
+   * pre-edit baseline from an earlier write in this turn.
+   *
+   * Why: without this, `trackBashEditsFromCommand` later compares post-command
+   * disk content against `cache.getBeforeState`, which falls through to git
+   * `startSha` (committed) content when the in-memory cache misses. Any file
+   * with uncommitted modifications at session start then looks "edited" by a
+   * read-only command (`sed -n`, `cat`, `nl`), producing false attributions
+   * across sessions.
+   */
+  async captureBashPreEditSnapshots(
+    sessionId: string,
+    workspacePath: string,
+    command: string,
+  ): Promise<void> {
+    const watcherEntry = this.watchers.get(sessionId);
+    if (!watcherEntry) return;
+
+    const cwd = watcherEntry.workspacePath;
+    const filePaths = await this.extractFilePathsFromCommand(command, workspacePath, cwd);
+    if (filePaths.length === 0) return;
+
+    for (const filePath of filePaths) {
+      // Preserve any existing in-session snapshot (initGitCache, prior write
+      // in this turn). The user opted for seed-if-missing so a parallel-bash
+      // race can't erase an earlier command's pre-edit baseline.
+      if (watcherEntry.cache.hasSnapshot(filePath)) continue;
+      if (isBinaryFile(filePath)) continue;
+
+      const content = await readFileContentOrNull(filePath);
+      if (content === null) continue;
+
+      watcherEntry.cache.updateSnapshot(filePath, content);
+    }
+  }
+
+  /**
+   * For Bash tool calls in agent sessions: scan the command for plausible file
    * paths, and for each one create a pre-edit tag + session file link.
    * Mirrors the work the `file_change` watcher path would have done if the
    * agent had emitted a structured edit event.
@@ -248,13 +297,19 @@ export class HooklessAgentFileWatcher {
 
       let beforeContent: string | null = null;
 
-      // Prefer the same cache/history baseline strategy as file_change tracking.
-      // This avoids whole-file green diffs for gitignored/untracked bash edits.
+      // In-memory cache only. We deliberately bypass `getBeforeState`'s tier-2
+      // git-`startSha` fallback here: that path returns committed content,
+      // which differs from the working tree for any file dirty at session
+      // start, and any read-only command (`sed -n`, `cat`, `nl`) then looks
+      // like an edit. `captureBashPreEditSnapshots` should have already seeded
+      // a real working-tree baseline at `item.started`; if it didn't, fall
+      // through to history rather than fabricating one from `HEAD`.
       if (watcherEntry) {
-        try {
-          beforeContent = await watcherEntry.cache.getBeforeState(filePath);
-        } catch {
-          // Best-effort; we'll continue with history/git fallbacks.
+        const cachedBaseline = watcherEntry.cache.hasSnapshot(filePath)
+          ? await watcherEntry.cache.getBeforeState(filePath)
+          : null;
+        if (cachedBaseline !== null) {
+          beforeContent = cachedBaseline;
         }
       }
 
@@ -265,24 +320,22 @@ export class HooklessAgentFileWatcher {
         }
       }
 
-      // Last-resort fallback to git HEAD when cache/history are unavailable.
+      // No `git show HEAD:` last-resort fallback. It produced the cross-session
+      // false-attribution bug for `sed -n`-style read-only commands run against
+      // working-tree-modified files. If neither the in-memory cache nor local
+      // history can supply a real baseline, skip the bash-watcher tag and let
+      // an authoritative writer (file_change pre_edit_snapshot, OpenCode /
+      // Codex-ACP edit tools) attribute later.
       if (beforeContent === null) {
-        try {
-          const relativePath = path.relative(effectivePath, filePath);
-          if (!relativePath.startsWith('..') && !path.isAbsolute(relativePath) && !relativePath.startsWith(':')) {
-            const { stdout } = await execFileAsync(
-              'git',
-              ['show', `HEAD:${relativePath}`],
-              { cwd: effectivePath, encoding: 'utf-8' },
-            );
-            beforeContent = stdout;
-          }
-        } catch {
-          // File may be untracked/new. Keep null and fall back to empty baseline.
-        }
+        logger.main.debug('[HooklessAgentFileWatcher] Skipping bash tag — no real baseline available:', {
+          sessionId: session.id,
+          filePath,
+        });
+        watcherEntry?.cache.updateSnapshot(filePath, currentContent);
+        continue;
       }
 
-      const resolvedBeforeContent = beforeContent ?? '';
+      const resolvedBeforeContent = beforeContent;
 
       // If baseline equals current content, command did not materially change this file.
       if (resolvedBeforeContent === currentContent) {
@@ -304,6 +357,11 @@ export class HooklessAgentFileWatcher {
         logger.main.info('[HooklessAgentFileWatcher] Upgraded empty bash tag with baseline:', {
           sessionId: session.id, filePath, tagId: existingTag.id,
         });
+        watcherEntry?.cache.updateSnapshot(filePath, currentContent);
+        continue;
+      }
+
+      if (!(await sessionEditQuota.tryReserve(session.id, filePath))) {
         watcherEntry?.cache.updateSnapshot(filePath, currentContent);
         continue;
       }
@@ -389,6 +447,7 @@ export async function extractFilePathsFromCommand(
       // Resolve symlinks so boundary check cannot be bypassed via symlinks.
       const realPath = await fs.promises.realpath(candidate);
       if (!isFileInWorkspaceOrWorktree(realPath, workspacePath)) return;
+      if (pathContainsExcludedDir(realPath)) return;
       // Skip non-regular files (directories, sockets, fifos). Bash commands
       // routinely reference directories as positional args; without this
       // filter every such mention later fails `readFile` with EISDIR.

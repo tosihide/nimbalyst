@@ -1,59 +1,39 @@
 import React, { useState, useEffect, useRef } from 'react';
 
-// Helper function to apply theme
+// Apply the active theme as a base dark/light class on the WorkspaceManager
+// (project picker) window. The picker does not load the extension theme
+// registry, so we rely on the main process's getResolvedThemeSync() to return
+// 'dark' | 'crystal-dark' | 'light' regardless of whether the active theme is
+// built-in, system, or extension-contributed.
 const applyTheme = () => {
   if (typeof window === 'undefined') return;
 
-  const savedTheme = localStorage.getItem('theme');
+  const resolved = window.electronAPI?.getResolvedThemeSync?.() ?? 'light';
   const root = document.documentElement;
 
-  // Clear all theme classes first
   root.classList.remove('light-theme', 'dark-theme', 'crystal-dark-theme');
 
-  if (savedTheme === 'dark') {
+  if (resolved === 'dark') {
     root.setAttribute('data-theme', 'dark');
     root.classList.add('dark-theme');
-  } else if (savedTheme === 'crystal-dark') {
+  } else if (resolved === 'crystal-dark') {
     root.setAttribute('data-theme', 'crystal-dark');
     root.classList.add('crystal-dark-theme');
-  } else if (savedTheme === 'light') {
+  } else {
     root.setAttribute('data-theme', 'light');
     root.classList.add('light-theme');
-  } else {
-    // Auto - check system preference
-    const prefersDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
-    if (prefersDark) {
-      root.setAttribute('data-theme', 'dark');
-      root.classList.add('dark-theme');
-    } else {
-      root.setAttribute('data-theme', 'light');
-      root.classList.add('light-theme');
-    }
   }
 };
 
 // Apply theme on mount
 applyTheme();
 
-// Listen for theme changes
-if (typeof window !== 'undefined') {
-  window.addEventListener('storage', (e) => {
-    if (e.key === 'theme') {
-      applyTheme();
-    }
+// Listen for theme changes from the main process. Re-running applyTheme()
+// re-queries getThemeSync(), which already reflects the new active theme.
+if (typeof window !== 'undefined' && window.electronAPI?.onThemeChange) {
+  window.electronAPI.onThemeChange(() => {
+    applyTheme();
   });
-
-  // Also listen for IPC theme changes
-  if (window.electronAPI?.onThemeChange) {
-    const unsubscribe = window.electronAPI.onThemeChange((theme) => {
-      // Guard: skip if unchanged
-      if (localStorage.getItem('theme') === theme) return;
-      // Update localStorage with the new theme
-      localStorage.setItem('theme', theme);
-      applyTheme();
-    });
-    // Note: unsubscribe is returned but we're not cleaning it up since this is module-level
-  }
 }
 
 interface WorkspaceInfo {
@@ -126,6 +106,7 @@ export const WorkspaceManager: React.FC = () => {
 
   // Operation state
   const [operationInProgress, setOperationInProgress] = useState(false);
+  const [operationLabel, setOperationLabel] = useState('Moving project...');
   const [operationError, setOperationError] = useState<string | null>(null);
 
   const renameInputRef = useRef<HTMLInputElement>(null);
@@ -287,6 +268,29 @@ export const WorkspaceManager: React.FC = () => {
     });
   };
 
+  const openRenameDialog = async (workspace: WorkspaceInfo) => {
+    const canMoveResult = await window.electronAPI.projectMigration.canMove(workspace.path);
+    if (!canMoveResult.canMove) {
+      setOperationError(canMoveResult.reason || 'Cannot rename project');
+      return;
+    }
+
+    let renameStats: WorkspaceStats | null = null;
+    try {
+      renameStats = await window.electronAPI.workspaceManager.getWorkspaceStats(workspace.path);
+    } catch (e) {
+      // Stats are optional, continue without them
+    }
+
+    setRenameDialog({
+      visible: true,
+      workspace,
+      newName: workspace.name,
+      error: null,
+      stats: renameStats,
+    });
+  };
+
   const handleContextMenuAction = async (action: 'open' | 'rename' | 'move' | 'remove') => {
     const workspace = contextMenu.workspace;
     setContextMenu(prev => ({ ...prev, visible: false }));
@@ -299,26 +303,7 @@ export const WorkspaceManager: React.FC = () => {
         break;
 
       case 'rename':
-        // Check if can move first
-        const canMoveResult = await window.electronAPI.projectMigration.canMove(workspace.path);
-        if (!canMoveResult.canMove) {
-          setOperationError(canMoveResult.reason || 'Cannot rename project');
-          return;
-        }
-        // Get workspace stats for the rename dialog
-        let renameStats: WorkspaceStats | null = null;
-        try {
-          renameStats = await window.electronAPI.workspaceManager.getWorkspaceStats(workspace.path);
-        } catch (e) {
-          // Stats are optional, continue without them
-        }
-        setRenameDialog({
-          visible: true,
-          workspace,
-          newName: workspace.name,
-          error: null,
-          stats: renameStats,
-        });
+        await openRenameDialog(workspace);
         break;
 
       case 'move':
@@ -372,6 +357,7 @@ export const WorkspaceManager: React.FC = () => {
     const newPath = confirmDialog.destinationPath;
 
     setConfirmDialog(prev => ({ ...prev, visible: false }));
+    setOperationLabel('Moving project...');
     setOperationInProgress(true);
     setOperationError(null);
 
@@ -418,6 +404,7 @@ export const WorkspaceManager: React.FC = () => {
       return;
     }
 
+    setOperationLabel('Renaming project...');
     setOperationInProgress(true);
     setRenameDialog(prev => ({ ...prev, error: null }));
 
@@ -643,13 +630,29 @@ export const WorkspaceManager: React.FC = () => {
                 <h1 className="text-xl font-semibold text-[var(--nim-text)] m-0 mb-1">{selectedWorkspace.name}</h1>
                 <div className="workspace-path text-[13px] text-[var(--nim-text-muted)]">{selectedWorkspace.path}</div>
               </div>
-              <div className="content-actions flex gap-2 shrink-0">
-                <button className="btn nim-btn-primary" onClick={handleOpenWorkspace}>
-                  Open Project
-                </button>
-                <button className="btn nim-btn-secondary !text-[var(--nim-error)] !border-[var(--nim-error-subtle)] hover:!bg-[var(--nim-error-subtle)]" onClick={() => handleRemoveFromRecent()}>
-                  Remove from Recent
-                </button>
+              <div className="content-actions flex flex-col items-end gap-2 shrink-0">
+                <div className="content-actions-primary flex flex-wrap justify-end gap-2">
+                  <button className="btn nim-btn-primary" onClick={handleOpenWorkspace}>
+                    Open Project
+                  </button>
+                  <button className="btn nim-btn-secondary !text-[var(--nim-error)] !border-[var(--nim-error-subtle)] hover:!bg-[var(--nim-error-subtle)]" onClick={() => handleRemoveFromRecent()}>
+                    Remove from Recent
+                  </button>
+                </div>
+                <div className="content-actions-secondary flex flex-wrap justify-end gap-2">
+                  <button
+                    className="btn nim-btn-secondary !h-8 !px-2.5 !text-[12px]"
+                    onClick={() => openRenameDialog(selectedWorkspace)}
+                  >
+                    Rename
+                  </button>
+                  <button
+                    className="btn nim-btn-secondary !h-8 !px-2.5 !text-[12px]"
+                    onClick={() => handleMoveProject(selectedWorkspace)}
+                  >
+                    Move
+                  </button>
+                </div>
               </div>
             </div>
 
@@ -900,7 +903,7 @@ export const WorkspaceManager: React.FC = () => {
         <div className="fixed inset-0 bg-black/30 flex items-center justify-center z-[4000]">
           <div className="bg-[var(--nim-bg)] border border-[var(--nim-border)] rounded-lg shadow-xl p-6 flex items-center gap-3">
             <div className="spinner w-5 h-5 border-2 border-[var(--nim-border)] border-t-[var(--nim-primary)] rounded-full animate-spin"></div>
-            <span className="text-[14px] text-[var(--nim-text)]">Moving project...</span>
+            <span className="text-[14px] text-[var(--nim-text)]">{operationLabel}</span>
           </div>
         </div>
       )}

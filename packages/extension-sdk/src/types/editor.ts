@@ -13,7 +13,175 @@
  * and provided by the host.
  */
 
+import type { Doc as YDoc } from 'yjs';
+import type { Awareness } from 'y-protocols/awareness';
 import type { ExtensionStorage } from './panel.js';
+
+// ============================================================================
+// Collaboration types
+// ============================================================================
+
+/**
+ * Connection status of a collaborative session.
+ *
+ * Mirrors `DocumentSyncStatus` in `@nimbalyst/runtime`. Extensions should treat
+ * any non-`'connected'` value as "not safe to assume the server has our
+ * latest edits" for UI purposes; the underlying Y.Doc remains usable
+ * regardless (CRDT updates queue locally until reconnection).
+ */
+export type CollaborationStatus =
+  | 'disconnected'
+  | 'connecting'
+  | 'syncing'
+  | 'replaying'
+  | 'offline-unsynced'
+  | 'connected'
+  | 'error';
+
+/**
+ * The standard awareness fields the host renders generically (presence
+ * avatars, cursors). Extensions may add arbitrary extra keys -- those extras
+ * are opaque to the host and handled by the extension itself.
+ */
+export interface StandardAwarenessState {
+  user: { id: string; name: string; color: string };
+  pointer?: { x: number; y: number };
+  selection?: unknown;
+  [k: string]: unknown;
+}
+
+/**
+ * Snapshot of a remote collaborator currently in awareness. Provided as a
+ * convenience for the SDK hook; extensions that need richer per-editor
+ * awareness fields should read `host.collaboration.awareness.getStates()`
+ * directly.
+ */
+export interface CollaboratorInfo {
+  user: { id: string; name: string; color: string };
+}
+
+/**
+ * Available on `EditorHost` only when the document was opened collaboratively.
+ *
+ * When undefined, the extension should fall back to its standard
+ * `host.loadContent()` / `host.saveContent()` flow. When defined, the
+ * extension MUST drive its state through the Y.Doc (and the host will not
+ * call `host.onSaveRequested` for this document -- persistence is the
+ * server's encrypted blob store).
+ */
+export interface CollaborationContext {
+  /**
+   * The shared Y.Doc. Extensions create their own shared types within it
+   * (e.g. `yDoc.getArray('elements')`).
+   */
+  readonly yDoc: YDoc;
+
+  /**
+   * `y-protocols/awareness` instance carrying remote presence. Extension
+   * bindings register their own local awareness fields here (cursor, tool,
+   * selection) and observe changes via `awareness.on('change', ...)`.
+   *
+   * The host wires this into the encrypted transport so awareness updates
+   * are throttled and end-to-end encrypted on the wire.
+   */
+  readonly awareness: Awareness;
+
+  /** Identity used to drive `awareness` and presence display. */
+  readonly user: { id: string; name: string; color: string };
+
+  /** Current connection status. */
+  getStatus(): CollaborationStatus;
+
+  /** Subscribe to status changes. Returns an unsubscribe fn. */
+  onStatusChange(cb: (status: CollaborationStatus) => void): () => void;
+
+  /**
+   * Returns the file content that should be used to seed the Y.Doc when this
+   * client is the first to open it. The host owns reading the bytes (from
+   * disk, from in-memory Share-to-Team payload, etc.) so extensions never
+   * reason about file paths in collab mode.
+   */
+  loadInitialContent(): Promise<string | ArrayBuffer>;
+
+  /**
+   * Flush the current Y.Doc state upstream and resolve ONLY after the server
+   * confirms it persisted the update (not merely after the socket write).
+   *
+   * The SDK awaits this after seeding a first-open collaborative document so the
+   * seed is durably on the server before the provider can tear down. Resolves
+   * `true` on a server-acked persist, `false` on timeout / not-yet-connected —
+   * the host surfaces a failed flush to the user (pending-seed machinery)
+   * rather than silently losing the seed. Required on the collab context: a
+   * host that can't guarantee the flush would reintroduce the seed data-loss
+   * race that made this method necessary.
+   */
+  flushWithAck(timeoutMs?: number): Promise<boolean>;
+
+  /**
+   * True when the transport skipped server payloads it could not decode
+   * (stale key epoch, corruption). An "empty" Y.Doc then does NOT mean the
+   * room is empty — the SDK must not run the first-open seed, or a default
+   * document gets written over real-but-unreadable content for every client.
+   */
+  hasUndecodedContent?(): boolean;
+
+  /**
+   * @deprecated Use {@link flushWithAck}, which awaits a server-persisted ack.
+   * `flushLocalState` fires-and-forgets (resolves after the socket write, not
+   * the server ack) and rode in the mindmap seed data-loss race. Retained only
+   * so existing callers keep compiling.
+   */
+  flushLocalState?(): Promise<void>;
+
+  /**
+   * Register a revision-history snapshot adapter for this collaborative
+   * document. Extensions opt in by implementing `exportRevisionSnapshot`
+   * and `restoreRevisionSnapshot`; the host wires these into the
+   * shared-document History dialog so users can preview and restore past
+   * versions of the document.
+   *
+   * Call this once after binding the editor to the Y.Doc (e.g. inside the
+   * same effect that wires `useCollaborativeEditor`). The returned function
+   * unregisters the adapter -- call it on unmount.
+   *
+   * When no adapter is registered, the host falls back to a metadata-only
+   * history view: users can see when revisions were taken and by whom, but
+   * cannot preview or restore them.
+   *
+   * Implementations should serialize the editor-native state (e.g. an
+   * Excalidraw scene JSON) deterministically so dedupe-on-hash is stable.
+   */
+  registerRevisionAdapter?(adapter: RevisionSnapshotAdapter): () => void;
+}
+
+/**
+ * Editor-supplied snapshot round-trip for collaborative revision history.
+ * See `CollaborationContext.revisionAdapter`.
+ */
+export interface RevisionSnapshotAdapter {
+  /**
+   * Snapshot payload format identifier, e.g. `excalidraw-json` or
+   * `mindmap-yaml`. Treated as opaque by the server; used by the dialog to
+   * pick a renderer (or fall back to metadata-only display).
+   */
+  readonly contentFormat: string;
+
+  /** Capture the current document state as bytes. */
+  exportRevisionSnapshot(): Uint8Array | Promise<Uint8Array>;
+
+  /**
+   * Apply a previously captured snapshot back into the live document.
+   * Implementations should produce normal collaborative edits so the
+   * change broadcasts to peers via the standard Yjs path.
+   */
+  restoreRevisionSnapshot(plaintext: Uint8Array): void | Promise<void>;
+
+  /**
+   * Optional read-only preview component name for the History dialog. When
+   * absent, the dialog shows metadata only.
+   */
+  readonly previewKind?: 'text' | 'metadata-only';
+}
 
 // ============================================================================
 // EditorHost API - The primary API for custom editors
@@ -129,6 +297,36 @@ export interface EditorHost {
    * Set to true by the web share viewer's ReadOnlyEditorHost.
    */
   readonly readOnly?: boolean;
+
+  /**
+   * Whether the editor is rendered inline inside another document
+   * (i.e. as an embed in a markdown doc rather than as a full tab).
+   *
+   * Extensions can use this to suppress persistent chrome that doesn't make
+   * sense inside another doc (e.g., side panels, sticky toolbars). The
+   * `readOnly` flag is a separate axis; an embed is typically both `embedded`
+   * and `readOnly`, but an extension that opts into writable embeds will see
+   * `embedded` true and `readOnly` false.
+   *
+   * Defaults to false (undefined treated as false for backwards compatibility).
+   */
+  readonly embedded?: boolean;
+
+  /**
+   * Subscribe to changes to `readOnly`.
+   *
+   * Optional: hosts where `readOnly` never changes after construction
+   * (TabEditor, share viewer) omit this. Hosts that allow the user to
+   * flip between view and edit modes (the inline embed frame) implement
+   * it so extensions can react -- e.g. Excalidraw toggles
+   * `viewModeEnabled` so toolbars hide in view mode and reappear in
+   * edit mode without remounting the canvas.
+   *
+   * Extensions should read `host.readOnly` for the current value (it is
+   * a getter on reactive hosts) and subscribe here for subsequent flips.
+   * Returns an unsubscribe function.
+   */
+  onReadOnlyChanged?(callback: (readOnly: boolean) => void): () => void;
 
   // ============ THEME CHANGES ============
 
@@ -345,6 +543,24 @@ export interface EditorHost {
   registerEditorAPI(api: unknown | null): void;
 
   // ============ MENU ITEMS ============
+
+  // ============ COLLABORATION (OPTIONAL) ============
+
+  /**
+   * Present only when this document was opened collaboratively.
+   *
+   * When defined, the extension MUST drive its state through `collaboration.yDoc`
+   * and use the SDK's `useCollaborativeEditor` hook to manage the binding
+   * lifecycle. In collab mode, the host does not invoke `onSaveRequested` --
+   * persistence is the server's encrypted blob store.
+   *
+   * When undefined, the extension operates in local-only mode (load from
+   * disk via `loadContent()`, save via `saveContent()`).
+   *
+   * Extensions opt in by declaring `collaboration.supported: true` in their
+   * editor contribution manifest entry.
+   */
+  readonly collaboration?: CollaborationContext;
 
   /**
    * Register menu items to appear in the editor's "..." actions menu.

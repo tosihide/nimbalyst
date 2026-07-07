@@ -9,8 +9,8 @@ export const KeyboardShortcuts = {
     newFile: 'Cmd+N',
     newSession: 'Cmd+N',
     newSessionGlobal: 'Cmd+Shift+N',
+    newBrowserTab: 'Cmd+Shift+B',
     open: 'Cmd+O',
-    openFolder: 'Cmd+Shift+O',
     save: 'Cmd+S',
     closeTab: 'Cmd+W',
     reopenClosedTab: 'Cmd+Shift+T',
@@ -26,6 +26,7 @@ export const KeyboardShortcuts = {
     copy: 'Cmd+C',
     copyMarkdown: 'Cmd+Shift+C',
     paste: 'Cmd+V',
+    pasteAsText: 'Cmd+Shift+V',
     selectAll: 'Cmd+A',
     find: 'Cmd+F',
     findNext: 'Cmd+G',
@@ -46,8 +47,10 @@ export const KeyboardShortcuts = {
     toggleAIChat: 'Cmd+Shift+A',
     toggleBottomPanel: 'Cmd+J',
     toggleTerminalPanel: 'Ctrl+`',
+    toggleCliTerminalDrawer: 'Ctrl+Shift+`',
     trackerMode: 'Cmd+T',
     collabMode: 'Cmd+D',
+    prReviewMode: 'Cmd+U',
     toggleSidebar: 'Cmd+B',
 
     // Navigation
@@ -79,6 +82,7 @@ export const KeyboardShortcuts = {
     sessionQuickOpen: 'Cmd+L',
     promptQuickOpen: 'Cmd+Shift+L',
     contentSearch: 'Cmd+Shift+F',
+    globalSearch: 'Cmd+Shift+O',
     projectQuickOpen: 'Cmd+Shift+P',
     kanbanView: 'Cmd+Shift+K',
     newWorktree: 'Cmd+Alt+W',
@@ -93,10 +97,23 @@ export const KeyboardShortcuts = {
 } as const;
 
 /**
- * Get platform-specific shortcut display (for renderer)
- * On macOS, modifiers are shown without + separators (e.g., ⌘⇧A not ⌘+⇧+A)
+ * Get platform-specific shortcut display (for renderer).
+ * On macOS, modifiers are shown without + separators (e.g., ⌘⇧A not ⌘+⇧+A).
+ * On Windows/Linux, Cmd is rewritten to Ctrl and Option to Alt, with the
+ * familiar `+` joiner kept (e.g., Ctrl+Shift+A).
+ *
+ * The `isMac` parameter defaults to a `navigator.platform` check so renderer
+ * call sites get the right output automatically. Pass it explicitly in tests
+ * to avoid monkey-patching `navigator`.
  */
-export function getShortcutDisplay(shortcut: string): string {
+export function getShortcutDisplay(
+  shortcut: string,
+  isMac: boolean = typeof navigator !== 'undefined'
+    && navigator.platform.startsWith('Mac'),
+): string {
+  if (!isMac) {
+    return shortcut.replace('Cmd', 'Ctrl').replace('Option', 'Alt');
+  }
   return shortcut
     .replace('Cmd', '⌘')
     .replace('Ctrl', '⌃')

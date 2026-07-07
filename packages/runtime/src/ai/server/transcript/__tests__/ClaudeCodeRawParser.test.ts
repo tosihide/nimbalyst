@@ -32,6 +32,7 @@ function makeContext(overrides?: Partial<ParseContext>): ParseContext {
     hasToolCall: () => false,
     hasSubagent: () => false,
     findByProviderToolCallId: async () => null,
+    findActiveToolCallByRawProviderId: async () => null,
     ...overrides,
   };
 }
@@ -68,6 +69,38 @@ describe('ClaudeCodeRawParser', () => {
         type: 'system_message',
         systemType: 'status',
       });
+    });
+
+    it('parses wakeup_resume prompt as system_message, not user_message', async () => {
+      const parser = new ClaudeCodeRawParser();
+      const msg = makeRawMessage({
+        direction: 'input',
+        content: JSON.stringify({ prompt: 'Continue working on the feature', options: {} }),
+        metadata: { promptOrigin: 'wakeup_resume' },
+      });
+
+      const descriptors = await parser.parseMessage(msg, makeContext());
+
+      expect(descriptors).toHaveLength(1);
+      expect(descriptors[0]).toMatchObject({
+        type: 'system_message',
+        systemType: 'status',
+        reminderKind: 'wakeup_resume',
+        text: 'Continue working on the feature',
+      });
+    });
+
+    it('does not treat regular user prompt with promptOrigin absent as wakeup', async () => {
+      const parser = new ClaudeCodeRawParser();
+      const msg = makeRawMessage({
+        direction: 'input',
+        content: JSON.stringify({ prompt: 'Hello world', options: {} }),
+      });
+
+      const descriptors = await parser.parseMessage(msg, makeContext());
+
+      expect(descriptors).toHaveLength(1);
+      expect(descriptors[0].type).toBe('user_message');
     });
 
     it('parses SDK format user message { type: "user", message: { content: "..." } }', async () => {
@@ -432,6 +465,100 @@ describe('ClaudeCodeRawParser', () => {
       expect(descriptors).toHaveLength(0);
     });
 
+    it('emits result chunk text on resume when num_turns is 0 (unknown slash command)', async () => {
+      // Regression: on a resumed session, suppressResultChunkText is set to
+      // avoid duplicating prior assistant text. But a turn with num_turns===0
+      // (e.g. "Unknown command: /foo") has zero assistant chunks and the result
+      // text is the only signal of what happened. Suppressing it leaves the
+      // turn rendered as completely blank UI, hiding the failure.
+      const parser = new ClaudeCodeRawParser();
+      parser.setSuppressResultChunkText(true); // resume batch
+
+      const descriptors = await parser.parseMessage(
+        makeRawMessage({
+          content: JSON.stringify({
+            type: 'result',
+            subtype: 'success',
+            is_error: false,
+            num_turns: 0,
+            result: 'Unknown command: /nimbalyst-planning:launch-new-session',
+          }),
+        }),
+        makeContext(),
+      );
+
+      expect(descriptors).toHaveLength(1);
+      expect(descriptors[0]).toMatchObject({
+        type: 'assistant_message',
+        text: 'Unknown command: /nimbalyst-planning:launch-new-session',
+      });
+    });
+
+    it('emits result chunk text with num_turns 0 even after prior turns produced text in the same batch', async () => {
+      // Regression: in a full-session reparse, processedTextMessageIds
+      // accumulates across all turns processed in the batch. By the time we
+      // reach a later turn's result chunk, it's non-empty -- but a result
+      // chunk with num_turns===0 belongs to a turn that ran zero assistant
+      // turns, so its text cannot duplicate anything from prior turns.
+      const parser = new ClaudeCodeRawParser();
+
+      // Prior turn produces assistant text.
+      await parser.parseMessage(
+        makeRawMessage({
+          content: JSON.stringify({
+            type: 'assistant',
+            message: { id: 'msg-1', content: [{ type: 'text', text: 'Plan written.' }] },
+          }),
+        }),
+        makeContext(),
+      );
+
+      // Later turn: unknown slash command, num_turns 0, only a result chunk.
+      const descriptors = await parser.parseMessage(
+        makeRawMessage({
+          id: 99,
+          content: JSON.stringify({
+            type: 'result',
+            subtype: 'success',
+            is_error: false,
+            num_turns: 0,
+            result: 'Unknown command: /nimbalyst-planning:launch-new-session',
+          }),
+        }),
+        makeContext(),
+      );
+
+      expect(descriptors).toHaveLength(1);
+      expect(descriptors[0]).toMatchObject({
+        type: 'assistant_message',
+        text: 'Unknown command: /nimbalyst-planning:launch-new-session',
+      });
+    });
+
+    it('still suppresses result chunk text on resume when num_turns > 0', async () => {
+      // The carve-out above is gated on num_turns===0. A resumed turn that
+      // actually ran assistant turns must still suppress its result echo to
+      // avoid duplicating text already produced via assistant chunks in
+      // prior batches.
+      const parser = new ClaudeCodeRawParser();
+      parser.setSuppressResultChunkText(true);
+
+      const descriptors = await parser.parseMessage(
+        makeRawMessage({
+          content: JSON.stringify({
+            type: 'result',
+            subtype: 'success',
+            is_error: false,
+            num_turns: 3,
+            result: 'Final assistant response',
+          }),
+        }),
+        makeContext(),
+      );
+
+      expect(descriptors).toHaveLength(0);
+    });
+
     it('parses nimbalyst_tool_use', async () => {
       const parser = new ClaudeCodeRawParser();
       const msg = makeRawMessage({
@@ -509,6 +636,18 @@ describe('ClaudeCodeRawParser', () => {
         type: 'assistant_message',
         text: 'Plain text response',
       });
+    });
+
+    it('drops the sync whole-message elision marker instead of rendering a stray bubble', async () => {
+      const parser = new ClaudeCodeRawParser();
+      const msg = makeRawMessage({
+        content:
+          '[Full claude-code message elided from mobile sync: 29.2 KB raw. View on desktop for the full content.]',
+      });
+
+      const descriptors = await parser.parseMessage(msg, makeContext());
+
+      expect(descriptors).toHaveLength(0);
     });
   });
 
@@ -588,6 +727,110 @@ describe('ClaudeCodeRawParser', () => {
       });
     });
 
+    // Regression: when the commit proposal widget posts back its result, the
+    // response row lives in ai_agent_messages as { type: 'git_commit_proposal_response' }
+    // with source='nimbalyst'. Without parser support the canonical tool_call
+    // event for developer_git_commit_proposal stays at status='running' /
+    // result=undefined, and the widget renders as "pending" forever even after
+    // a successful commit. See session cb82f2eb-941c-4fb5-b552-adbae567df61.
+    describe('git_commit_proposal_response', () => {
+      it('emits tool_call_completed with structured result for a committed response', async () => {
+        const parser = new ClaudeCodeRawParser();
+        const msg = makeRawMessage({
+          source: 'nimbalyst',
+          content: JSON.stringify({
+            type: 'git_commit_proposal_response',
+            proposalId: 'toolu_proposal_1',
+            action: 'committed',
+            commitHash: '0b02b2301eecf073c716f8f0da43d458a611c568',
+            commitDate: '2026-06-01T17:00:20-04:00',
+            filesCommitted: ['packages/electron/build/build-worker.js'],
+            commitMessage: 'fix: SQLite migration adopt crash in packaged builds',
+            respondedAt: 1780347621666,
+            respondedBy: 'desktop',
+          }),
+        });
+
+        const context = makeContext({
+          hasToolCall: (id) => id === 'toolu_proposal_1',
+        });
+        const descriptors = await parser.parseMessage(msg, context);
+
+        expect(descriptors).toHaveLength(1);
+        const completed = descriptors[0] as any;
+        expect(completed.type).toBe('tool_call_completed');
+        expect(completed.providerToolCallId).toBe('toolu_proposal_1');
+        expect(completed.status).toBe('completed');
+        expect(completed.isError).toBe(false);
+        const parsedResult = JSON.parse(completed.result);
+        expect(parsedResult.action).toBe('committed');
+        expect(parsedResult.commitHash).toBe('0b02b2301eecf073c716f8f0da43d458a611c568');
+        expect(parsedResult.filesCommitted).toEqual(['packages/electron/build/build-worker.js']);
+      });
+
+      it('emits tool_call_completed with status=error for an error response', async () => {
+        const parser = new ClaudeCodeRawParser();
+        const msg = makeRawMessage({
+          source: 'nimbalyst',
+          content: JSON.stringify({
+            type: 'git_commit_proposal_response',
+            proposalId: 'toolu_proposal_2',
+            action: 'error',
+            error: 'No files were staged. The files may not exist or have no changes.',
+            respondedAt: 1780347829579,
+            respondedBy: 'desktop',
+          }),
+        });
+
+        const context = makeContext({
+          hasToolCall: (id) => id === 'toolu_proposal_2',
+        });
+        const descriptors = await parser.parseMessage(msg, context);
+
+        expect(descriptors).toHaveLength(1);
+        const completed = descriptors[0] as any;
+        expect(completed.type).toBe('tool_call_completed');
+        expect(completed.providerToolCallId).toBe('toolu_proposal_2');
+        expect(completed.status).toBe('error');
+        expect(completed.isError).toBe(true);
+      });
+
+      it('does not overwrite an existing committed result with a later error response', async () => {
+        // Mirrors session cb82f2eb where a second error response arrived ~3
+        // minutes after a successful commit (e.g. duplicate click). The committed
+        // outcome must win so the widget keeps showing the commit hash.
+        const parser = new ClaudeCodeRawParser();
+        const msg = makeRawMessage({
+          source: 'nimbalyst',
+          content: JSON.stringify({
+            type: 'git_commit_proposal_response',
+            proposalId: 'toolu_proposal_3',
+            action: 'error',
+            error: 'No files were staged.',
+          }),
+        });
+
+        const existingCommittedEvent = {
+          id: 42,
+          payload: {
+            result: JSON.stringify({
+              action: 'committed',
+              commitHash: 'abc123',
+            }),
+          },
+        } as any;
+
+        const context = makeContext({
+          hasToolCall: (id) => id === 'toolu_proposal_3',
+          findByProviderToolCallId: async (id) =>
+            id === 'toolu_proposal_3' ? existingCommittedEvent : null,
+        });
+        const descriptors = await parser.parseMessage(msg, context);
+
+        expect(descriptors).toHaveLength(0);
+      });
+    });
+
     it('uses args.subagent_type for the subagent agentType', async () => {
       const parser = new ClaudeCodeRawParser();
       const msg = makeRawMessage({
@@ -612,6 +855,77 @@ describe('ClaudeCodeRawParser', () => {
       const started = descriptors.find(d => d.type === 'subagent_started') as any;
       expect(started).toBeDefined();
       expect(started.agentType).toBe('Explore');
+    });
+  });
+
+  describe('auto-mode permission_denied (issue #371)', () => {
+    it('parses system/permission_denied raw message into a system_message descriptor', async () => {
+      const parser = new ClaudeCodeRawParser();
+      const msg = makeRawMessage({
+        content: JSON.stringify({
+          type: 'system',
+          subtype: 'permission_denied',
+          tool_name: 'Bash',
+          tool_use_id: 'toolu_abc',
+          tool_input: { command: 'rm -rf /' },
+          decision_reason: 'Destructive operation',
+          decision_reason_type: 'classifier',
+          message: 'rm -rf is destructive and was auto-denied',
+        }),
+      });
+
+      const descriptors = await parser.parseMessage(msg, makeContext());
+
+      expect(descriptors).toHaveLength(1);
+      expect(descriptors[0]).toMatchObject({
+        type: 'system_message',
+        systemType: 'permission_denied',
+        deniedToolName: 'Bash',
+        deniedReason: 'Destructive operation',
+        deniedReasonType: 'classifier',
+        deniedInput: { command: 'rm -rf /' },
+        text: 'rm -rf is destructive and was auto-denied',
+      });
+    });
+
+    it('falls back to a synthesised text when SDK omits message field', async () => {
+      const parser = new ClaudeCodeRawParser();
+      const msg = makeRawMessage({
+        content: JSON.stringify({
+          type: 'system',
+          subtype: 'permission_denied',
+          tool_name: 'Write',
+          decision_reason: 'Protected path',
+        }),
+      });
+
+      const descriptors = await parser.parseMessage(msg, makeContext());
+
+      expect(descriptors).toHaveLength(1);
+      const desc = descriptors[0] as CanonicalEventDescriptor & { text?: string };
+      expect(desc.type).toBe('system_message');
+      expect(desc.text).toBe('Write was denied: Protected path');
+    });
+
+    it('handles permission_denied with no reason fields gracefully', async () => {
+      const parser = new ClaudeCodeRawParser();
+      const msg = makeRawMessage({
+        content: JSON.stringify({
+          type: 'system',
+          subtype: 'permission_denied',
+          tool_name: 'Edit',
+        }),
+      });
+
+      const descriptors = await parser.parseMessage(msg, makeContext());
+
+      expect(descriptors).toHaveLength(1);
+      expect(descriptors[0]).toMatchObject({
+        type: 'system_message',
+        systemType: 'permission_denied',
+        deniedToolName: 'Edit',
+        text: 'Edit was denied',
+      });
     });
   });
 });

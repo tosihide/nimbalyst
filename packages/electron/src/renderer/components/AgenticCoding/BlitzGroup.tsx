@@ -2,7 +2,8 @@ import React, { useState, useEffect, useRef, memo, useMemo, useCallback } from '
 import { useAtomValue } from 'jotai';
 import { MaterialSymbol } from '@nimbalyst/runtime';
 import { groupSessionStatusAtom, sessionProcessingAtom, sessionUnreadAtom, sessionPendingPromptAtom } from '../../store';
-import { getRelativeTimeString } from '../../utils/dateFormatting';
+import { SessionContextMenu } from './SessionContextMenu';
+import { SessionRelativeTime } from './SessionRelativeTime';
 
 import type { SessionMeta as SessionItem } from '../../store';
 
@@ -178,7 +179,7 @@ const BlitzSessionRow: React.FC<{
           isActive ? 'font-medium' : ''
         }`}>{sessionTitle}</span>
         <span className="shrink-0 text-[0.6875rem] text-[var(--nim-text-faint)] ml-2">
-          {getRelativeTimeString(session.updatedAt || session.createdAt)}
+          <SessionRelativeTime sessionId={session.id} fallbackTimestamp={session.updatedAt || session.createdAt} />
         </span>
       </>
     )}
@@ -249,6 +250,10 @@ export const BlitzGroup: React.FC<BlitzGroupProps> = memo(({
   const [renamingSessionId, setRenamingSessionId] = useState<string | null>(null);
   const [renameItemValue, setRenameItemValue] = useState('');
   const worktreeRenameInputRef = useRef<HTMLInputElement>(null);
+  const contextMenuSession = useMemo(
+    () => worktrees.flatMap((worktree) => worktree.sessions).find((session) => session.id === sessionContextMenuSessionId) ?? null,
+    [worktrees, sessionContextMenuSessionId],
+  );
 
   const handleChevronClick = useCallback((e: React.MouseEvent) => {
     e.stopPropagation();
@@ -730,7 +735,28 @@ export const BlitzGroup: React.FC<BlitzGroupProps> = memo(({
       )}
 
       {/* Session/Worktree-level Context Menu */}
-      {showSessionContextMenu && (() => {
+      {showSessionContextMenu && sessionContextMenuIsSessionTitle && contextMenuSession && (
+        <SessionContextMenu
+          sessionId={contextMenuSession.id}
+          title={sessionContextMenuDisplayTitle}
+          position={sessionContextMenuPosition}
+          onClose={handleCloseSessionContextMenu}
+          isArchived={contextMenuSession.isArchived}
+          isPinned={contextMenuSession.isPinned}
+          isWorkstream={(contextMenuSession.childCount ?? 0) > 0}
+          isWorktreeSession={!!contextMenuSession.worktreeId}
+          parentSessionId={contextMenuSession.parentSessionId}
+          phase={contextMenuSession.phase}
+          onRename={onSessionRename ? () => {
+            setShowSessionContextMenu(false);
+            setRenameItemValue(sessionContextMenuDisplayTitle);
+            setRenamingSessionId(contextMenuSession.id);
+            setRenamingWorktreeId(sessionContextMenuWorktreeId);
+          } : undefined}
+        />
+      )}
+
+      {showSessionContextMenu && (!sessionContextMenuIsSessionTitle || !contextMenuSession) && (() => {
         const isAnalysisContextMenu = sessionContextMenuWorktreeId?.startsWith('analysis-');
         return (
           <div

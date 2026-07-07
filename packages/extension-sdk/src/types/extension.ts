@@ -13,7 +13,160 @@ import type {
   SettingsPanelContribution,
   SettingsPanelProps,
 } from './panel';
-import type { ThemeColors } from './theme';
+import type { BackendModuleContribution, ExtensionPermissionId } from './permissions';
+import type { MonacoThemeContribution, ThemeColors } from './theme';
+import type { ExtensionCollabService } from './collab';
+import type { TrackerImporterContribution } from './trackerImporter';
+
+/**
+ * Manifest validation rejects extensions declaring more than this many
+ * backend modules, to keep the consent prompt manageable.
+ */
+export const MAX_BACKEND_MODULES_PER_EXTENSION = 8;
+
+/**
+ * Manifest validation rejects extensions declaring more than this many
+ * AI agent providers, to keep the provider dropdown manageable and to
+ * bound the registration cost on the host side.
+ */
+export const MAX_AGENT_PROVIDERS_PER_EXTENSION = 4;
+
+/**
+ * How a provider discovers the model list shown in the UI model picker.
+ *
+ * - `static`  -- the list is fixed at manifest time and lives in the
+ *                contribution's `models` array. Use when the provider
+ *                supports a small, stable set of models.
+ * - `dynamic` -- the provider exposes a `listModels()` method on its
+ *                protocol implementation. The host calls it lazily and
+ *                caches the result for the session. Use when the set of
+ *                models depends on user credentials or remote discovery.
+ */
+export type AiAgentProviderModelDiscovery = 'static' | 'dynamic';
+
+/**
+ * A single static model entry advertised by an agent provider. Used
+ * only when `modelDiscovery` is `'static'`; dynamic providers populate
+ * model metadata at runtime via `listModels()` on the protocol.
+ */
+export interface AiAgentProviderModel {
+  /**
+   * Stable model id passed back to the provider on each turn. Opaque
+   * to the host; recorded in session history.
+   */
+  id: string;
+
+  /** Human-readable label shown in the model picker. */
+  name: string;
+
+  /**
+   * Whether this entry is the provider's default model selection.
+   * Exactly zero or one entry per contribution should set this.
+   */
+  default?: boolean;
+}
+
+/**
+ * Manifest contribution for an AI agent provider.
+ *
+ * An `AiAgentProviderContribution` makes an extension's coding-agent
+ * implementation available as a selectable provider in Nimbalyst's
+ * agentic coding session UI. The contribution is metadata only -- it
+ * describes the provider's identity, capabilities, and supported
+ * models -- while the protocol implementation lives in a backend
+ * module referenced by `backendModuleId`.
+ *
+ * The host wires manifest entries to runtime providers at session
+ * creation:
+ *
+ *   1. The user picks a provider from the agent-provider dropdown.
+ *   2. The host looks up the matching `AiAgentProviderContribution`.
+ *   3. The host loads `backendModuleId` (subject to the user having
+ *      granted the backing `BackendModuleContribution`) and asks it
+ *      for an `AgentProtocol` implementation.
+ *   4. The host creates an `AgentProtocolHost` and hands it to the
+ *      protocol implementation for the lifetime of the session.
+ *
+ * See `agents/AgentProtocolHost.ts` and the Phase 4 SDK design doc
+ * for the runtime contract.
+ */
+export interface AiAgentProviderContribution {
+  /**
+   * Stable provider id unique within the extension (e.g.
+   * `antigravity-gemini`). The host namespaces this with the
+   * extension id when persisting session-provider links, so a value
+   * unique within the extension is sufficient.
+   */
+  id: string;
+
+  /** Human-readable name shown in the provider dropdown. */
+  displayName: string;
+
+  /**
+   * Platform string surfaced in the provider details pane (e.g.
+   * `Gemini`, `Claude`, `OpenAI`). Treated as display text only.
+   */
+  platform: string;
+
+  /**
+   * Id of the `BackendModuleContribution` (same extension) that
+   * implements the `AgentProtocol` for this provider. The protocol
+   * implementation is loaded from this module; the contribution is
+   * hidden from the dropdown until the user has granted the module.
+   */
+  backendModuleId: string;
+
+  /**
+   * Whether the provider can resume an existing session by id.
+   * Defaults to `false`. When `true`, the host may call
+   * `protocol.resume(sessionId)` instead of `protocol.start(...)`.
+   */
+  supportsResume?: boolean;
+
+  /**
+   * Whether the provider can fork (clone) a session at a given
+   * canonical event index into a new branch. Defaults to `false`.
+   */
+  supportsForking?: boolean;
+
+  /**
+   * Whether the provider accepts user-attached files (images,
+   * documents) on a turn. Defaults to `false`.
+   */
+  supportsAttachments?: boolean;
+
+  /** How model discovery is performed. */
+  modelDiscovery: AiAgentProviderModelDiscovery;
+
+  /**
+   * Static model list. Used when `modelDiscovery` is `'static'`;
+   * ignored when `modelDiscovery` is `'dynamic'` (the host calls
+   * `listModels()` on the protocol instead). Validators may still
+   * require a non-empty array when `modelDiscovery === 'static'`.
+   */
+  models: AiAgentProviderModel[];
+
+  /**
+   * Optional map of label to extension-relative path. Each entry
+   * surfaces a bundled documentation file in the provider details
+   * pane (e.g. built-in tool docs). The host treats values as opaque
+   * paths and does not parse the files.
+   */
+  toolFileLinks?: Record<string, string>;
+
+  /**
+   * Material icon name shown next to `displayName` in the provider
+   * dropdown. Optional; the host falls back to a generic agent icon.
+   */
+  icon?: string;
+
+  /**
+   * Component name (key in `ExtensionModule.settingsPanel`) for an
+   * optional provider-specific settings panel. When present, the
+   * host renders this panel under the provider entry in Settings.
+   */
+  settingsPanelComponent?: string;
+}
 
 /**
  * Extension manifest schema (manifest.json)
@@ -158,6 +311,17 @@ export interface ExtensionPermissions {
 
   /** Can make network requests */
   network?: boolean;
+
+  /**
+   * Catalog-based capability ids. Use this for capabilities defined in the
+   * host's permission catalog (see ExtensionPermissionId). Required for any
+   * panel/renderer extension that wants to call host APIs gated on a catalog
+   * permission (e.g. `host.data.query` requires `nimbalyst-database-read`).
+   *
+   * Backend modules declare their own permissions on the module contribution;
+   * this top-level array covers the panel/renderer surface.
+   */
+  catalog?: ExtensionPermissionId[];
 }
 
 export interface ExtensionContributions {
@@ -188,6 +352,19 @@ export interface ExtensionContributions {
   /** Markdown transformers for Lexical */
   transformers?: string[];
 
+  /**
+   * `LexicalExtension` instances contributed by the extension (see
+   * `@lexical/extension`). Names refer to exports on the module's
+   * `lexicalExtensions` record. Each contributed extension is added to
+   * the host editor's extension graph at construction time; toggling an
+   * extension on or off rebuilds the editor instance.
+   *
+   * This is the supported path for shipping Lexical functionality from
+   * an extension. Use `defineExtension` from `lexical` to build the
+   * extension object.
+   */
+  lexicalExtensions?: string[];
+
   /** Components mounted by the host at app level */
   hostComponents?: string[];
 
@@ -196,6 +373,9 @@ export interface ExtensionContributions {
 
   /** Claude Code plugin metadata */
   claudePlugin?: ClaudePluginContribution;
+
+  /** Provider-neutral agent workflows exported to supported agent providers */
+  agentWorkflows?: AgentWorkflowsContribution;
 
   /**
    * Non-file-based panels (e.g., database browser, deployment dashboard).
@@ -219,6 +399,42 @@ export interface ExtensionContributions {
    * Extensions can provide color themes that override the built-in themes.
    */
   themes?: ThemeContribution[];
+
+  /**
+   * Backend modules contributed by this extension.
+   *
+   * Each module runs in an isolated runtime (utility-process or worker-thread)
+   * outside both Electron main and the renderer. Modules are inert until the
+   * user grants their declared permissions via the first-use prompt.
+   *
+   * Capped at {@link MAX_BACKEND_MODULES_PER_EXTENSION} per extension.
+   */
+  backendModules?: BackendModuleContribution[];
+
+  /**
+   * External-source importers that pull items (GitHub issues, Linear issues,
+   * ...) into the native tracker. Each importer's privileged work runs in a
+   * backend module referenced by `backendModuleId`; the host owns the
+   * create/merge path. See {@link TrackerImporterContribution}.
+   */
+  trackerImporters?: TrackerImporterContribution[];
+
+  /**
+   * AI agent providers contributed by this extension.
+   *
+   * Each entry registers a new agent-protocol provider (e.g. an
+   * Antigravity/Gemini integration) that the user can pick from the
+   * agent-provider dropdown in a coding session. The contribution
+   * declares its identity and capabilities here; the protocol
+   * implementation itself lives in a backend module referenced by
+   * `backendModuleId`.
+   *
+   * Granting the backing backend module is the consent that lets the
+   * provider run; an `aiAgentProviders` entry whose backend module has
+   * not been granted is hidden from the dropdown rather than failing
+   * at turn time.
+   */
+  aiAgentProviders?: AiAgentProviderContribution[];
 }
 
 /**
@@ -318,20 +534,58 @@ export interface ClaudePluginAgent {
 }
 
 /**
+ * Provider-neutral agent workflow contribution.
+ * The directory should contain `commands/` and/or `skills/` subdirectories
+ * using the familiar Claude-compatible markdown formats.
+ */
+export interface AgentWorkflowsContribution {
+  /** Path to the workflow root relative to extension root */
+  path: string;
+
+  /** Human-readable name for settings and diagnostics UI */
+  displayName: string;
+
+  /** Description for settings and diagnostics UI */
+  description?: string;
+
+  /** Whether these workflows are enabled by default */
+  enabledByDefault?: boolean;
+}
+
+/**
  * New file menu contribution.
  */
 export interface NewFileMenuContribution {
-  /** File extension with dot (e.g., '.csv') */
+  /**
+   * Identifier for the menu item. For `createFile` actions this is the file
+   * extension with dot (e.g., '.csv') and is appended to the typed name. For
+   * `openVirtualTab` actions it is just a unique key.
+   */
   extension: string;
 
-  /** Name shown in menu */
+  /** Name shown in menu (rendered as "New {displayName}") */
   displayName: string;
 
   /** Material icon name */
   icon: string;
 
-  /** Initial file content */
-  defaultContent: string;
+  /**
+   * What selecting the item does. Defaults to `createFile`.
+   * - `createFile`: prompts for a name and writes a file with `defaultContent`.
+   * - `openVirtualTab`: opens a fileless editor tab at `<virtualScheme><id>`
+   *   (no file on disk, no name prompt). The custom editor registered for that
+   *   virtual prefix renders it.
+   */
+  action?: 'createFile' | 'openVirtualTab';
+
+  /** Initial file content (for `createFile`). */
+  defaultContent?: string;
+
+  /**
+   * For `openVirtualTab`: the `virtual://…/` prefix to open. A unique id (and a
+   * `?title=` derived from displayName) is appended by the host.
+   */
+  virtualScheme?: string;
 }
 
 export interface CustomEditorContribution {
@@ -361,6 +615,43 @@ export interface CustomEditorContribution {
    * Defaults to true when omitted for backward compatibility.
    */
   showDocumentHeader?: boolean;
+
+  /**
+   * Whether this editor opts in to render inline in the agent transcript
+   * when an AI edits a file it handles. The host renders the editor in a
+   * read-only, click-to-activate frame. Defaults to false; extensions must
+   * explicitly enable so heavyweight editors don't auto-instantiate for
+   * every scrolled edit.
+   */
+  supportsTranscriptEmbed?: boolean;
+
+  /**
+   * Preferred height in pixels for the inline transcript embed. Only
+   * applies when `supportsTranscriptEmbed` is true. Defaults to 360 when
+   * omitted.
+   */
+  transcriptEmbedHeight?: number;
+
+  /**
+   * Declares whether this editor supports the host's collaborative
+   * (Share-to-Team / multi-client real-time) flow.
+   *
+   * When `supported: true`, the host treats files of this type as eligible
+   * for collaborative open: it stands up a `DocumentSyncProvider`,
+   * populates `host.collaboration` on the EditorHost, and the editor
+   * component is expected to call `useCollaborativeEditor` from
+   * `@nimbalyst/extension-sdk` to wire its binding.
+   *
+   * `awarenessFields` is advisory metadata used for docs / debugging --
+   * it does not gate runtime behaviour. List the extra awareness keys
+   * (beyond the standard `user`, `pointer`, `selection`) your editor
+   * publishes, e.g. `['selectedElementIds', 'tool']` for Excalidraw or
+   * `['editingNodeId']` for Mindmap.
+   */
+  collaboration?: {
+    supported: boolean;
+    awarenessFields?: string[];
+  };
 }
 
 export interface DocumentHeaderContribution {
@@ -451,6 +742,16 @@ export interface ThemeContribution {
    * Missing colors will fall back to the appropriate base theme.
    */
   colors: ThemeColors;
+
+  /**
+   * Optional Monaco editor theme definition. When present, the runtime
+   * registers a Monaco theme (via `monaco.editor.defineTheme`) using the
+   * namespaced theme id and routes Monaco-backed editors to it whenever
+   * this theme is active. When absent, Monaco-backed editors fall back to
+   * the appropriate base Monaco theme (`vs` / `vs-dark`) based on
+   * `isDark`.
+   */
+  monaco?: MonacoThemeContribution;
 }
 
 /**
@@ -474,6 +775,18 @@ export interface ExtensionModule {
 
   /** Markdown transformers for Lexical */
   transformers?: Record<string, unknown>;
+
+  /**
+   * `LexicalExtension` instances exported by the extension module. Keys
+   * match names listed in `contributions.lexicalExtensions`. Each value
+   * should be the return value of `defineExtension(...)` from `lexical`.
+   *
+   * The host treats the values as opaque (`unknown`) at this layer so the
+   * extension SDK does not have to pin a specific version of
+   * `@lexical/extension`. The host validates and consumes them through
+   * the editor's `LexicalExtensionComposer` pipeline.
+   */
+  lexicalExtensions?: Record<string, unknown>;
 
   /** Components that render inside the host editor */
   hostComponents?: Record<string, ComponentType>;
@@ -516,6 +829,48 @@ export interface JSONSchemaProperty {
 }
 
 /**
+ * Declares what kind of document access an AI tool needs.
+ *
+ * This is intentionally separate from `scope`: a globally available tool may
+ * still operate on a file, and an editor-scoped tool may only need filesystem
+ * reads. The host uses this value to decide whether it should mount an editor
+ * and whether the tool is allowed to persist editor mutations.
+ */
+export type ExtensionAIToolAccess =
+  | {
+      /**
+       * Tool reads/writes through explicit services such as
+       * `context.extensionContext.services.filesystem`. The host must not mount
+       * an editor, provide `editorAPI`, or flush editor state for this tool.
+       *
+       * This is the safe default for compilers, analyzers, indexers, symbol
+       * lookup, and any tool that can operate on latest disk content. A
+       * `filePath` argument never by itself requires editor access.
+       */
+      kind: 'filesystem';
+    }
+  | {
+      /**
+       * Tool needs a mounted editor API to inspect editor state but does not
+       * mutate document content. The host provides the editor API (preferring a
+       * visible editor when the file is open, otherwise a hidden one) but never
+       * flushes editor state after the tool runs.
+       */
+      kind: 'editor-read';
+    }
+  | {
+      /**
+       * Tool intentionally mutates editor state. The host mounts an editor if
+       * needed and persists the change after the tool returns through its
+       * conflict-aware save path: the write is committed only if disk still
+       * matches what the editor loaded, otherwise it is aborted and the editor
+       * reloads from disk so an out-of-band write is never clobbered. Authors do
+       * not configure this; the host owns the commit and conflict policy.
+       */
+      kind: 'editor-write';
+    };
+
+/**
  * AI tool definition from an extension.
  */
 export interface ExtensionAITool {
@@ -549,6 +904,39 @@ export interface ExtensionAITool {
    * If omitted, the host may inherit the extension's custom editor patterns.
    */
   editorFilePatterns?: string[];
+
+  /**
+   * Declares the document/editor access this tool needs.
+   *
+   * Use `filesystem` for CAD/compiler/analyzer tools that read latest disk
+   * content through services. Use `editor-read` only when the tool needs a
+   * mounted editor API without mutating content. Use `editor-write` when the
+   * tool intentionally changes editor content.
+   */
+  access?: ExtensionAIToolAccess;
+
+  /**
+   * Legacy read-only flag.
+   *
+   * @deprecated Use `access: { kind: 'filesystem' }` for disk-first tools or
+   * `access: { kind: 'editor-read' }` for tools that need read-only editor
+   * state. `readOnly: true` is treated as `editor-read` by compatibility code.
+   */
+  readOnly?: boolean;
+
+  /**
+   * Opt the tool in to the voice agent (OpenAI Realtime), in addition to the
+   * coding agent. When `true`, the host converts this tool's `inputSchema` into
+   * a Realtime function-tool and exposes it during a voice session; calls are
+   * dispatched through the same execution path as the coding agent. The same
+   * `handler`/`inputSchema` serves both agents. Defaults to `false` -- tools
+   * target only the coding agent unless they opt in.
+   *
+   * Voice tools should generally be `scope: 'global'` and self-contained (low
+   * latency, no required editor mount), since the voice agent has no reliable
+   * active-file context.
+   */
+  voiceAgent?: boolean;
 
   /** Handler function */
   handler: (
@@ -602,6 +990,14 @@ export interface ExtensionServices {
 
   /** Configuration service (only available if contributions.configuration is defined) */
   configuration?: ExtensionConfigurationService;
+
+  /**
+   * Collaboration service. Used by editors that ship a
+   * CollabContentAdapter to plug into host-level operations on their
+   * shared Y.Doc (re-upload, history, export, AI editing, search).
+   * See `packages/extension-sdk-docs/custom-editors.md`.
+   */
+  collab: ExtensionCollabService;
 }
 
 /**
@@ -690,12 +1086,73 @@ export interface ExtensionUIService {
   showError(message: string): void;
 }
 
+/**
+ * Status of the agent task the voice agent is driving (see
+ * {@link ExtensionAIService.getTaskStatus}).
+ */
+export interface AgentTaskStatus {
+  /** The coding session id the voice agent targets. */
+  sessionId: string;
+  /** Session title, if one has been set. */
+  title: string | null;
+  /** Raw session status. */
+  status: 'idle' | 'running' | 'waiting_for_input' | 'error';
+  /** True while the agent is actively working. */
+  running: boolean;
+  /** True when the agent has paused for an interactive prompt. */
+  waitingForInput: boolean;
+}
+
 export interface ExtensionAIService {
   /** Register an AI tool */
   registerTool(tool: ExtensionAITool): Disposable;
 
   /** Register a context provider */
   registerContextProvider(provider: ExtensionContextProvider): Disposable;
+
+  /**
+   * Register a provider that contributes text to the voice agent's session
+   * context at session start (e.g. top-N grounding facts). The host calls every
+   * registered provider when a voice session begins, caps each provider's output,
+   * and appends the concatenated result to the voice agent's instructions. Use
+   * this for zero-latency grounding the agent should know up front; expose
+   * on-demand lookups as `voiceAgent: true` tools instead.
+   */
+  registerVoiceContextProvider(provider: VoiceContextProvider): Disposable;
+
+  /**
+   * Report the status of the agent task the voice agent is currently driving in
+   * this workspace — the coding session it targets with `submit_agent_prompt`
+   * for `/design` / `/implement`. Lets a `voiceAgent: true` tool answer "is that
+   * still running?" or "is it done yet?" verbally without blocking on the agent.
+   *
+   * Returns `null` when there is no active voice-linked session. `running` is
+   * true while the agent is working; `waitingForInput` is true when it has
+   * paused for an interactive prompt.
+   */
+  getTaskStatus(workspacePath?: string): Promise<AgentTaskStatus | null>;
+
+  /**
+   * Call one of this extension's own backend-module MCP tools from the renderer
+   * and return its parsed JSON result.
+   *
+   * Backend modules run in a utility process the renderer cannot reach directly;
+   * voiceAgent / coding-agent tool calls route main->backend without a renderer
+   * hop, but a settings panel or voice context provider sometimes needs READ
+   * access to the same tools (e.g. live index status, listing stored facts).
+   * This is that read bridge: pass the advertised, namespaced tool name
+   * (`<extShort>.<tool>`, e.g. `memory.status`) and its arguments; the host
+   * resolves the active workspace, routes to the backend module, and returns the
+   * tool's result. Throws if the tool errors or the module is not running.
+   *
+   * Requires the `ai` manifest permission. `workspacePath` is optional — the
+   * host falls back to the window's active workspace when omitted.
+   */
+  callBackendTool(
+    toolName: string,
+    args?: Record<string, unknown>,
+    workspacePath?: string
+  ): Promise<unknown>;
 
   /** Send a prompt to the AI and get a response. Defaults to claude-code provider. Creates a session. */
   sendPrompt(options: {
@@ -839,6 +1296,35 @@ export interface ExtensionContextProvider {
 
   /** Generate context string */
   provideContext(): Promise<string>;
+}
+
+/**
+ * Information passed to a voice context provider when a voice session starts.
+ */
+export interface VoiceContextProviderInput {
+  /** Path to the current workspace, if one is open. */
+  workspacePath?: string;
+  /** Path to the active file, if any. */
+  activeFilePath?: string;
+  /** The voice (Realtime) session id. */
+  voiceSessionId?: string;
+  /** The linked coding session id voice commands target. */
+  codingSessionId?: string;
+}
+
+/**
+ * A voice session context provider contributed by an extension. Returns a
+ * string (sync or async) to inject into the voice agent's session context at
+ * start. Keep output small -- the host caps each provider's contribution and the
+ * Realtime context window is expensive.
+ */
+export interface VoiceContextProvider {
+  /** Provider identifier (namespaced per extension by the host). */
+  id: string;
+  /** Priority (higher = earlier in the injected context). Defaults to 0. */
+  priority?: number;
+  /** Produce the context string for this session. */
+  provideContext(input: VoiceContextProviderInput): string | Promise<string>;
 }
 
 export interface Disposable {

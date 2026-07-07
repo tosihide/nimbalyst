@@ -10,7 +10,7 @@
  */
 
 import React, { useState, useCallback, useRef, useEffect, useMemo } from 'react';
-import { useSetAtom } from 'jotai';
+import { useAtomValue, useSetAtom } from 'jotai';
 import { $isHeadingNode } from '@lexical/rich-text';
 import { $getRoot } from 'lexical';
 import {
@@ -27,13 +27,18 @@ import {
 } from '@nimbalyst/runtime';
 import { $generateHtmlFromNodes } from '@lexical/html';
 import { copyToClipboard, ProviderIcon } from '@nimbalyst/runtime';
-import { revealFolderAtom, revealFileAtom, openFileRequestAtom, setWindowModeAtom, historyDialogFileAtom } from '../../store';
+import { historyDialogFileAtom } from '../../store';
 import { useFloatingMenu, FloatingPortal } from '../../hooks/useFloatingMenu';
 import { getDocumentService } from '../../services/RendererDocumentService';
 import { isWorktreePath } from '../../../shared/pathUtils';
 import { CommonFileActions } from '../CommonFileActions';
+import { FilePathBreadcrumb } from '../common/FilePathBreadcrumb';
 import { dialogRef, DIALOG_IDS } from '../../dialogs';
 import type { ShareDialogData } from '../../dialogs';
+import { useLocalFileSharedDocLink } from '../../hooks/useCollabLocalOrigin';
+import { sharedDocumentsAtom, pendingCollabDocumentAtom, activeTeamOrgIdAtom, buildSharedDocumentDeepLink } from '../../store/atoms/collabDocuments';
+import { setWindowModeAtom } from '../../store/atoms/windowMode';
+import { getCollabNodeName, getCollabParentPath, normalizeCollabPath } from '../CollabMode/collabTree';
 
 // Built-in tracker types that support full-document mode
 const TRACKER_TYPES: TrackerTypeInfo[] = [
@@ -99,12 +104,14 @@ interface ExtensionMenuItem {
   label: string;
   icon?: string;
   onClick: () => void;
+  disabled?: boolean;
 }
 
 interface UnifiedEditorHeaderBarProps {
   filePath: string;
   fileName: string;
   workspaceId?: string;
+  breadcrumbContent?: React.ReactNode;
 
   // Editor type info
   isMarkdown?: boolean;
@@ -129,6 +136,7 @@ interface UnifiedEditorHeaderBarProps {
 
   // Extension menu items (contributed by custom editors)
   extensionMenuItems?: ExtensionMenuItem[];
+  extraActionItems?: ExtensionMenuItem[];
   onOpenExtensionSettings?: () => void;
 
   // Debug tree toggle (dev mode only)
@@ -136,12 +144,20 @@ interface UnifiedEditorHeaderBarProps {
 
   // Signal that content changed (e.g., frontmatter injected), so document headers re-check
   onContentChanged?: () => void;
+
+  // Visibility overrides for non-local editor shells
+  showAIButton?: boolean;
+  showShareLinkButton?: boolean;
+  showSharedDocButton?: boolean;
+  showHistoryAction?: boolean;
+  showCommonFileActions?: boolean;
 }
 
 export const UnifiedEditorHeaderBar: React.FC<UnifiedEditorHeaderBarProps> = ({
   filePath,
   fileName,
   workspaceId,
+  breadcrumbContent,
   isMarkdown = false,
   isCustomEditor = false,
   extensionId,
@@ -154,15 +170,16 @@ export const UnifiedEditorHeaderBar: React.FC<UnifiedEditorHeaderBarProps> = ({
   onSwitchToAgentMode,
   onOpenSessionInChat,
   extensionMenuItems = [],
+  extraActionItems = [],
   onOpenExtensionSettings,
   onToggleDebugTree,
   onContentChanged,
+  showAIButton,
+  showShareLinkButton = isMarkdown,
+  showSharedDocButton = true,
+  showHistoryAction = true,
+  showCommonFileActions = true,
 }) => {
-  // Jotai atom for folder navigation and mode switching
-  const revealFolder = useSetAtom(revealFolderAtom);
-  const revealFile = useSetAtom(revealFileAtom);
-  const setOpenFileRequest = useSetAtom(openFileRequestAtom);
-  const setWindowMode = useSetAtom(setWindowModeAtom);
   const openHistoryDialog = useSetAtom(historyDialogFileAtom);
 
   // Dropdown states
@@ -174,6 +191,67 @@ export const UnifiedEditorHeaderBar: React.FC<UnifiedEditorHeaderBarProps> = ({
   const actionsMenu = useFloatingMenu({ placement: 'bottom-end' });
   const showActionsMenu = actionsMenu.isOpen;
   const setShowActionsMenu = actionsMenu.setIsOpen;
+  const sharedDocMenu = useFloatingMenu({ placement: 'bottom-end' });
+  const sharedDocLink = useLocalFileSharedDocLink(workspaceId ?? '', filePath);
+  const sharedDocuments = useAtomValue(sharedDocumentsAtom);
+  const teamOrgId = useAtomValue(activeTeamOrgIdAtom);
+  const setWindowMode = useSetAtom(setWindowModeAtom);
+  const setPendingCollabDoc = useSetAtom(pendingCollabDocumentAtom);
+
+  // Look up the shared document by id so we can show its name + folder
+  const sharedDocument = useMemo(() => {
+    const id = sharedDocLink.binding?.documentId;
+    if (!id) return null;
+    return sharedDocuments.find((doc) => doc.documentId === id) ?? null;
+  }, [sharedDocLink.binding?.documentId, sharedDocuments]);
+
+  const sharedDocNameAndFolder = useMemo(() => {
+    if (sharedDocument?.title) {
+      const normalized = normalizeCollabPath(sharedDocument.title);
+      return {
+        name: getCollabNodeName(normalized) || sharedDocument.title,
+        folder: getCollabParentPath(normalized),
+      };
+    }
+    // Fall back to the local source basename if the shared-docs index hasn't loaded yet
+    if (sharedDocLink.binding?.sourceBasename) {
+      return { name: sharedDocLink.binding.sourceBasename, folder: null };
+    }
+    return null;
+  }, [sharedDocument, sharedDocLink.binding?.sourceBasename]);
+
+  const handleOpenSharedDoc = useCallback(() => {
+    const documentId = sharedDocLink.binding?.documentId;
+    if (!documentId) return;
+    setWindowMode('collab');
+    setPendingCollabDoc({
+      documentId,
+      documentType: sharedDocument?.documentType ?? sharedDocLink.binding?.documentType,
+    });
+    sharedDocMenu.setIsOpen(false);
+  }, [
+    sharedDocLink.binding?.documentId,
+    sharedDocLink.binding?.documentType,
+    sharedDocument?.documentType,
+    setWindowMode,
+    setPendingCollabDoc,
+    sharedDocMenu,
+  ]);
+
+  // Copy a deep link to the linked shared document (only meaningful for shared docs)
+  const sharedDocDeepLinkAvailable = Boolean(sharedDocLink.binding?.documentId && teamOrgId);
+  const handleCopyDeepLink = useCallback(async () => {
+    const documentId = sharedDocLink.binding?.documentId;
+    if (!documentId || !teamOrgId) return;
+    const url = buildSharedDocumentDeepLink(documentId, teamOrgId);
+    try {
+      await copyToClipboard(url);
+      console.log('[UnifiedHeaderBar] Shared document link copied to clipboard');
+    } catch (err) {
+      console.error('[UnifiedHeaderBar] Failed to copy shared document link:', err);
+    }
+    setShowActionsMenu(false);
+  }, [sharedDocLink.binding?.documentId, teamOrgId, setShowActionsMenu]);
 
   // Dev mode check
   const isDevMode = import.meta.env.DEV;
@@ -191,56 +269,6 @@ export const UnifiedEditorHeaderBar: React.FC<UnifiedEditorHeaderBarProps> = ({
   // Refs for click-outside handling
   const aiSessionsButtonRef = useRef<HTMLButtonElement>(null);
   const tocButtonRef = useRef<HTMLButtonElement>(null);
-
-  // workspaceId is actually the workspace path (naming is misleading but correct)
-  const workspacePath = workspaceId;
-
-  // Parse breadcrumb segments from file path relative to workspace root
-  // Returns array of { name, folderPath } where folderPath is the absolute path to that folder
-  const breadcrumbSegments = React.useMemo(() => {
-    if (!workspacePath) {
-      // Fallback: just show the filename
-      return [{ name: fileName, folderPath: null }];
-    }
-
-    // Get path relative to workspace root
-    let relativePath = filePath;
-    if (filePath.startsWith(workspacePath)) {
-      relativePath = filePath.slice(workspacePath.length);
-      // Remove leading slash if present
-      if (relativePath.startsWith('/')) {
-        relativePath = relativePath.slice(1);
-      }
-    }
-
-    // Split into segments and compute folder paths
-    const parts = relativePath.split('/').filter(Boolean);
-    return parts.map((name, index) => {
-      // For folder segments, compute the absolute folder path
-      // For the last segment (filename), folderPath is null
-      const isFile = index === parts.length - 1;
-      const folderPath = isFile
-        ? null
-        : workspacePath + '/' + parts.slice(0, index + 1).join('/');
-      return { name, folderPath };
-    });
-  }, [filePath, workspacePath, fileName]);
-
-  // Handle breadcrumb click - switches to files mode and opens the file/folder
-  const handleBreadcrumbClick = useCallback((folderPath: string | null, targetFilePath?: string) => {
-    if (folderPath) {
-      // Folder segment: switch to files mode and reveal the folder in the tree
-      setWindowMode('files');
-      revealFolder(folderPath);
-      return;
-    }
-    if (targetFilePath) {
-      // Filename segment: open the file in files mode and reveal it in the tree
-      // (reveal clears any active filter so the file becomes visible)
-      setOpenFileRequest({ path: targetFilePath, ts: Date.now() });
-      revealFile(targetFilePath);
-    }
-  }, [revealFolder, revealFile, setOpenFileRequest, setWindowMode]);
 
   // Load AI sessions
   const loadAISessions = useCallback(async () => {
@@ -397,7 +425,7 @@ export const UnifiedEditorHeaderBar: React.FC<UnifiedEditorHeaderBarProps> = ({
         // Cast to LexicalEditor for $generateHtmlFromNodes
         const editorAsLexical = lexicalEditor as unknown as import('lexical').LexicalEditor;
         const content = $generateHtmlFromNodes(editorAsLexical);
-        html = wrapWithPrintStyles(content);
+        html = wrapWithPrintStyles(content, fileName);
       });
 
       // Export to PDF via main process
@@ -405,6 +433,8 @@ export const UnifiedEditorHeaderBar: React.FC<UnifiedEditorHeaderBarProps> = ({
         html,
         outputPath,
         pageSize: 'Letter',
+        generateDocumentOutline: true,
+        generateTaggedPDF: true,
       });
 
       if (result.success) {
@@ -568,9 +598,14 @@ export const UnifiedEditorHeaderBar: React.FC<UnifiedEditorHeaderBarProps> = ({
     if (days < 7) return `${days}d ago`;
     return new Date(timestamp).toLocaleDateString();
   };
+  const formatSharedTimestamp = (isoTimestamp: string): string => {
+    const timestamp = new Date(isoTimestamp).getTime();
+    if (Number.isNaN(timestamp)) return isoTimestamp;
+    return `${new Date(timestamp).toLocaleString()} (${formatRelativeTime(timestamp)})`;
+  };
 
   // Determine if we should show AI button (shown in both editor and agent modes)
-  const showAIButton = Boolean(workspaceId);
+  const shouldShowAIButton = showAIButton ?? Boolean(workspaceId);
   // Group sessions: current workspace first, then others
   const isInWorktree = workspaceId ? isWorktreePath(workspaceId) : false;
   const currentWorkspaceSessions = useMemo(() => aiSessions.filter(s => s.isCurrentWorkspace), [aiSessions]);
@@ -581,50 +616,14 @@ export const UnifiedEditorHeaderBar: React.FC<UnifiedEditorHeaderBarProps> = ({
   const showTOCButton = isMarkdown && Boolean(lexicalEditor);
 
   return (
-    <div className="unified-editor-header-bar h-9 min-h-9 flex items-center justify-between px-3 shrink-0 bg-[var(--nim-bg)] border-b border-[var(--nim-border)]">
+      <div className="unified-editor-header-bar h-9 min-h-9 flex items-center justify-between px-3 shrink-0 bg-[var(--nim-bg)] border-b border-[var(--nim-border)]">
       {/* Left: Breadcrumb Path */}
-      <div className="unified-header-breadcrumb flex items-center gap-1.5 text-[13px] min-w-0 overflow-hidden">
-        {breadcrumbSegments.map((segment, index) => {
-          const isLast = index === breadcrumbSegments.length - 1;
-          const isClickable = (!isLast && segment.folderPath) || (isLast && Boolean(filePath));
-          return (
-            <React.Fragment key={index}>
-              <span
-                className={`breadcrumb-segment flex items-center gap-1 whitespace-nowrap ${
-                  isLast
-                    ? 'breadcrumb-filename text-[var(--nim-text)] font-medium'
-                    : 'text-[var(--nim-text-muted)]'
-                } ${
-                  isClickable
-                    ? 'breadcrumb-clickable cursor-pointer rounded py-0.5 px-1 -my-0.5 -mx-1 transition-colors duration-150 hover:text-[var(--nim-text)] hover:bg-[var(--nim-bg-hover)]'
-                    : ''
-                }`}
-                onClick={isClickable ? () => handleBreadcrumbClick(segment.folderPath, isLast ? filePath : undefined) : undefined}
-                title={isClickable ? `Go to ${segment.name} in file tree` : undefined}
-              >
-                {!isLast && (
-                  <svg className="breadcrumb-icon w-3.5 h-3.5 opacity-70 shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                    <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/>
-                  </svg>
-                )}
-                {isLast && (
-                  <svg className="breadcrumb-icon w-3.5 h-3.5 opacity-80 shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                    <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
-                    <polyline points="14 2 14 8 20 8"/>
-                  </svg>
-                )}
-                {segment.name}
-              </span>
-              {!isLast && <span className="breadcrumb-separator text-[var(--nim-text-faint)] text-[11px]">/</span>}
-            </React.Fragment>
-          );
-        })}
-      </div>
+      {breadcrumbContent ?? <FilePathBreadcrumb filePath={filePath} workspacePath={workspaceId} />}
 
       {/* Right: Action Buttons */}
       <div className="unified-header-actions flex items-center gap-1">
         {/* AI Sessions Button */}
-        {showAIButton && (
+        {shouldShowAIButton && (
           <div className="unified-header-dropdown-container relative">
             <button
               ref={aiSessionsButtonRef}
@@ -760,7 +759,7 @@ export const UnifiedEditorHeaderBar: React.FC<UnifiedEditorHeaderBarProps> = ({
         )}
 
         {/* Share Link Button (markdown files only) */}
-        {isMarkdown && (
+        {showShareLinkButton && (
           <button
             className="unified-header-button nim-btn-icon w-7 h-7 rounded border-none bg-transparent cursor-pointer flex items-center justify-center transition-all duration-150 text-[var(--nim-text-muted)] hover:bg-[var(--nim-bg-hover)] hover:text-[var(--nim-text)]"
             onClick={handleShareLink}
@@ -774,6 +773,88 @@ export const UnifiedEditorHeaderBar: React.FC<UnifiedEditorHeaderBarProps> = ({
               <line x1="15.41" y1="6.51" x2="8.59" y2="10.49"/>
             </svg>
           </button>
+        )}
+
+        {/* Shared Doc Button - local file is already linked to a team-shared doc */}
+        {showSharedDocButton && sharedDocLink.binding && (
+          <div className="unified-header-dropdown-container relative">
+            <button
+              ref={sharedDocMenu.refs.setReference}
+              className={`unified-header-button unified-header-shared-linked nim-btn-icon w-7 h-7 rounded border-none bg-transparent cursor-pointer flex items-center justify-center transition-all duration-150 text-[var(--nim-primary)] hover:bg-[var(--nim-bg-hover)] ${
+                sharedDocMenu.isOpen ? 'active bg-[var(--nim-bg-tertiary)]' : ''
+              }`}
+              onClick={() => sharedDocMenu.setIsOpen(!sharedDocMenu.isOpen)}
+              title="Linked to team shared document"
+              {...sharedDocMenu.getReferenceProps()}
+            >
+              <svg className="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                <path d="M20 16.58A5 5 0 0 0 18 7h-1.26A8 8 0 1 0 4 15.25" />
+                <path d="m8 17 4 4 4-4" />
+                <path d="M12 12v9" />
+              </svg>
+            </button>
+
+            {sharedDocMenu.isOpen && (
+              <FloatingPortal>
+                <div
+                  ref={sharedDocMenu.refs.setFloating}
+                  style={sharedDocMenu.floatingStyles}
+                  className="min-w-[260px] overflow-hidden rounded-md z-[1000] py-1 bg-[var(--nim-bg)] border border-[var(--nim-border)] shadow-[0_4px_12px_rgba(0,0,0,0.3)]"
+                  {...sharedDocMenu.getFloatingProps()}
+                >
+                  <div className="px-3 py-2 border-b border-[var(--nim-border)]">
+                    <div className="text-[11px] font-semibold uppercase tracking-wider text-[var(--nim-text-faint)]">
+                      Shared Document
+                    </div>
+                    <div className="mt-1 text-[13px] text-[var(--nim-text)]">
+                      Shared to team on {formatSharedTimestamp(sharedDocLink.binding.createdAt)}
+                    </div>
+                  </div>
+                  {sharedDocNameAndFolder && (
+                    <button
+                      className="shared-doc-open-link dropdown-item w-full py-2 px-3 border-none bg-transparent text-[13px] text-left cursor-pointer flex items-start gap-2.5 transition-colors duration-150 text-[var(--nim-text)] hover:bg-[var(--nim-bg-hover)]"
+                      onClick={handleOpenSharedDoc}
+                      title="Open shared document"
+                    >
+                      <svg className="w-4 h-4 mt-[2px] opacity-70 shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                        <path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6" />
+                        <polyline points="15 3 21 3 21 9" />
+                        <line x1="10" y1="14" x2="21" y2="3" />
+                      </svg>
+                      <div className="min-w-0 flex-1 flex flex-col leading-tight">
+                        <span className="shared-doc-open-link-name truncate text-[var(--nim-text)]">
+                          {sharedDocNameAndFolder.name}
+                        </span>
+                        {sharedDocNameAndFolder.folder && (
+                          <sub className="shared-doc-open-link-folder text-[11px] text-[var(--nim-text-faint)] truncate not-italic align-baseline mt-0.5">
+                            {sharedDocNameAndFolder.folder}
+                          </sub>
+                        )}
+                      </div>
+                    </button>
+                  )}
+                  <button
+                    className="dropdown-item w-full py-2 px-3 border-none bg-transparent text-[13px] text-left cursor-pointer flex items-center gap-2.5 transition-colors duration-150 text-[var(--nim-text)] hover:bg-[var(--nim-bg-hover)] disabled:opacity-50 disabled:cursor-not-allowed"
+                    disabled={sharedDocLink.busyAction !== null}
+                    onClick={async () => {
+                      const success = await sharedDocLink.reuploadToSharedDoc();
+                      if (success) {
+                        await sharedDocLink.refresh();
+                        sharedDocMenu.setIsOpen(false);
+                      }
+                    }}
+                  >
+                    <svg className="w-4 h-4 opacity-70" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                      <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
+                      <polyline points="7 10 12 5 17 10" />
+                      <line x1="12" y1="5" x2="12" y2="16" />
+                    </svg>
+                    Re-upload to Shared Doc
+                  </button>
+                </div>
+              </FloatingPortal>
+            )}
+          </div>
         )}
 
         {/* Actions Menu Button */}
@@ -820,19 +901,35 @@ export const UnifiedEditorHeaderBar: React.FC<UnifiedEditorHeaderBarProps> = ({
               )}
 
               {/* View History */}
-              <button
-                className="dropdown-item w-full py-2 px-3 border-none bg-transparent text-[13px] text-left cursor-pointer flex items-center gap-2.5 transition-colors duration-150 text-[var(--nim-text)] hover:bg-[var(--nim-bg-hover)]"
-                onClick={() => {
-                  openHistoryDialog(filePath);
-                  setShowActionsMenu(false);
-                }}
-              >
-                <svg className="w-4 h-4 opacity-70" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                  <circle cx="12" cy="12" r="10"/>
-                  <polyline points="12 6 12 12 16 14"/>
-                </svg>
-                View History
-              </button>
+              {showHistoryAction && (
+                <button
+                  className="dropdown-item w-full py-2 px-3 border-none bg-transparent text-[13px] text-left cursor-pointer flex items-center gap-2.5 transition-colors duration-150 text-[var(--nim-text)] hover:bg-[var(--nim-bg-hover)]"
+                  onClick={() => {
+                    openHistoryDialog(filePath);
+                    setShowActionsMenu(false);
+                  }}
+                >
+                  <svg className="w-4 h-4 opacity-70" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                    <circle cx="12" cy="12" r="10"/>
+                    <polyline points="12 6 12 12 16 14"/>
+                  </svg>
+                  View History
+                </button>
+              )}
+
+              {/* Copy link (shared docs only) */}
+              {sharedDocDeepLinkAvailable && (
+                <button
+                  className="dropdown-item copy-shared-doc-link w-full py-2 px-3 border-none bg-transparent text-[13px] text-left cursor-pointer flex items-center gap-2.5 transition-colors duration-150 text-[var(--nim-text)] hover:bg-[var(--nim-bg-hover)]"
+                  onClick={handleCopyDeepLink}
+                >
+                  <svg className="w-4 h-4 opacity-70" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                    <path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71" />
+                    <path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71" />
+                  </svg>
+                  Copy link
+                </button>
+              )}
 
               {/* Markdown-specific actions */}
               {isMarkdown && (
@@ -965,17 +1062,44 @@ export const UnifiedEditorHeaderBar: React.FC<UnifiedEditorHeaderBarProps> = ({
                 </button>
               )}
 
+              {/* Extra shell-specific actions */}
+              {extraActionItems.length > 0 && (
+                <>
+                  <div className="dropdown-divider h-px my-1 bg-[var(--nim-border)]" />
+                  {extraActionItems.map((item, index) => (
+                    <button
+                      key={`extra-action-${index}-${item.label}`}
+                      className="dropdown-item w-full py-2 px-3 border-none bg-transparent text-[13px] text-left cursor-pointer flex items-center gap-2.5 transition-colors duration-150 text-[var(--nim-text)] hover:bg-[var(--nim-bg-hover)] disabled:opacity-50 disabled:cursor-not-allowed"
+                      disabled={item.disabled}
+                      onClick={() => {
+                        item.onClick();
+                        setShowActionsMenu(false);
+                      }}
+                    >
+                      {item.icon && (
+                        <span className="material-symbols-outlined text-lg opacity-70">{item.icon}</span>
+                      )}
+                      {item.label}
+                    </button>
+                  ))}
+                </>
+              )}
+
               {/* Common file actions (Open in Default App, External Editor, Finder, Copy Path, Share) */}
-              <div className="dropdown-divider h-px my-1 bg-[var(--nim-border)]" />
-              <CommonFileActions
-                filePath={filePath}
-                fileName={fileName}
-                onClose={() => setShowActionsMenu(false)}
-                menuItemClass="dropdown-item w-full py-2 px-3 border-none bg-transparent text-[13px] text-left cursor-pointer flex items-center gap-2.5 transition-colors duration-150 text-[var(--nim-text)] hover:bg-[var(--nim-bg-hover)]"
-                separatorClass="dropdown-divider h-px my-1 bg-[var(--nim-border)]"
-                iconSize={16}
-                useButtons={true}
-              />
+              {showCommonFileActions && (
+                <>
+                  <div className="dropdown-divider h-px my-1 bg-[var(--nim-border)]" />
+                  <CommonFileActions
+                    filePath={filePath}
+                    fileName={fileName}
+                    onClose={() => setShowActionsMenu(false)}
+                    menuItemClass="dropdown-item w-full py-2 px-3 border-none bg-transparent text-[13px] text-left cursor-pointer flex items-center gap-2.5 transition-colors duration-150 text-[var(--nim-text)] hover:bg-[var(--nim-bg-hover)]"
+                    separatorClass="dropdown-divider h-px my-1 bg-[var(--nim-border)]"
+                    iconSize={16}
+                    useButtons={true}
+                  />
+                </>
+              )}
 
               {/* Extension Menu Items */}
               {extensionMenuItems.length > 0 && (
@@ -987,7 +1111,8 @@ export const UnifiedEditorHeaderBar: React.FC<UnifiedEditorHeaderBarProps> = ({
                   {extensionMenuItems.map((item, index) => (
                     <button
                       key={index}
-                      className="dropdown-item w-full py-2 px-3 border-none bg-transparent text-[13px] text-left cursor-pointer flex items-center gap-2.5 transition-colors duration-150 text-[var(--nim-text)] hover:bg-[var(--nim-bg-hover)]"
+                      className="dropdown-item w-full py-2 px-3 border-none bg-transparent text-[13px] text-left cursor-pointer flex items-center gap-2.5 transition-colors duration-150 text-[var(--nim-text)] hover:bg-[var(--nim-bg-hover)] disabled:opacity-50 disabled:cursor-not-allowed"
+                      disabled={item.disabled}
                       onClick={() => {
                         item.onClick();
                         setShowActionsMenu(false);

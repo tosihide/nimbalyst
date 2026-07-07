@@ -39,7 +39,7 @@ export const feedbackToolSchemas = [
   },
   {
     name: 'feedback_open_github_issue',
-    description: `Open a pre-filled GitHub new-issue page in the user's browser, targeting ${FEEDBACK_REPO}. Picks the right template (bug_report.md or feature_request.md) and label based on \`kind\`. Returns { ok: true } when the URL was short enough to include the body. Returns { ok: false, reason: "too-long", url } when the body would have been truncated — in that case, show the body in chat as a code block, open the returned URL (title only), and tell the user to paste. The user must approve before this is called.`,
+    description: `Open a pre-filled GitHub new-issue page in the user's browser, targeting ${FEEDBACK_REPO}. Picks the right issue-form template (bug_report.yml or feature_request.yml) based on \`kind\` and routes the body into the template's primary textarea field. Type ("Bug" / "Feature") and the \`status:needs-triage\` label come from the template's frontmatter. Returns { ok: true } when the URL was short enough to include the body. Returns { ok: false, reason: "too-long", url } when the body would have been truncated — in that case, show the body in chat as a code block, open the returned URL (title only), and tell the user to paste. The user must approve before this is called.`,
     inputSchema: {
       type: 'object',
       properties: {
@@ -70,14 +70,19 @@ function jsonResult(value: unknown, isError = false): McpToolResult {
   return textResult(JSON.stringify(value, null, 2), isError);
 }
 
-export function handleFeedbackAnonymizeText(args: any): McpToolResult {
+export function handleFeedbackAnonymizeText(args: any, callerWorkspacePath?: string): McpToolResult {
   const text = typeof args?.text === 'string' ? args.text : '';
   if (!text) {
     return textResult('Error: `text` is required and must be a non-empty string.', true);
   }
 
   const homeDir = os.homedir();
-  const result = anonymize(text, { homeDir });
+  // Scrub the reporting session's workspace path too, not just the home dir.
+  // Workspaces commonly live outside the home directory (e.g. C:\Projects\...),
+  // so without this they pass through verbatim and leak directory names into
+  // the public GitHub issue.
+  const workspacePaths = callerWorkspacePath ? [callerWorkspacePath] : [];
+  const result = anonymize(text, { homeDir, workspacePaths });
   return textResult(result);
 }
 

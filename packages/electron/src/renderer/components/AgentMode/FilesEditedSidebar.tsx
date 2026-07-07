@@ -49,9 +49,11 @@ import {
   type FileEditWithSession,
 } from '../../store/atoms/sessionFiles';
 import { registerSessionWorkspace, registerWorktreePath, loadInitialSessionFileState } from '../../store/listeners/fileStateListeners';
+import { isPathInWorkspace } from '../../../shared/pathUtils';
 import { FilesScopeDropdown } from './FilesScopeDropdown';
 import { GitOperationsPanel } from './GitOperationsPanel';
 import { TodoPanel } from './TodoPanel';
+import { TaskListPanel } from './TaskListPanel';
 import { TeammatePanel } from './TeammatePanel';
 import { TrackerPanel } from './TrackerPanel';
 
@@ -111,6 +113,16 @@ export const FilesEditedSidebar: React.FC<FilesEditedSidebarProps> = React.memo(
   const [filterToCurrentSession, setFilterToCurrentSession] = useState(false);
   const [isClearing, setIsClearing] = useState(false);
 
+  const isWorkspaceCommittableFile = useCallback(
+    (filePath: string) => isPathInWorkspace(filePath, effectiveWorkspacePath),
+    [effectiveWorkspacePath]
+  );
+
+  const workspaceScopedFileEdits = useMemo(
+    () => allFileEdits.filter((edit) => isWorkspaceCommittableFile(edit.filePath)),
+    [allFileEdits, isWorkspaceCommittableFile]
+  );
+
   // Register this session/worktree with central listener for state updates
   useEffect(() => {
     registerSessionWorkspace(workstreamId, effectiveWorkspacePath);
@@ -142,8 +154,22 @@ export const FilesEditedSidebar: React.FC<FilesEditedSidebarProps> = React.memo(
   // Staged files - used for checkbox state (per-workstream)
   // Checkboxes are always shown in the new unified design
   const stagedFilesArr = useAtomValue(workstreamStagedFilesAtom(workstreamId));
-  const stagedFiles = useMemo(() => new Set(stagedFilesArr), [stagedFilesArr]);
+  const stagedFiles = useMemo(
+    () => new Set(stagedFilesArr.filter((filePath) => isPathInWorkspace(filePath, effectiveWorkspacePath))),
+    [stagedFilesArr, effectiveWorkspacePath]
+  );
   const setStagedFilesAction = useSetAtom(setWorkstreamStagedFilesAtom);
+
+  useEffect(() => {
+    if (worktreeId) {
+      return;
+    }
+
+    const sanitized = stagedFilesArr.filter((filePath) => isPathInWorkspace(filePath, effectiveWorkspacePath));
+    if (sanitized.length !== stagedFilesArr.length) {
+      setStagedFilesAction({ workstreamId, files: sanitized });
+    }
+  }, [effectiveWorkspacePath, stagedFilesArr, setStagedFilesAction, workstreamId, worktreeId]);
 
   // File scope mode for filtering what files to show (workspace-level setting)
   const fileScopeMode = useAtomValue(agentFileScopeModeAtom);
@@ -162,12 +188,32 @@ export const FilesEditedSidebar: React.FC<FilesEditedSidebarProps> = React.memo(
   const handleGetDiff = useCallback(async (filePath: string) => {
     const gitWorkspacePath = worktreePath || workspacePath;
     if (!gitWorkspacePath) return null;
+    // Prefer session-aware diff (pre-edit baseline vs ai-edit snapshot) when an
+    // active session has touched this file. Falls back to git's working-tree
+    // diff when no session baseline exists. Without this, gitignored or
+    // untracked files always render as fully-added (all green) because
+    // git:file-diff synthesizes against /dev/null. See NIM-586.
+    if (activeSessionId) {
+      try {
+        const sessionDiff = await window.electronAPI.invoke(
+          'session:file-diff',
+          gitWorkspacePath,
+          activeSessionId,
+          filePath,
+        ) as { unifiedDiff: string; isBinary: boolean; source: string };
+        if (sessionDiff?.unifiedDiff && sessionDiff.unifiedDiff.trim().length > 0) {
+          return { unifiedDiff: sessionDiff.unifiedDiff, isBinary: sessionDiff.isBinary };
+        }
+      } catch {
+        // Fall through to git diff on any session-diff failure.
+      }
+    }
     return await window.electronAPI.invoke(
       'git:file-diff',
       gitWorkspacePath,
       { path: filePath, group: 'working' as const }
     ) as { unifiedDiff: string; isBinary: boolean };
-  }, [worktreePath, workspacePath]);
+  }, [activeSessionId, worktreePath, workspacePath]);
 
   const setGroupByDirectory = useCallback((value: boolean) => {
     if (effectiveWorkspacePath) {
@@ -229,7 +275,7 @@ export const FilesEditedSidebar: React.FC<FilesEditedSidebarProps> = React.memo(
     switch (fileScopeMode) {
       case 'current-changes':
         // Only show files that have uncommitted changes
-        return filtered.filter(edit => isFileUncommitted(edit.filePath));
+        return filtered.filter(edit => isWorkspaceCommittableFile(edit.filePath) && isFileUncommitted(edit.filePath));
 
       case 'session-files':
         // Show all files from session(s)
@@ -238,7 +284,9 @@ export const FilesEditedSidebar: React.FC<FilesEditedSidebarProps> = React.memo(
       case 'all-changes': {
         // Merge uncommitted session files with all other uncommitted files
         // For worktrees, use worktree changed files; for regular sessions, use workspace uncommitted files
-        const uncommittedFiltered = filtered.filter(edit => isFileUncommitted(edit.filePath));
+        const uncommittedFiltered = filtered.filter(
+          edit => isWorkspaceCommittableFile(edit.filePath) && isFileUncommitted(edit.filePath)
+        );
         const sessionFilePaths = new Set(uncommittedFiltered.map(f => f.filePath));
         let additionalFiles: FileEditWithSession[];
 
@@ -271,7 +319,7 @@ export const FilesEditedSidebar: React.FC<FilesEditedSidebarProps> = React.memo(
       default:
         return filtered;
     }
-  }, [allFileEdits, filterToCurrentSession, activeSessionId, fileScopeMode, isFileUncommitted, allUncommittedFiles, worktreeId, worktreePath, worktreeChangedFiles]);
+  }, [allFileEdits, filterToCurrentSession, activeSessionId, fileScopeMode, isWorkspaceCommittableFile, isFileUncommitted, allUncommittedFiles, worktreeId, worktreePath, worktreeChangedFiles]);
 
   // Memoize editedFiles array for GitOperationsPanel to prevent unnecessary re-renders
   const editedFilePaths = useMemo(() => {
@@ -279,8 +327,10 @@ export const FilesEditedSidebar: React.FC<FilesEditedSidebarProps> = React.memo(
       // For worktrees, include worktree changed files
       return [...fileEdits.map((f) => f.filePath), ...worktreeChangedFiles.map(f => f.path)];
     }
-    return fileEdits.map((f) => f.filePath);
-  }, [fileEdits, worktreeId, worktreeChangedFiles]);
+    return fileEdits
+      .map((f) => f.filePath)
+      .filter((filePath) => isWorkspaceCommittableFile(filePath));
+  }, [fileEdits, isWorkspaceCommittableFile, worktreeId, worktreeChangedFiles]);
 
   // Helper to convert absolute path to relative path for worktree comparisons
   const toRelativePath = useCallback((absolutePath: string) => {
@@ -560,6 +610,7 @@ export const FilesEditedSidebar: React.FC<FilesEditedSidebarProps> = React.memo(
             showCheckboxes={true}
             selectedFiles={worktreeId ? worktreeStagedFiles : stagedFiles}
             onSelectionChange={handleSelectionChange}
+            isFileSelectable={isWorkspaceCommittableFile}
             onSelectAll={handleSelectAll}
             onBulkSelectionChange={handleBulkSelectionChange}
             totalSessionFilesCount={totalSessionFilesCount}
@@ -590,6 +641,11 @@ export const FilesEditedSidebar: React.FC<FilesEditedSidebarProps> = React.memo(
       {/* Todo Panel - shows agent's current tasks */}
       {activeSessionId && (
         <TodoPanel sessionId={activeSessionId} />
+      )}
+
+      {/* Task List Panel - shows the SDK-native task queue (TaskCreate/TaskUpdate) */}
+      {activeSessionId && (
+        <TaskListPanel sessionId={activeSessionId} />
       )}
 
       {/* Teammate Panel - shows agent's current teammates */}

@@ -1,4 +1,4 @@
-import { BrowserWindow, app, shell, clipboard } from 'electron';
+import { BrowserWindow, app, shell, clipboard, nativeImage } from 'electron';
 import { readFileSync, readdirSync, statSync, existsSync, promises as fsPromises } from 'fs';
 import * as fs from 'fs';
 import { join, basename, dirname, extname } from 'path';
@@ -82,6 +82,10 @@ function getFileType(filePath: string): string {
 // Cache for quick open file searches
 const fileNameCaches = new Map<string, Array<{ path: string; name: string; type: 'file' | 'directory' }>>();
 
+interface QuickOpenFileNameSearchOptions {
+    fileMask?: string | null;
+}
+
 // Binary file extensions to exclude from QuickOpen results
 // Note: Images are NOT excluded - Nimbalyst can display them
 // Note: PDFs are NOT excluded - extensions may add support
@@ -103,10 +107,52 @@ const BINARY_EXTENSIONS = new Set([
     '.node', '.wasm',
 ]);
 
+const NIMBALYST_LOCAL_DIRNAME = 'nimbalyst-local';
+
+function globToRegex(glob: string): RegExp {
+    const escaped = glob.replace(/[.+^${}()|[\]\\]/g, '\\$&');
+    const pattern = escaped
+        .replace(/\*\*/g, '__DOUBLESTAR__')
+        .replace(/\*/g, '[^/]*')
+        .replace(/__DOUBLESTAR__/g, '.*')
+        .replace(/\?/g, '[^/]');
+    return new RegExp(`^${pattern}$`, 'i');
+}
+
+function parseQuickOpenFileMask(mask: string | null | undefined): RegExp[] {
+    if (!mask) return [];
+    return mask
+        .split(',')
+        .map(s => s.trim())
+        .filter(Boolean)
+        .map(globToRegex);
+}
+
+function matchesQuickOpenFileMask(filePath: string, patterns: RegExp[]): boolean {
+    if (patterns.length === 0) return true;
+    const normalizedPath = filePath.replace(/\\/g, '/');
+    const base = path.basename(normalizedPath);
+    return patterns.some(re => re.test(base) || re.test(normalizedPath));
+}
+
+function shouldIncludeQuickOpenCacheItem(
+    item: { path: string; type: 'file' | 'directory' },
+    maskPatterns: RegExp[]
+): boolean {
+    if (maskPatterns.length === 0) return true;
+    if (item.type === 'directory') return false;
+    return matchesQuickOpenFileMask(item.path, maskPatterns);
+}
+
 // Get the ripgrep binary path for the current platform.
 // Resolves the rg bundled by the @vscode/ripgrep package at
-// node_modules/@vscode/ripgrep/bin/rg(.exe).
+// node_modules/@vscode/ripgrep/bin/rg(.exe). Result is cached for
+// the lifetime of the process — search is called frequently and
+// the binary doesn't move.
+let cachedRgPath: string | null = null;
 function getRipgrepPath(): string {
+    if (cachedRgPath !== null) return cachedRgPath;
+
     const platform = os.platform();
     const rgBinaryName = platform === 'win32' ? 'rg.exe' : 'rg';
     const isPackaged = app.isPackaged;
@@ -146,29 +192,26 @@ function getRipgrepPath(): string {
                     console.warn('[SEARCH] Could not set executable permission on ripgrep:', e);
                 }
             }
-            console.log('[SEARCH] Found ripgrep at:', testPath);
+            // console.log('[SEARCH] Found ripgrep at:', testPath);
+            cachedRgPath = testPath;
             return testPath;
-        } else {
-            console.log('[SEARCH] ripgrep not found at:', testPath);
         }
     }
 
     // Fall back to system rg
-    console.warn('[SEARCH] Could not find bundled ripgrep, falling back to system rg');
+    console.warn('[SEARCH] Could not find bundled ripgrep, falling back to system rg. Probed:', possibleRgPaths);
+    cachedRgPath = 'rg';
     return 'rg';
 }
 
-// Cross-platform file finder using ripgrep --files
-// Finds all files and filters out binary extensions
-async function findWorkspaceFiles(dir: string): Promise<string[]> {
+async function runRipgrepFiles(rootPath: string, options?: { noIgnore?: boolean }): Promise<string[]> {
     const rgPath = getRipgrepPath();
-
-    // Find ALL files, only exclude directories (no file type filtering)
     const rgArgs = [
         '--files',
         '--hidden',  // Include dotfiles like .gitignore
+        ...(options?.noIgnore ? ['--no-ignore'] : []),
         ...RIPGREP_EXCLUDE_ARGS_ARRAY,
-        dir
+        rootPath
     ];
 
     let stdout = '';
@@ -189,7 +232,20 @@ async function findWorkspaceFiles(dir: string): Promise<string[]> {
     return stdout
         .split('\n')
         .filter(line => line.trim())
-        .map(file => path.normalize(file))
+        .map(file => path.normalize(file));
+}
+
+// Cross-platform file finder using ripgrep --files.
+// Respects .gitignore for the general workspace scan, but explicitly includes
+// nimbalyst-local/ so local plan files remain mentionable in @ typeahead.
+async function findWorkspaceFiles(dir: string): Promise<string[]> {
+    const baseFiles = await runRipgrepFiles(dir);
+    const nimbalystLocalPath = path.join(dir, NIMBALYST_LOCAL_DIRNAME);
+    const extraFiles = existsSync(nimbalystLocalPath)
+      ? await runRipgrepFiles(nimbalystLocalPath, { noIgnore: true })
+      : [];
+
+    return Array.from(new Set([...baseFiles, ...extraFiles]))
         .filter(file => {
             // Filter out binary files by extension
             const ext = path.extname(file).toLowerCase();
@@ -393,9 +449,15 @@ export function registerWorkspaceHandlers() {
 
     // Search workspace file names only (fast, uses cache)
     // Supports fuzzy matching with CamelCase abbreviations (e.g., "ClaCoPro" matches "ClaudeCodeProvider")
-    safeHandle('search-workspace-file-names', async (event, workspacePath: string, query: string) => {
+    safeHandle('search-workspace-file-names', async (
+        event,
+        workspacePath: string,
+        query: string,
+        options?: QuickOpenFileNameSearchOptions
+    ) => {
         try {
             const trimmedQuery = query.trim();
+            const maskPatterns = parseQuickOpenFileMask(options?.fileMask);
 
             // Use cache if available
             const cache = fileNameCaches.get(workspacePath);
@@ -426,6 +488,7 @@ export function registerWorkspaceHandlers() {
             // Use fuzzy matching for better search experience
             // Supports: substring, CamelCase abbreviation (ClaCoPro), delimiter-separated (tra-bug)
             const scoredResults = cache
+                .filter(item => shouldIncludeQuickOpenCacheItem(item, maskPatterns))
                 .map(item => {
                     const match = fuzzyMatchPath(trimmedQuery, item.path);
                     return {
@@ -630,19 +693,39 @@ export function registerWorkspaceHandlers() {
         }
     });
 
-    // Get recent workspace files
-    safeHandle('get-recent-workspace-files', async (event) => {
-        const window = BrowserWindow.fromWebContents(event.sender);
-        if (!window) return [];
+    // Get recent workspace files.
+    //
+    // Pre-#188 (single-workspace-per-window) this resolved the workspace from
+    // BrowserWindow state. After the multi-project rail landed, a single
+    // window can have multiple workspaces pinned and the caller knows which
+    // one it cares about; falling back to window state caused Cmd+O Quick Open
+    // and the @-mention picker to pull "recent files" from whichever workspace
+    // the window happened to be tracking last, which leaks files from other
+    // pinned workspaces into the picker. See #301 (Quick Open) and #304
+    // (@-mention shows alphabetical instead of recents because the cross-
+    // workspace recent list failed its path-prefix filter and fell through to
+    // the alphabetical search path).
+    //
+    // The renderer now passes workspacePath explicitly. The window-state
+    // fallback stays for backwards compatibility with any older renderer
+    // bundle that may still hit this channel without the parameter.
+    safeHandle('get-recent-workspace-files', async (event, workspacePath?: string) => {
+        let scope = workspacePath;
 
-        const windowId = getWindowId(window);
-        if (windowId === null) return [];
+        if (!scope) {
+            const window = BrowserWindow.fromWebContents(event.sender);
+            if (!window) return [];
 
-        const state = windowStates.get(windowId);
-        if (!state || !state.workspacePath) return [];
+            const windowId = getWindowId(window);
+            if (windowId === null) return [];
+
+            const state = windowStates.get(windowId);
+            if (!state || !state.workspacePath) return [];
+            scope = state.workspacePath;
+        }
 
         // Get recent files for this workspace from store
-        const workspaceRecentFiles = getWorkspaceRecentFiles(state.workspacePath);
+        const workspaceRecentFiles = getWorkspaceRecentFiles(scope);
 
         // Ensure it's an array before filtering
         if (!Array.isArray(workspaceRecentFiles)) {
@@ -685,6 +768,23 @@ export function registerWorkspaceHandlers() {
 
         try {
             const newPath = join(dirname(oldPath), newName);
+
+            if (newPath !== oldPath && existsSync(newPath)) {
+                let isSameFile = false;
+                try {
+                    const [oldStats, newStats] = await Promise.all([
+                        stat(oldPath),
+                        stat(newPath),
+                    ]);
+                    isSameFile = oldStats.dev === newStats.dev && oldStats.ino === newStats.ino;
+                } catch {
+                    isSameFile = false;
+                }
+
+                if (!isSameFile) {
+                    return { success: false, error: 'File already exists' };
+                }
+            }
 
             // Stop watching before rename to prevent false delete detection
             for (const [windowId, state] of windowStates) {
@@ -975,6 +1075,29 @@ export function registerWorkspaceHandlers() {
     safeHandle('copy-to-clipboard', async (_event, text: string) => {
         clipboard.writeText(text);
         return { success: true };
+    });
+
+    safeHandle('copy-image-to-clipboard', async (_event, payload: { filePath?: string; dataUrl?: string }) => {
+        try {
+            let image;
+            if (payload.filePath) {
+                image = nativeImage.createFromPath(payload.filePath);
+            } else if (payload.dataUrl) {
+                image = nativeImage.createFromDataURL(payload.dataUrl);
+            } else {
+                return { success: false, error: 'No image source provided' };
+            }
+
+            if (image.isEmpty()) {
+                return { success: false, error: 'Failed to decode image for clipboard' };
+            }
+
+            clipboard.writeImage(image);
+            return { success: true };
+        } catch (error: any) {
+            console.error('Error copying image to clipboard:', error);
+            return { success: false, error: error.message };
+        }
     });
 
     safeHandle('read-from-clipboard', async () => {

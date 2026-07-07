@@ -7,15 +7,33 @@ import com.nimbalyst.app.notifications.NotificationManager
 import com.nimbalyst.app.pairing.PairingStore
 import com.nimbalyst.app.analytics.AnalyticsManager
 import com.nimbalyst.app.sync.SyncManager
+import com.nimbalyst.app.sync.WebSocketClient
 import com.nimbalyst.app.transcript.TranscriptWebViewPool
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
 
 class NimbalystApplication : Application() {
     val applicationScope: CoroutineScope by lazy {
         CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    }
+
+    // A session id pending in-app navigation, set when the app is opened via a
+    // notification tap / `nimbalyst://session/<id>` deep link. The Compose nav
+    // host observes this and routes to the session, then clears it.
+    private val _pendingSessionNavigation = MutableStateFlow<String?>(null)
+    val pendingSessionNavigation: StateFlow<String?> = _pendingSessionNavigation.asStateFlow()
+
+    fun requestSessionNavigation(sessionId: String) {
+        _pendingSessionNavigation.value = sessionId
+    }
+
+    fun consumeSessionNavigation() {
+        _pendingSessionNavigation.value = null
     }
 
     val database: NimbalystDatabase by lazy {
@@ -48,6 +66,11 @@ class NimbalystApplication : Application() {
         super.onCreate()
         AnalyticsManager.initialize(this)
         TranscriptWebViewPool.warmup(this)
+        // Label every sync WebSocket connection with this build's version so the
+        // server can attribute connect/disconnect telemetry to platform + version.
+        WebSocketClient.appVersion = runCatching {
+            packageManager.getPackageInfo(packageName, 0).versionName
+        }.getOrNull()
     }
 
     override fun onTerminate() {

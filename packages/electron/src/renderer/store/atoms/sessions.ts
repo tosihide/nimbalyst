@@ -17,8 +17,9 @@
 import { atom } from 'jotai';
 import { atomFamily } from '../debug/atomFamilyRegistry';
 import { store } from '@nimbalyst/runtime/store';
-import { ModelIdentifier, type ChatAttachment, type TranscriptViewMessage } from '@nimbalyst/runtime/ai/server/types';
+import { ModelIdentifier, type ChatAttachment, type SessionData, type TranscriptViewMessage } from '@nimbalyst/runtime/ai/server/types';
 import type { SessionMeta } from '@nimbalyst/runtime';
+import deepEqual from 'fast-deep-equal';
 import { workstreamStateAtom, setWorkstreamActiveChildAtom } from './workstreamState';
 import { aiInputHistoryAtom } from './aiInputUndo';
 
@@ -113,6 +114,22 @@ export const sessionUnreadAtom = atomFamily((_sessionId: string) =>
 );
 
 /**
+ * Per-session "last activity" timestamp.
+ *
+ * Bumped on every `ai:message-logged` IPC event. SessionListItem (and the
+ * group rows that render a relative-time label) subscribes to this so its
+ * "5m ago" label can tick during streaming without forcing a re-render of
+ * `SessionHistory` or the 705 other sessions in the registry.
+ *
+ * Initial value `0` means "no activity recorded this session" — the
+ * displayed timestamp falls back to the registry's `updatedAt` from the
+ * last DB refresh.
+ */
+export const sessionLastActivityAtom = atomFamily((_sessionId: string) =>
+  atom(0)
+);
+
+/**
  * Per-session pending prompt state.
  * Set when there's a queued prompt waiting to be processed.
  * SessionListItem subscribes to show pending indicator.
@@ -193,12 +210,18 @@ export const sessionPromptAdditionsAtom = atomFamily((_sessionId: string) =>
 
 /**
  * Pending interactive prompt from the database.
- * Represents either a permission_request or ask_user_question_request.
+ * Represents one of: permission_request, ask_user_question_request,
+ * exit_plan_mode_request, git_commit_proposal_request, or request_user_input_request.
  */
 export interface PendingPrompt {
   id: string;
   sessionId: string;
-  promptType: 'permission_request' | 'ask_user_question_request';
+  promptType:
+    | 'permission_request'
+    | 'ask_user_question_request'
+    | 'exit_plan_mode_request'
+    | 'git_commit_proposal_request'
+    | 'request_user_input_request';
   promptId: string;  // requestId or questionId
   data: any;         // The full prompt content
   createdAt: number;
@@ -224,11 +247,22 @@ export const sessionPendingPromptsRefreshAtom = atomFamily((_sessionId: string) 
  * Action atom to refresh pending prompts for a session.
  * Pending prompts are now derived from canonical transcript events, not ai_agent_messages.
  */
-const INTERACTIVE_PROMPT_TOOLS = new Set(['AskUserQuestion', 'ToolPermission', 'ExitPlanMode', 'GitCommitProposal']);
+const INTERACTIVE_PROMPT_TOOLS = new Set([
+  'AskUserQuestion',
+  'ToolPermission',
+  'ExitPlanMode',
+  'GitCommitProposal',
+  // Wire-name for the generic structured-input prompt. NOT `RequestUserInput` --
+  // that snake_cases to Codex's built-in `request_user_input`, which is gated to
+  // Plan mode and gets refused in Default mode. `RequestUserInput` is kept here
+  // so older recorded sessions still detect the pending state.
+  'PromptForUserInput',
+  'RequestUserInput',
+]);
 
 // MCP tools arrive as `mcp__<server>__<toolName>` (server name may contain dashes).
 // Match the bare name first; if not found, peel off the MCP prefix and recheck.
-function isInteractivePromptTool(toolName: string): boolean {
+export function isInteractivePromptTool(toolName: string): boolean {
   if (INTERACTIVE_PROMPT_TOOLS.has(toolName)) return true;
   const match = toolName.match(/^mcp__[^_]+(?:_[^_]+)*__(.+)$/);
   return !!match && INTERACTIVE_PROMPT_TOOLS.has(match[1]);
@@ -274,7 +308,7 @@ export const respondToPromptAtom = atom(
   async (get, set, params: {
     sessionId: string;
     promptId: string;
-    promptType: 'permission_request' | 'ask_user_question_request' | 'exit_plan_mode_request';
+    promptType: 'permission_request' | 'ask_user_question_request' | 'exit_plan_mode_request' | 'request_user_input_request';
     response: any;
   }) => {
     const { sessionId, promptId, promptType, response } = params;
@@ -511,7 +545,6 @@ export const resetSessionHistoryAtom = atom(
 // This eliminates the need for AgenticPanel to hold session state.
 // ============================================================
 
-import type { SessionData } from '@nimbalyst/runtime/ai/server/types';
 import type { AIMode } from '../../components/UnifiedAI/ModeTag';
 
 /**
@@ -550,6 +583,8 @@ interface SessionUpdateFields extends Partial<SessionData> {
   uncommittedCount?: number;  // From SessionMeta, not in SessionData
 }
 
+const EMPTY_SESSION_TODOS: unknown[] = [];
+
 /**
  * Unified session update atom.
  * SINGLE update point for all session metadata changes.
@@ -566,7 +601,11 @@ export const updateSessionStoreAtom = atom(
     // Note: Derived atoms (sessionModeAtom, sessionModelAtom, sessionArchivedAtom) automatically sync
     const current = get(sessionStoreAtom(sessionId));
     if (current) {
-      set(sessionStoreAtom(sessionId), { ...current, ...updates });
+      const normalizedUpdates = { ...updates };
+      if (updates.tokenUsage !== undefined && deepEqual(current.tokenUsage, updates.tokenUsage)) {
+        normalizedUpdates.tokenUsage = current.tokenUsage;
+      }
+      set(sessionStoreAtom(sessionId), { ...current, ...normalizedUpdates });
     }
 
     // 2. Always update registry with metadata fields
@@ -735,6 +774,23 @@ export const sessionProviderAtom = atomFamily((sessionId: string) =>
 );
 
 /**
+ * Derived: Session agent role from registry metadata.
+ * Lets consumers subscribe to one session's role without re-rendering on
+ * unrelated registry updates.
+ */
+export const sessionAgentRoleAtom = atomFamily((sessionId: string) =>
+  atom((get) => get(sessionRegistryAtom).get(sessionId)?.agentRole ?? 'standard')
+);
+
+/**
+ * Derived: Session kanban phase from registry metadata.
+ * Allows transcript consumers to subscribe only to one session's phase.
+ */
+export const sessionPhaseAtom = atomFamily((sessionId: string) =>
+  atom((get) => get(sessionRegistryAtom).get(sessionId)?.phase ?? null)
+);
+
+/**
  * Derived: Session messages from sessionData.
  * Allows components to subscribe only to messages without re-rendering on other field changes.
  */
@@ -753,6 +809,47 @@ export const sessionTokenUsageAtom = atomFamily((sessionId: string) =>
   atom((get) => {
     const data = get(sessionStoreAtom(sessionId));
     return data?.tokenUsage;
+  })
+);
+
+export const sessionLoadedAtom = atomFamily((sessionId: string) =>
+  atom((get) => get(sessionStoreAtom(sessionId)) !== null)
+);
+
+export const sessionUpdatedAtAtom = atomFamily((sessionId: string) =>
+  atom((get) => get(sessionStoreAtom(sessionId))?.updatedAt ?? null)
+);
+
+export const sessionStatusAtom = atomFamily((sessionId: string) =>
+  atom((get) => get(sessionStoreAtom(sessionId))?.metadata?.sessionStatus)
+);
+
+export const sessionCurrentTeammatesAtom = atomFamily((sessionId: string) =>
+  atom((get) => {
+    const raw = get(sessionStoreAtom(sessionId))?.metadata?.currentTeammates;
+    return Array.isArray(raw) ? raw as Array<{ agentId: string; status: 'running' | 'completed' | 'errored' | 'idle' }> : undefined;
+  })
+);
+
+export const sessionCurrentTodosAtom = atomFamily((sessionId: string) =>
+  atom((get) => {
+    const raw = get(sessionStoreAtom(sessionId))?.metadata?.currentTodos;
+    return Array.isArray(raw) ? raw : EMPTY_SESSION_TODOS;
+  })
+);
+
+export const sessionWorktreePathAtom = atomFamily((sessionId: string) =>
+  atom((get) => get(sessionStoreAtom(sessionId))?.worktreePath ?? null)
+);
+
+export const sessionDocumentContextAtom = atomFamily((sessionId: string) =>
+  atom((get) => get(sessionStoreAtom(sessionId))?.documentContext)
+);
+
+export const sessionEffortLevelRawAtom = atomFamily((sessionId: string) =>
+  atom((get) => {
+    const metadata = get(sessionStoreAtom(sessionId))?.metadata as Record<string, unknown> | undefined;
+    return metadata?.effortLevel ?? null;
   })
 );
 
@@ -918,7 +1015,12 @@ export const loadSessionChildrenAtom = atom(
     }
 
     try {
-      const result = await window.electronAPI.invoke('sessions:list-children', parentSessionId, workspacePath);
+      const result = await window.electronAPI.invoke(
+        'sessions:list-children',
+        parentSessionId,
+        workspacePath,
+        { includeArchived: false }
+      );
       // console.log('[loadSessionChildrenAtom] IPC result:', result);
       if (result.success && Array.isArray(result.children)) {
         const childIds = result.children.map((c: any) => c.id);
@@ -1084,10 +1186,16 @@ export const createChildSessionAtom = atom(
           childId: result.sessionId,
         });
 
-        // Update the parent's child count in the session list so the UI updates
+        // Update the parent's child count in the session list so the UI updates.
+        // Why max-with-existing: sessionChildrenAtom(parent) may not have been
+        // hydrated yet (e.g. user clicked "+" before loadSessionChildrenAtom
+        // populated it), in which case newChildren.length is 1 even though the
+        // DB has many siblings. Lowering the registry's existing childCount
+        // would mask the new child from SessionHistory's refresh check.
+        const existingChildCount = get(sessionRegistryAtom).get(parentSessionId)?.childCount ?? 0;
         set(updateSessionFullAtom, {
           id: parentSessionId,
-          childCount: newChildren.length,
+          childCount: Math.max(newChildren.length, existingChildCount + 1),
         });
 
         return result.sessionId;
@@ -1241,6 +1349,15 @@ export const convertToWorkstreamAtom = atom(
       // Don't convert if already has a parent (is already a child session)
       if (sessionData.parentSessionId) {
         console.error(`[sessions] Cannot convert to workstream: session ${sessionId} already has a parent`);
+        return null;
+      }
+
+      // Don't convert if the session is in a worktree. A worktree IS the workstream —
+      // wrapping a worktree-resident session in a workstream container produces a
+      // forbidden third layer (worktree → workstream → session). New sessions in a
+      // worktree should just be created as flat siblings, never via this conversion path.
+      if (sessionData.worktreeId) {
+        console.error(`[sessions] Cannot convert to workstream: session ${sessionId} is in worktree ${sessionData.worktreeId} (the worktree is already the workstream)`);
         return null;
       }
 
@@ -1411,15 +1528,18 @@ export const convertToWorkstreamAtom = atom(
         set(setWorkstreamActiveChildAtom, { workstreamId: parentSessionId, childId: sessionId });
       }
 
-      // Update unified workstream state (only when sibling was created)
-      if (siblingResult.success && siblingResult.sessionId) {
-        const { convertToWorkstreamAtom: convertToWorkstreamStateAtom } = await import('./workstreamState');
-        set(convertToWorkstreamStateAtom, {
-          sessionId,
-          parentId: parentSessionId,
-          siblingId: siblingResult.sessionId,
-        });
-      }
+      // Update unified workstream state. Always runs so drag-drop conversions
+      // (skipSiblingCreation=true) initialize childSessionIds; otherwise subsequent
+      // reparentSession calls operate on uninitialized state and the workstream's
+      // child list never reflects further drops.
+      const { convertToWorkstreamAtom: convertToWorkstreamStateAtom } = await import('./workstreamState');
+      set(convertToWorkstreamStateAtom, {
+        sessionId,
+        parentId: parentSessionId,
+        ...(siblingResult.success && siblingResult.sessionId
+          ? { siblingId: siblingResult.sessionId }
+          : {}),
+      });
 
       // Add the new parent session to the session list so it appears in the sidebar
       // If original was pinned, transfer pin to the parent workstream
@@ -1436,7 +1556,9 @@ export const convertToWorkstreamAtom = atom(
         messageCount: 0,
         isArchived: false,
         isPinned: originalWasPinned,
-        worktreeId: sessionData.worktreeId || null,
+        // Workstreams never carry a worktreeId — the worktree IS the workstream,
+        // and the early-return above already blocks this path for worktree sessions.
+        worktreeId: null,
         parentSessionId: null, // This is the root
         childCount: children.length,
         uncommittedCount: 0,
@@ -1579,6 +1701,74 @@ export const updateSessionDataAtom = atom(
  */
 const pendingReloads = new Map<string, { version: number; aborted: boolean }>();
 
+function preserveEquivalentArrayRef<T>(current: T[] | undefined, next: T[] | undefined): T[] | undefined {
+  if (!current || !next) return next;
+  if (current === next) return current;
+  if (current.length !== next.length) return next;
+  if (deepEqual(current, next)) return current;
+  // Per-element preservation: if individual entries are deep-equal, reuse the
+  // current reference for that index so virtualized row memos can bail out.
+  // The outer array reference still changes (some element differs) — that's
+  // expected — but rows whose underlying message didn't change keep identity.
+  let changed = false;
+  const merged: T[] = new Array(next.length);
+  for (let i = 0; i < next.length; i++) {
+    const c = current[i];
+    const n = next[i];
+    if (c === n || deepEqual(c, n)) {
+      merged[i] = c;
+    } else {
+      merged[i] = n;
+      changed = true;
+    }
+  }
+  return changed ? merged : current;
+}
+
+function preserveEquivalentValue<T>(current: T | undefined, next: T | undefined): T | undefined {
+  if (current === undefined || next === undefined) return next;
+  return deepEqual(current, next) ? current : next;
+}
+
+export function preserveReloadIdentity(current: SessionData, next: SessionData): SessionData {
+  const normalizedMessages = preserveEquivalentArrayRef(current.messages, next.messages);
+  const currentTeammates = Array.isArray(current.metadata?.currentTeammates)
+    ? current.metadata.currentTeammates
+    : undefined;
+  const nextTeammates = Array.isArray(next.metadata?.currentTeammates)
+    ? next.metadata.currentTeammates
+    : undefined;
+  const currentTodos = Array.isArray(current.metadata?.currentTodos)
+    ? current.metadata.currentTodos
+    : undefined;
+  const nextTodos = Array.isArray(next.metadata?.currentTodos)
+    ? next.metadata.currentTodos
+    : undefined;
+
+  let metadata = next.metadata;
+  if (currentTeammates && nextTeammates && deepEqual(currentTeammates, nextTeammates)) {
+    metadata = {
+      ...(metadata ?? {}),
+      currentTeammates,
+    };
+  }
+  if (currentTodos && nextTodos && deepEqual(currentTodos, nextTodos)) {
+    metadata = {
+      ...(metadata ?? {}),
+      currentTodos,
+    };
+  }
+
+  const tokenUsage = preserveEquivalentValue(current.tokenUsage, next.tokenUsage);
+
+  return {
+    ...next,
+    messages: normalizedMessages ?? next.messages,
+    ...(tokenUsage !== next.tokenUsage ? { tokenUsage } : {}),
+    ...(metadata !== next.metadata ? { metadata } : {}),
+  };
+}
+
 /**
  * Reload session data from database.
  * Called after message-logged events, etc.
@@ -1663,19 +1853,22 @@ export const reloadSessionDataAtom = atom(
           const dbTimestamp = sessionData.lastReadMessageTimestamp || 0;
           sessionData.lastReadMessageTimestamp = Math.max(preservedTimestamp, dbTimestamp);
 
-          // For claude-code, preserve tokenUsage (comes from /context IPC, not database)
-          if (sessionData.provider === 'claude-code' && current.tokenUsage) {
+          // Token usage comes from IPC more often than the DB, so preserve the
+          // existing reference whenever the DB payload hasn't materially changed.
+          if (current.tokenUsage && deepEqual(current.tokenUsage, sessionData.tokenUsage)) {
             sessionData.tokenUsage = current.tokenUsage;
           }
         }
 
-        // Final check before updating state - ensure we weren't superseded
-        if (!thisReload.aborted) {
-          // console.log(`[TRANSCRIPT-DEBUG] reloadSessionDataAtom: setting ${sessionData.messages?.length ?? 0} messages from DB for session ${sessionId}`);
-          set(sessionStoreAtom(sessionId), sessionData);
-          // Note: sessionModeAtom, sessionModelAtom, and sessionArchivedAtom are derived from sessionStoreAtom,
-          // so they automatically stay in sync when sessionStoreAtom is updated
-        }
+          const normalizedSessionData = preserveReloadIdentity(current ?? sessionData, sessionData);
+
+          // Final check before updating state - ensure we weren't superseded
+          if (!thisReload.aborted) {
+            // console.log(`[TRANSCRIPT-DEBUG] reloadSessionDataAtom: setting ${sessionData.messages?.length ?? 0} messages from DB for session ${sessionId}`);
+            set(sessionStoreAtom(sessionId), normalizedSessionData);
+            // Note: sessionModeAtom, sessionModelAtom, and sessionArchivedAtom are derived from sessionStoreAtom,
+            // so they automatically stay in sync when sessionStoreAtom is updated
+          }
       }
     } catch (error) {
       console.error(`[sessions] Failed to reload session ${sessionId}:`, error);
@@ -1916,10 +2109,12 @@ export const refreshSessionListAtom = atom(
           if (s.hasUnread) {
             set(sessionUnreadAtom(s.id), true);
           }
-          // Initialize pending interactive prompt state from database metadata (for sidebar indicator persistence)
-          if (s.hasPendingQuestion || s.hasPendingInteractivePrompt) {
-            set(sessionHasPendingInteractivePromptAtom(s.id), true);
-          }
+          // Rehydrate the pending-interactive-prompt indicator from the
+          // authoritative DB field. Write BOTH directions so a stuck-true
+          // atom (e.g. from a missed resolve event after a renderer reload)
+          // gets corrected on the next session-list refresh. Persisted by
+          // main-process setSessionPendingPrompt on every prompt open/resolve.
+          set(sessionHasPendingInteractivePromptAtom(s.id), !!s.hasPendingInteractivePrompt);
         }
 
         set(sessionRegistryAtom, registry);

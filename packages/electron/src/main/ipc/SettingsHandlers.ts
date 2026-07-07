@@ -1,17 +1,53 @@
-import { BrowserWindow, safeStorage, session } from 'electron';
+import { BrowserWindow, safeStorage, session, dialog } from 'electron';
 import { safeHandle, safeOn } from '../utils/ipcRegistry';
 import * as os from 'os';
 import * as fs from 'fs';
 import * as path from 'path';
 import { app } from 'electron';
-import { getWorkspaceState, updateWorkspaceState, getTheme, getThemeSync, isCompletionSoundEnabled, setCompletionSoundEnabled, getCompletionSoundType, setCompletionSoundType, CompletionSoundType, getReleaseChannel, setReleaseChannel, ReleaseChannel, getRecentItems, getDefaultAIModel, setDefaultAIModel, getDefaultEffortLevel, setDefaultEffortLevel, isAnalyticsEnabled, setAnalyticsEnabled, getSessionSyncConfig, setSessionSyncConfig, SessionSyncConfig, isExtensionDevToolsEnabled, setExtensionDevToolsEnabled, getAppSetting, setAppSetting, getAlphaFeatures, setAlphaFeatures, getBetaFeatures, setBetaFeatures, getEnableAllBetaFeatures, setEnableAllBetaFeatures, getDeveloperFeatures, setDeveloperFeatures, isDeveloperFeatureAvailable, isShowTrayIcon, getDebugFlags, setDebugFlags, type DebugFlags } from '../utils/store';
+import {
+    getWorkspaceState, updateWorkspaceState,
+    getTheme, getThemeSync, getResolvedThemeSync,
+    isCompletionSoundEnabled, setCompletionSoundEnabled,
+    getCompletionSoundType, setCompletionSoundType, CompletionSoundType,
+    getCompletionSoundCustomPath, setCompletionSoundCustomPath,
+    getCompletionSoundVolume, setCompletionSoundVolume,
+    getReleaseChannel, setReleaseChannel, ReleaseChannel,
+    getRecentItems,
+    getDefaultAIModel, setDefaultAIModel,
+    getDefaultEffortLevel, setDefaultEffortLevel,
+    isAnalyticsEnabled, setAnalyticsEnabled,
+    getSessionSyncConfig, setSessionSyncConfig, SessionSyncConfig,
+    isExtensionDevToolsEnabled, setExtensionDevToolsEnabled,
+    getAppSetting, setAppSetting,
+    getAlphaFeatures, setAlphaFeatures,
+    getBetaFeatures, setBetaFeatures,
+    getEnableAllBetaFeatures, setEnableAllBetaFeatures,
+    getDeveloperFeatures, setDeveloperFeatures, isDeveloperFeatureAvailable,
+    isShowTrayIcon,
+    setPreferredAgentLanguage,
+    getMultiProjectMode, setMultiProjectMode,
+    getOpenProjectPaths, setOpenProjectPaths,
+    getActiveProjectPath, setActiveProjectPath,
+    getRestorePreviousProjectsOnLaunch, setRestorePreviousProjectsOnLaunch,
+    getOnboardingState, updateOnboardingState,
+    isDeveloperMode, setDeveloperMode,
+    isFeatureWalkthroughCompleted, setFeatureWalkthroughCompleted,
+    isWorktreeOnboardingShown, setWorktreeOnboardingShown,
+    getClaudeCodeSettings,
+    setClaudeCodeProjectCommandsEnabled, setClaudeCodeUserCommandsEnabled,
+    getAgentWorkflowSourceSettings, getAgentWorkflowExportSettings,
+    setAgentWorkflowSourceSettings, setAgentWorkflowExportSettings,
+} from '../utils/store';
 import { getEnhancedPath } from '../services/CLIManager';
 import { logger } from '../utils/logger';
+import { getSettingsService, isSettingKey } from '../services/SettingsService';
+import { SessionNamingService } from '../services/SessionNamingService';
 import { SoundNotificationService } from '../services/SoundNotificationService';
 import { autoUpdaterService } from '../services/autoUpdater';
 import type { OnboardingState } from '../utils/store';
 import { getCredentials, resetCredentials, generateQRPairingPayload, isUsingSecureStorage } from '../services/CredentialService';
 import { onSyncStatusChange, updateSleepPrevention } from '../services/SyncManager';
+import { getDocSyncStatusForWorkspace } from '../file/WorkspaceWatcher';
 import * as StytchAuth from '../services/StytchAuthService';
 import { getRestartSignalPath } from '../utils/appPaths';
 import { TrayManager } from '../tray/TrayManager';
@@ -63,6 +99,41 @@ function getLocalNetworkIP(): string | null {
 }
 
 export function registerSettingsHandlers() {
+    // ============================================================
+    // Flat-key SettingsService (per-key reads/writes + broadcast)
+    //
+    // The renderer hydrates every setting at startup via `settings:getAll`,
+    // mutates via `settings:set`/`delete`, and stays in lockstep across windows
+    // via the `settings:changed` broadcast emitted from SettingsService.notify.
+    // See packages/electron/src/main/services/SettingsService.ts for the
+    // authority model and packages/electron/src/shared/settings/keys.ts for
+    // the key registry.
+    // ============================================================
+    const settingsService = getSettingsService();
+    settingsService.init();
+
+    safeHandle('settings:getAll', () => {
+        return settingsService.getAll();
+    });
+
+    safeHandle('settings:set', (_event, key: string, value: unknown) => {
+        if (!isSettingKey(key)) {
+            // Reject loudly -- a renderer asking for an unknown key is a
+            // registry/key mismatch we want to catch in dev, not paper over.
+            throw new Error(`[settings:set] Unknown setting key: ${key}`);
+        }
+        settingsService.set(key, value as any);
+        return { ok: true };
+    });
+
+    safeHandle('settings:delete', (_event, key: string) => {
+        if (!isSettingKey(key)) {
+            throw new Error(`[settings:delete] Unknown setting key: ${key}`);
+        }
+        settingsService.delete(key);
+        return { ok: true };
+    });
+
     // Generic app settings get/set (for extension storage)
     safeHandle('app-settings:get', (_event, key: string) => {
         return getAppSetting(key);
@@ -76,6 +147,18 @@ export function registerSettingsHandlers() {
     safeHandle('spellcheck:set-enabled', (_event, enabled: boolean) => {
         session.defaultSession.setSpellCheckerEnabled(enabled);
         setAppSetting('spellcheckEnabled', enabled);
+    });
+
+    // Preferred agent language. Persists to the electron-store and pushes
+    // the new value into the runtime so providers pick it up on the next turn.
+    safeHandle('preferred-agent-language:set', (_event, language: unknown) => {
+        const value = typeof language === 'string' ? language : undefined;
+        setPreferredAgentLanguage(value);
+        SessionNamingService.getInstance().setLanguage(value);
+    });
+
+    safeHandle('preferred-agent-language:get', () => {
+        return getAppSetting<string>('preferredAgentLanguage') ?? '';
     });
 
     // Get the enhanced PATH that Nimbalyst uses for spawning processes
@@ -208,6 +291,15 @@ export function registerSettingsHandlers() {
         event.returnValue = theme;
     });
 
+    // Get fully-resolved theme (sync) - collapses extension/filesystem themes
+    // into 'dark' | 'light' | 'crystal-dark'. Used by callers that cannot
+    // consult the in-renderer extension theme registry (project picker window
+    // and the flash-prevention script in index.html).
+    safeOn('get-resolved-theme-sync', (event) => {
+        const theme = getResolvedThemeSync();
+        event.returnValue = theme;
+    });
+
     // Get app version (from app.getVersion)
     safeHandle('get-app-version', () => {
         const { app } = require('electron');
@@ -234,9 +326,168 @@ export function registerSettingsHandlers() {
         setCompletionSoundType(soundType);
     });
 
-    safeHandle('completion-sound:test', (_event, soundType: CompletionSoundType) => {
+    safeHandle('completion-sound:get-volume', () => {
+        return getCompletionSoundVolume();
+    });
+
+    safeHandle('completion-sound:set-volume', (_event, volumePercent: number) => {
+        setCompletionSoundVolume(volumePercent);
+    });
+
+    safeHandle('completion-sound:test', (_event, soundType: CompletionSoundType, volumePercent?: number) => {
         const soundService = SoundNotificationService.getInstance();
-        soundService.testSound(soundType);
+        // Prefer the volume passed from the renderer (reflects the live slider
+        // position before the debounced persist lands); fall back to the stored value.
+        const volume = typeof volumePercent === 'number' ? volumePercent : getCompletionSoundVolume();
+        soundService.testSound(soundType, volume);
+    });
+
+    // Custom completion sound file management. The chosen file is copied into
+    // userData/custom-sounds so playback survives the original being moved or
+    // deleted. Only one custom sound is kept at a time. The renderer owns the
+    // completionSoundType value (single writer) to avoid racing the debounced
+    // `completion-sound:set-type` persist; these handlers only manage the file.
+    const MAX_CUSTOM_SOUND_BYTES = 10 * 1024 * 1024;
+    const customSoundDir = () => path.join(app.getPath('userData'), 'custom-sounds');
+
+    // Cheap content sniff so a renamed non-audio file (e.g. notes.txt -> x.mp3)
+    // is rejected before we commit it. Truncated/corrupt-but-headered audio is
+    // caught later by the renderer's decodeAudioData validation.
+    const looksLikeAudio = (filePath: string): boolean => {
+        let fd: number | undefined;
+        try {
+            const buf = Buffer.alloc(16);
+            fd = fs.openSync(filePath, 'r');
+            const read = fs.readSync(fd, buf, 0, 16, 0);
+            if (read < 4) return false;
+            const tag = (start: number, len: number) => buf.toString('latin1', start, start + len);
+            if (tag(0, 4) === 'RIFF') return true;          // WAV
+            if (tag(0, 4) === 'OggS') return true;          // OGG
+            if (tag(0, 4) === 'fLaC') return true;          // FLAC
+            if (tag(0, 3) === 'ID3') return true;           // MP3 with ID3 tag
+            if (buf[0] === 0xff && (buf[1] & 0xe0) === 0xe0) return true; // MP3 frame sync
+            if (tag(4, 4) === 'ftyp') return true;          // MP4 / M4A / AAC container
+            return false;
+        } catch {
+            return false;
+        } finally {
+            if (fd !== undefined) {
+                try { fs.closeSync(fd); } catch { /* ignore */ }
+            }
+        }
+    };
+
+    // Notify every window so a custom-sound change made in one window does not
+    // leave another window's settings panel showing stale state.
+    const broadcastCustomChanged = (fileName: string | null) => {
+        for (const win of BrowserWindow.getAllWindows()) {
+            if (!win.isDestroyed()) {
+                win.webContents.send('completion-sound:custom-changed', { fileName });
+            }
+        }
+    };
+
+    safeHandle('completion-sound:get-custom', () => {
+        const stored = getCompletionSoundCustomPath();
+        if (!stored) {
+            return null;
+        }
+        if (!fs.existsSync(stored)) {
+            // The app-owned copy vanished (out-of-band delete / migration).
+            // Drop the dangling path; the renderer reconciles a stuck 'custom'
+            // type back to a built-in sound at init.
+            setCompletionSoundCustomPath(undefined);
+            return null;
+        }
+        return { path: stored, fileName: path.basename(stored) };
+    });
+
+    safeHandle('completion-sound:choose-custom', async (event) => {
+        const window = BrowserWindow.fromWebContents(event.sender);
+        const dialogOptions: Electron.OpenDialogOptions = {
+            title: 'Choose Completion Sound',
+            buttonLabel: 'Use Sound',
+            properties: ['openFile'],
+            filters: [{ name: 'Audio', extensions: ['mp3', 'wav', 'ogg', 'm4a', 'aac', 'flac'] }],
+        };
+        const result = window
+            ? await dialog.showOpenDialog(window, dialogOptions)
+            : await dialog.showOpenDialog(dialogOptions);
+        if (result.canceled || result.filePaths.length === 0) {
+            return null;
+        }
+
+        const sourcePath = result.filePaths[0];
+
+        // Reject oversized files: the bytes are read into memory and cloned over
+        // IPC on every completion, so a huge file means churn / OOM risk.
+        let size: number;
+        try {
+            size = fs.statSync(sourcePath).size;
+        } catch {
+            return { error: 'unreadable' };
+        }
+        if (size > MAX_CUSTOM_SOUND_BYTES) {
+            return { error: 'too-large', maxBytes: MAX_CUSTOM_SOUND_BYTES };
+        }
+        if (!looksLikeAudio(sourcePath)) {
+            return { error: 'invalid' };
+        }
+
+        const destDir = customSoundDir();
+        const fileName = path.basename(sourcePath);
+        // Stage the copy OUTSIDE destDir first, so the existing custom sound is
+        // never destroyed before the new one is safely written (and so the user
+        // can re-select the current file without it deleting itself).
+        const stagingPath = path.join(app.getPath('userData'), `custom-sound.staging${path.extname(sourcePath)}`);
+        try {
+            fs.copyFileSync(sourcePath, stagingPath);
+        } catch (error) {
+            logger.store.warn('[SettingsHandlers] Failed to copy custom sound:', error);
+            try { fs.rmSync(stagingPath, { force: true }); } catch { /* ignore */ }
+            return { error: 'copy-failed' };
+        }
+
+        // The new file is staged; now it is safe to replace the directory.
+        try { fs.rmSync(destDir, { recursive: true, force: true }); } catch { /* ignore */ }
+        fs.mkdirSync(destDir, { recursive: true });
+        const destPath = path.join(destDir, fileName);
+        try {
+            fs.renameSync(stagingPath, destPath);
+        } catch {
+            // Cross-device or rename failure: fall back to copy + cleanup.
+            fs.copyFileSync(stagingPath, destPath);
+            try { fs.rmSync(stagingPath, { force: true }); } catch { /* ignore */ }
+        }
+
+        setCompletionSoundCustomPath(destPath);
+        broadcastCustomChanged(fileName);
+        return { path: destPath, fileName };
+    });
+
+    safeHandle('completion-sound:clear-custom', () => {
+        try {
+            fs.rmSync(customSoundDir(), { recursive: true, force: true });
+        } catch {
+            // Best effort.
+        }
+        setCompletionSoundCustomPath(undefined);
+        broadcastCustomChanged(null);
+    });
+
+    // Returns the raw bytes of the custom sound file so the renderer can decode
+    // and play it via the Web Audio API. Returns null when no file is set.
+    safeHandle('completion-sound:get-custom-data', () => {
+        const stored = getCompletionSoundCustomPath();
+        if (!stored || !fs.existsSync(stored)) {
+            return null;
+        }
+        try {
+            return fs.readFileSync(stored);
+        } catch (error) {
+            logger.store.warn('[SettingsHandlers] Failed to read custom sound file:', error);
+            return null;
+        }
     });
 
     // Release channel settings
@@ -295,68 +546,98 @@ export function registerSettingsHandlers() {
         return isDeveloperFeatureAvailable(tag as any);
     });
 
-    // Debug flags (verbose logging toggles, off by default)
-    safeHandle('debug-flags:get', () => {
-        return getDebugFlags();
-    });
-
-    safeHandle('debug-flags:set', (_event, flags: Partial<DebugFlags>) => {
-        setDebugFlags(flags);
-        // Mirror to all renderers so the in-renderer atom + window mirror stay in sync without
-        // a full reload. Renderers register a listener for 'debug-flags:changed'.
-        const next = getDebugFlags();
-        for (const win of BrowserWindow.getAllWindows()) {
-            win.webContents.send('debug-flags:changed', next);
-        }
-        logger.store.info('[SettingsHandlers] Debug flags updated:', next);
-    });
-
     // Get recent projects
     safeHandle('settings:get-recent-projects', () => {
         return getRecentItems('workspaces');
     });
 
-    // Onboarding state
+    // Multi-project rail (opt-in: hosts multiple projects in a single window)
+    safeHandle('app:get-multi-project-mode', async () => {
+        return getMultiProjectMode();
+    });
+
+    safeHandle('app:set-multi-project-mode', async (_event, enabled: boolean) => {
+        setMultiProjectMode(enabled);
+    });
+
+    safeHandle('app:get-open-projects', async () => {
+        return getOpenProjectPaths();
+    });
+
+    safeHandle('app:set-open-projects', async (_event, paths: string[]) => {
+        setOpenProjectPaths(Array.isArray(paths) ? paths : []);
+    });
+
+    safeHandle('app:get-active-project-path', async () => {
+        return getActiveProjectPath();
+    });
+
+    safeHandle('app:set-active-project-path', async (_event, path: string | null) => {
+        setActiveProjectPath(path);
+    });
+
+    safeHandle('app:get-restore-previous-projects', async () => {
+        return getRestorePreviousProjectsOnLaunch();
+    });
+
+    safeHandle('app:set-restore-previous-projects', async (_event, enabled: boolean) => {
+        setRestorePreviousProjectsOnLaunch(!!enabled);
+    });
+
+    // Onboarding state.
+    //
+    // Diagnostic timing is emitted here because issue #260 reports a beach-ball
+    // hang on the developer-vs-standard mode picker, where this IPC is the
+    // suspected stall point on cold start. The renderer races this call against
+    // a timeout (see useOnboarding.ts), so we want a main-side breadcrumb that
+    // tells us whether the handler ever ran and how long the underlying store
+    // read took. Logs the elapsed time at info level so it lands in main.log on
+    // packaged builds.
     safeHandle('onboarding:get', async () => {
-        const { getOnboardingState } = await import('../utils/store');
-        return getOnboardingState();
+        const t0 = Date.now();
+        try {
+            const state = getOnboardingState();
+            const elapsed = Date.now() - t0;
+            if (elapsed > 50) {
+                logger.main.warn(`[SettingsHandlers] onboarding:get slow read: ${elapsed}ms`);
+            } else {
+                logger.main.info(`[SettingsHandlers] onboarding:get ok (${elapsed}ms)`);
+            }
+            return state;
+        } catch (err) {
+            logger.main.error('[SettingsHandlers] onboarding:get failed:', err);
+            throw err;
+        }
     });
 
     safeHandle('onboarding:update', async (_event, state: Partial<OnboardingState>) => {
-        const { updateOnboardingState } = await import('../utils/store');
         updateOnboardingState(state);
     });
 
     // Developer mode (global app setting)
     safeHandle('developer-mode:get', async () => {
-        const { isDeveloperMode } = await import('../utils/store');
         return isDeveloperMode();
     });
 
     safeHandle('developer-mode:set', async (_event, enabled: boolean) => {
-        const { setDeveloperMode } = await import('../utils/store');
         setDeveloperMode(enabled);
     });
 
     // Feature walkthrough state (shown on first launch)
     safeHandle('feature-walkthrough:is-completed', async () => {
-        const { isFeatureWalkthroughCompleted } = await import('../utils/store');
         return isFeatureWalkthroughCompleted();
     });
 
     safeHandle('feature-walkthrough:set-completed', async (_event, completed: boolean) => {
-        const { setFeatureWalkthroughCompleted } = await import('../utils/store');
         setFeatureWalkthroughCompleted(completed);
     });
 
     // Worktree onboarding state
     safeHandle('worktree-onboarding:is-shown', async () => {
-        const { isWorktreeOnboardingShown } = await import('../utils/store');
         return isWorktreeOnboardingShown();
     });
 
     safeHandle('worktree-onboarding:set-shown', async (_event: Electron.IpcMainInvokeEvent, shown: boolean) => {
-        const { setWorktreeOnboardingShown } = await import('../utils/store');
         setWorktreeOnboardingShown(shown);
     });
 
@@ -391,8 +672,14 @@ export function registerSettingsHandlers() {
 
     // Claude Code settings
     safeHandle('claudeCode:get-settings', async () => {
-        const { getClaudeCodeSettings } = await import('../utils/store');
         return getClaudeCodeSettings();
+    });
+
+    safeHandle('agentWorkflows:get-settings', async () => {
+        return {
+            sourceSettings: getAgentWorkflowSourceSettings(),
+            exportSettings: getAgentWorkflowExportSettings(),
+        };
     });
 
     // Claude Code user-level environment variables (~/.claude/settings.json)
@@ -411,15 +698,33 @@ export function registerSettingsHandlers() {
     });
 
     safeHandle('claudeCode:set-project-commands-enabled', async (_event, enabled: boolean) => {
-        const { setClaudeCodeProjectCommandsEnabled } = await import('../utils/store');
         setClaudeCodeProjectCommandsEnabled(enabled);
         logger.store.info(`[SettingsHandlers] Claude Code project commands ${enabled ? 'enabled' : 'disabled'}`);
     });
 
     safeHandle('claudeCode:set-user-commands-enabled', async (_event, enabled: boolean) => {
-        const { setClaudeCodeUserCommandsEnabled } = await import('../utils/store');
         setClaudeCodeUserCommandsEnabled(enabled);
         logger.store.info(`[SettingsHandlers] Claude Code user commands ${enabled ? 'enabled' : 'disabled'}`);
+    });
+
+    safeHandle('agentWorkflows:set-source-settings', async (_event, updates: {
+        workspaceClaudeCompatibilityEnabled?: boolean;
+        includeProjectClaudeSources?: boolean;
+        includeUserClaudeSources?: boolean;
+        extensionWorkflowsEnabled?: boolean;
+    }) => {
+        const next = setAgentWorkflowSourceSettings(updates ?? {});
+        logger.store.info('[SettingsHandlers] Agent workflow source settings updated');
+        return next;
+    });
+
+    safeHandle('agentWorkflows:set-export-settings', async (_event, updates: {
+        codexEnabled?: boolean;
+        claudeGeneratedExtensionWorkflowsEnabled?: boolean;
+    }) => {
+        const next = setAgentWorkflowExportSettings(updates ?? {});
+        logger.store.info('[SettingsHandlers] Agent workflow export settings updated');
+        return next;
     });
 
     // Extension Development Kit (EDK) settings
@@ -758,6 +1063,22 @@ export function registerSettingsHandlers() {
             docSyncStats,
             userEmail: StytchAuth.getUserEmail(),
         };
+    });
+
+    // Per-project doc (.md file) sync status, for Docs-toggle feedback in the sync panel
+    safeHandle('sync:get-doc-sync-status', async (_event, workspacePath: string) => {
+        if (!workspacePath) {
+            return { success: false, error: 'workspacePath is required' };
+        }
+        try {
+            const config = getSessionSyncConfig();
+            const enabled = (config?.docSyncEnabledProjects ?? []).includes(workspacePath);
+            const status = getDocSyncStatusForWorkspace(workspacePath);
+            return { success: true, enabled, ...status };
+        } catch (error) {
+            const message = error instanceof Error ? error.message : 'Failed to get doc sync status';
+            return { success: false, error: message };
+        }
     });
 
     // Toggle sync for a specific project

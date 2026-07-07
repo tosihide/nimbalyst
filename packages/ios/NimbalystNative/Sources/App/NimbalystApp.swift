@@ -244,17 +244,26 @@ public struct MainNavigationView: View {
     public init() {}
 
     public var body: some View {
-        Group {
-            if sizeClass == .regular {
-                IPadNavigationView()
-                    .environmentObject(appState)
-            } else {
-                NavigationStack(path: $navigationPath) {
-                    ProjectListView()
+        VStack(spacing: 0) {
+            if appState.syncAuthDegraded {
+                SyncAuthDegradedBanner {
+                    appState.signOutForAuthRecovery()
+                }
+                .transition(.move(edge: .top).combined(with: .opacity))
+            }
+            Group {
+                if sizeClass == .regular {
+                    IPadNavigationView()
                         .environmentObject(appState)
+                } else {
+                    NavigationStack(path: $navigationPath) {
+                        ProjectListView()
+                            .environmentObject(appState)
+                    }
                 }
             }
         }
+        .animation(.easeInOut(duration: 0.25), value: appState.syncAuthDegraded)
         #if os(iOS)
         .overlay(alignment: .bottom) {
             if let voice = appState.voiceAgent, voice.state != .disconnected {
@@ -268,6 +277,16 @@ public struct MainNavigationView: View {
             navigateToSession(sessionId)
             notificationManager.pendingSessionId = nil
         }
+        #if os(iOS)
+        // Voice agent created a session on this device — open it. iPhone navigates
+        // its stack here; iPad sets selectedSession in IPadNavigationView, which
+        // clears the request. Guard on compact so we don't consume the iPad case.
+        .onChange(of: appState.voiceNavigationRequest) { _, newValue in
+            guard sizeClass != .regular, let sessionId = newValue else { return }
+            navigateToSession(sessionId)
+            appState.voiceNavigationRequest = nil
+        }
+        #endif
         .onAppear {
             let version = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "unknown"
             AnalyticsManager.shared.capture("mobile_app_opened", properties: [
@@ -381,9 +400,13 @@ struct IPadNavigationView: View {
                     .foregroundStyle(.secondary)
                 #endif
             } else if let session = selectedSession {
+                // No `.id(session.id)` — SessionDetailView handles in-place
+                // session swap (see swapSession) so SwiftUI reuses the same
+                // view, the same TranscriptWebView, and the React-side
+                // multi-session DOM cache inside it when the user picks a
+                // different session in the sidebar.
                 SessionDetailView(session: session)
                     .environmentObject(appState)
-                    .id(session.id)
             } else {
                 Text("Select a session")
                     .foregroundStyle(.secondary)
@@ -394,6 +417,27 @@ struct IPadNavigationView: View {
         .sheet(isPresented: $showProjectPicker) {
             projectPickerSheet
         }
+        #if os(iOS)
+        .onChange(of: appState.voiceNavigationRequest) { _, newValue in
+            guard let sessionId = newValue else { return }
+            openVoiceCreatedSession(sessionId)
+            appState.voiceNavigationRequest = nil
+        }
+        #endif
+    }
+
+    /// Open a session the voice agent just created (iPad split view): select its
+    /// project if different, then show it in the detail column.
+    private func openVoiceCreatedSession(_ sessionId: String) {
+        guard let db = appState.databaseManager,
+              let session = try? db.session(byId: sessionId) else { return }
+        if selectedProject?.id != session.projectId,
+           let project = try? db.writer.read({ db in try Project.fetchOne(db, id: session.projectId) }) {
+            selectedProject = project
+            configureVoiceForProject(project)
+        }
+        selectedDocument = nil
+        selectedSession = session
     }
 
     private var projectPickerSheet: some View {
@@ -472,6 +516,57 @@ struct IPadNavigationView: View {
 
     private func configureVoiceForProject(_ project: Project) {
         appState.configureVoiceAgent(forProject: project.id)
+    }
+}
+
+// MARK: - Sync Auth-Degraded Banner
+
+/// Surfaced above MainNavigationView when sync has been failing with
+/// auth-class errors long enough that the user almost certainly needs to
+/// sign in again. Visibility is driven by `AppState.syncAuthDegraded`.
+struct SyncAuthDegradedBanner: View {
+    let onSignIn: () -> Void
+
+    var body: some View {
+        HStack(alignment: .center, spacing: 12) {
+            Image(systemName: "exclamationmark.triangle.fill")
+                .font(.subheadline)
+                .foregroundStyle(NimbalystColors.warning)
+
+            VStack(alignment: .leading, spacing: 1) {
+                Text("Sync paused")
+                    .font(.subheadline)
+                    .fontWeight(.semibold)
+                    .foregroundStyle(.primary)
+                Text("Your session may need a refresh.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            Spacer(minLength: 8)
+
+            Button(action: onSignIn) {
+                Text("Sign in again")
+                    .font(.caption)
+                    .fontWeight(.semibold)
+            }
+            .buttonStyle(.borderedProminent)
+            .controlSize(.small)
+            .tint(NimbalystColors.primary)
+            .accessibilityIdentifier("sync-auth-degraded-sign-in")
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 10)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(NimbalystColors.warning.opacity(0.18))
+        .overlay(alignment: .bottom) {
+            Rectangle()
+                .fill(NimbalystColors.warning.opacity(0.45))
+                .frame(height: 0.5)
+        }
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("Sync paused. Your session may need a refresh.")
+        .accessibilityIdentifier("sync-auth-degraded-banner")
     }
 }
 

@@ -7,11 +7,29 @@ import { execFile } from 'child_process';
 import { promisify } from 'util';
 import { safeHandle } from '../../utils/ipcRegistry';
 import Store from 'electron-store';
-import { SessionManager, ProviderFactory, ModelRegistry, AIProvider, isAskUserQuestionProvider, isAgentProvider, ClaudeCodeProvider, OpenAICodexProvider } from '@nimbalyst/runtime/ai/server';
+import {
+  isExtensionAgentProvider,
+  resolveExtensionAgentRef,
+} from './providerResolution';
+import { getAgentProviderRegistry } from '../../extensions/AgentProviderRegistry';
+import {
+  SessionManager,
+  ProviderFactory,
+  ModelRegistry,
+  AIProvider,
+  isAskUserQuestionProvider,
+  isAgentProvider,
+  isSlashCommandCatalogProvider,
+  ClaudeCodeProvider,
+  OpenAICodexProvider,
+} from '@nimbalyst/runtime/ai/server';
+import { CLAUDE_CODE_SAFE_FALLBACK_MODEL } from '@nimbalyst/runtime/ai/modelConstants';
+import { reconcileClaudeCodeModels } from './claudeCodeModelReconcile';
+import { isModelEnabled } from './modelEnablementFilter';
 import { getSessionStateManager } from '@nimbalyst/runtime/ai/server/SessionStateManager';
 import { parseContextUsageMessage } from '@nimbalyst/runtime/ai/server/utils/contextUsage';
 import { isBedrockToolSearchError } from '@nimbalyst/runtime/ai/server/utils/errorDetection';
-import { parseEffortLevel } from '@nimbalyst/runtime/ai/server/effortLevels';
+import { resolveEffortLevel } from '@nimbalyst/runtime/ai/server/effortLevels';
 import type { SessionStore } from '@nimbalyst/runtime';
 import {
   ModelIdentifier,
@@ -30,13 +48,22 @@ import {
 // MCP imports removed - no longer using MCP HTTP server
 import { ToolExecutor, toolRegistry, BUILT_IN_TOOLS } from './tools';
 import { initMobileSessionControlHandler } from './MobileSessionControlHandler';
+import { handleMobileVoiceToolCall } from '../voice/mobileVoiceToolHandler';
 import { SoundNotificationService } from '../SoundNotificationService';
+import { getTerminalSessionManager } from '../TerminalSessionManager';
+import { flushNextClaudeCliQueuedPromptForSession } from './claudeCliQueueFlushSingleton';
 import { notificationService } from '../NotificationService';
 import { TrayManager } from '../../tray/TrayManager';
 import { logger } from '../../utils/logger';
+import { getSettingsService } from '../SettingsService';
 import { windowStates, findWindowByWorkspace, getWindowId, createWindow } from '../../window/WindowManager';
+import { resolveActiveWorkspacePathForWindowId } from '../../window/windowState';
 import { sessionFileTracker } from '../SessionFileTracker';
+import { enrichTranscriptMessagesWithToolCallDiffs } from '../TranscriptToolCallEnricher';
 import { extractFilePath } from './tools/extractFilePath';
+import { handleBackendTool } from '../../mcp/tools/backendToolHandler';
+import { findOwnedBackendTool } from '../../mcp/backendToolRegistry';
+import { resolveBackendWorkspacePath } from '../../mcp/mcpWorkspaceResolver';
 import { toolCallMatcher, unwrapShellCommand } from '../ToolCallMatcher';
 import { workspaceFileEditAttributionService } from '../WorkspaceFileEditAttributionService';
 import {AnalyticsService} from "../analytics/AnalyticsService.ts";
@@ -53,14 +80,16 @@ import {
   markCommunityPopupShown,
   normalizeAIProviderOverrides,
   shouldShowCommunityPopup,
-  wasCommunityPopupShownThisLaunch
+  wasCommunityPopupShownThisLaunch,
+  getDefaultEffortLevel
 } from '../../utils/store';
-import { mergeAISettings } from '../../utils/aiSettingsMerge';
+import { mergeAISettings, getAIProviderOverridesWithWorktreeFallback } from '../../utils/aiSettingsMerge';
 import { DocumentContextService, type RawDocumentContext, type PreparedDocumentContext } from '@nimbalyst/runtime';
 import { getMessageSyncHandler, getSyncProvider, isDesktopTrulyAway } from '../SyncManager';
 import { normalizeCodexProviderConfig, omitModelsField, stripTransientProviderFields } from '@nimbalyst/runtime/ai/server/utils/modelConfigUtils';
 import { isFileInWorkspaceOrWorktree, resolveProjectPath } from '../../utils/workspaceDetection';
 import { SessionFilesRepository } from '@nimbalyst/runtime';
+import { buildToolPermissionResponseRecord } from './claudeCliToolPermission';
 import * as fs from 'fs';
 import * as path from 'path';
 import {
@@ -89,8 +118,32 @@ import {
 } from './aiServiceUtils';
 import { MessageStreamingHandler } from './MessageStreamingHandler';
 import { HooklessAgentFileWatcher } from './HooklessAgentFileWatcher';
+import { getAgentWorkflowService } from '../AgentWorkflowService';
+import { tryClaimAndDispatchNextQueuedPrompt } from './queuedPromptDispatcher';
+import { dispatchQueuedPromptToClaudeCli } from './claudeCliQueueDispatch';
+import { ensureClaudeCliSession, claudeCliSessionSupportsPlugins } from './claudeCliLauncherSingleton';
+import { supportsWorkspaceSlashWorkflowProvider } from '../../../shared/agentWorkflowProviders';
 
 const execFileAsync = promisify(execFile);
+
+// Debounced re-sync of the available-models list to mobile. The renderer can
+// send rapid providerSettings slices when toggling providers, so coalesce them
+// into a single mobile sync. Enabling an agent provider (e.g. openai-codex)
+// must refresh the mobile model picker, which otherwise only happens on
+// desktop startup / mobile reconnect / OpenAI-key change (NIM-976).
+let mobileSettingsSyncTimer: ReturnType<typeof setTimeout> | null = null;
+function scheduleMobileSettingsSync(): void {
+  if (mobileSettingsSyncTimer) clearTimeout(mobileSettingsSyncTimer);
+  mobileSettingsSyncTimer = setTimeout(() => {
+    mobileSettingsSyncTimer = null;
+    import('../SyncManager').then(({ syncSettingsToMobile }) => {
+      // Pass the stored OpenAI key so we don't drop it from the mobile payload;
+      // mobile keeps its existing key when the field is absent, so either is safe.
+      const apiKeys = new Store<Record<string, unknown>>({ name: 'ai-settings' }).get('apiKeys', {}) as Record<string, string>;
+      syncSettingsToMobile(apiKeys['openai']);
+    }).catch(() => { /* sync manager may not be available */ });
+  }, 500);
+}
 
 export class AIService {
   private sessionManager: SessionManager;
@@ -164,6 +217,22 @@ export class AIService {
     for (const tool of BUILT_IN_TOOLS) {
       toolRegistry.register(tool);
     }
+
+    // Wire up the custom binary path loader so each query reads the current
+    // value fresh from the ai-settings store. This must live here (not in
+    // index.ts) because only AIService owns the ai-settings store; the
+    // store reference in index.ts points to app-settings and would always
+    // return empty string.
+    ClaudeCodeProvider.setCustomClaudeCodePathLoader((workspacePath: string) => {
+      if (!workspacePath) {
+        throw new Error('[ClaudeCodeProvider] customClaudeCodePathLoader called without a workspacePath');
+      }
+      const projectOverride = getAIProviderOverridesWithWorktreeFallback(workspacePath)?.customClaudeCodePath;
+      if (projectOverride !== undefined) {
+        return projectOverride;
+      }
+      return (this.getSettingsStore().get('customClaudeCodePath', '') as string) || '';
+    });
 
     // API keys must be explicitly set by the user in settings.
     // NEVER auto-import keys from process.env. A user's .env file with
@@ -332,28 +401,39 @@ export class AIService {
   }
 
   /**
-   * Append any claude-code variants that were added after this user's
-   * `providerSettings['claude-code'].models` list was first persisted. Without
-   * this, `ai:getModels` filters out newly-introduced variants (e.g. the
-   * `opus-4-6` pinned variant) because they aren't in the saved list and
-   * there's no UI in ClaudeCodePanel to re-enable them.
+   * Back-fill any claude-code variants that shipped after this user's
+   * `providerSettings['claude-code'].models` allow-list was first persisted.
+   * Without this, `ai:getModels` filters out newly-introduced variants (they
+   * aren't in the saved list and ClaudeCodePanel has no per-model UI to re-enable
+   * them) — the drift that silently hid Fable 5 and sonnet-4-6.
+   *
+   * This is a single self-reconciliation against the catalog source of truth
+   * (`CLAUDE_CODE_VARIANTS`) rather than one hand-written migration per variant:
+   * a persisted snapshot of "known" variant ids records what we've seen before,
+   * so any future variant is enabled by default with no code change, while a
+   * variant the user has deliberately removed (already in the snapshot) is never
+   * re-added. See `claudeCodeModelReconcile.ts`.
    */
-  private migrateClaudeCodeModelList(): void {
-    const MIGRATION_KEY = 'migrations.claudeCodeOpus46Added';
-    if (this.settingsStore!.get(MIGRATION_KEY)) return;
+  private reconcileClaudeCodeModelList(): void {
+    const KNOWN_KEY = 'migrations.knownClaudeCodeVariants';
+    const known = this.settingsStore!.get(KNOWN_KEY) as string[] | undefined;
     const providerSettings = this.settingsStore!.get('providerSettings', {}) as any;
     const claudeCode = providerSettings?.['claude-code'];
-    if (claudeCode && Array.isArray(claudeCode.models) && !claudeCode.models.includes('claude-code:opus-4-6')) {
-      const opusIndex = claudeCode.models.indexOf('claude-code:opus');
-      const insertAt = opusIndex >= 0 ? opusIndex + 1 : claudeCode.models.length;
-      claudeCode.models = [
-        ...claudeCode.models.slice(0, insertAt),
-        'claude-code:opus-4-6',
-        ...claudeCode.models.slice(insertAt),
-      ];
-      this.settingsStore!.set('providerSettings', providerSettings);
+
+    // An empty/undefined models array means "allow all", so there is nothing to
+    // back-fill — only reconcile an explicit allow-list.
+    if (claudeCode && Array.isArray(claudeCode.models) && claudeCode.models.length > 0) {
+      const result = reconcileClaudeCodeModels(claudeCode.models, known);
+      if (result.changed) {
+        claudeCode.models = result.models;
+        this.settingsStore!.set('providerSettings', providerSettings);
+      }
+      this.settingsStore!.set(KNOWN_KEY, result.known);
+    } else {
+      // Still advance the snapshot so a later switch to an explicit list starts
+      // from the current catalog instead of re-flagging everything as new.
+      this.settingsStore!.set(KNOWN_KEY, reconcileClaudeCodeModels([], known).known);
     }
-    this.settingsStore!.set(MIGRATION_KEY, true);
   }
 
   private getSettingsStore(): Store<Record<string, unknown>> {
@@ -380,7 +460,15 @@ export class AIService {
                 enabled: true,
                 testStatus: "idle",
                 installStatus: "not-installed",
-                models: ["claude-code:opus", "claude-code:opus-4-6", "claude-code:sonnet", "claude-code:haiku"]
+                // Allow-all: no curated default list. There is no UI to curate
+                // claude-code models and nothing writes this array, so shipping a
+                // hardcoded subset only creates drift — a newly-added variant that
+                // someone forgets to list gets silently filtered out of the picker
+                // (this is how Fable 5 and sonnet-4-6 disappeared, NIM-1486). An
+                // empty list means "show whatever the catalog emits", so the
+                // catalog (ClaudeCodeProvider.getModels) is the single source of
+                // truth and cannot drift.
+                models: []
               },
               openai: {
                 enabled: false,
@@ -402,13 +490,17 @@ export class AIService {
             type: 'boolean',
             default: false  // Hidden by default, developer mode only
           },
+          chatShowToolCalls: {
+            type: 'boolean',
+            default: true  // User-facing chat toggle; defaults true to preserve current UX
+          },
           aiDebugLogging: {
             type: 'boolean',
             default: false  // Hidden by default, developer mode only
           }
         }
       });
-      this.migrateClaudeCodeModelList();
+      this.reconcileClaudeCodeModelList();
     }
     return this.settingsStore;
   }
@@ -443,6 +535,15 @@ export class AIService {
     // NEVER fall back to process.env — users must explicitly set keys in settings.
     // Implicit env-var usage caused a user to burn $100+ on their personal Anthropic
     // account because Nimbalyst silently picked up ANTHROPIC_API_KEY from a .env file.
+
+    // Extension-agent providers (aiAgentProviders contributions) defer auth to
+    // the extension itself (e.g. Antigravity rides ~/.gemini OAuth). The host
+    // does not manage their API key. See providerResolution.ts for the shim
+    // until session.provider is widened to a discriminated union.
+    if (isExtensionAgentProvider(provider)) {
+      return 'not-required';
+    }
+
     switch (provider) {
       case 'claude':
         return globalApiKeys['anthropic'];
@@ -470,23 +571,23 @@ export class AIService {
     const effectiveWorkspacePath = session.workspacePath || workspacePath;
     const apiKey = this.getApiKeyForProvider('claude-code', effectiveWorkspacePath);
 
+    const effortLevel = resolveEffortLevel((session.metadata as any)?.effortLevel, getDefaultEffortLevel());
     const config: ProviderConfig = {
       maxTokens: (session.providerConfig as any)?.maxTokens,
       temperature: (session.providerConfig as any)?.temperature,
       ...(apiKey ? { apiKey } : {}),
-      ...((session.metadata as any)?.effortLevel && {
-        effortLevel: parseEffortLevel((session.metadata as any).effortLevel),
-      }),
+      ...(effortLevel && { effortLevel }),
     };
 
     const fullModel = session.model || session.providerConfig?.model;
     if (fullModel) {
       config.model = fullModel;
     } else {
-      const defaultModel = await ModelRegistry.getDefaultModel('claude-code');
-      if (defaultModel) {
-        config.model = defaultModel;
-      }
+      // Billing safety (#631 / NIM-848): a session with no resolved model must
+      // fall back to a STANDARD 200k model, never the 1M user-facing default
+      // (ModelRegistry.getDefaultModel('claude-code') is `opus-1m`). Sending the
+      // paid 1M beta for an empty/lost model silently bills the user.
+      config.model = CLAUDE_CODE_SAFE_FALLBACK_MODEL;
     }
 
     return config;
@@ -554,110 +655,171 @@ export class AIService {
     await this.processQueuedPrompt(sessionId, workspacePath, targetWindow);
   }
 
+  public async tryDispatchNextQueuedPrompt(
+    sessionId: string,
+    workspacePath: string,
+    targetWindow: Electron.BrowserWindow | null,
+    source: string,
+  ): Promise<boolean> {
+    // NIM-834: claude-code-cli sessions have no in-process turn driver — the SDK
+    // dispatch below would call the provider's Phase 1 sendMessage stub and mark
+    // the prompt failed (broke meta-agent spawns, restart continuations, and
+    // scheduled wakeups for CLI sessions). Route them onto the CLI's PTY
+    // queue-drain rails instead: launch the genuine CLI if needed and let the
+    // PID watcher's idle flush deliver the prompt.
+    let dispatchSession: { provider?: string; model?: string | null; worktreeId?: string | null } | null = null;
+    try {
+      const { AISessionsRepository } = await import('@nimbalyst/runtime/storage/repositories/AISessionsRepository');
+      dispatchSession = await AISessionsRepository.get(sessionId);
+    } catch (lookupError) {
+      logger.main.warn(`[AIService] ${source}: provider lookup failed before queued dispatch:`, lookupError);
+    }
+    if (dispatchSession?.provider === 'claude-code-cli') {
+      return this.dispatchQueuedPromptToClaudeCliSession(sessionId, workspacePath, dispatchSession, source);
+    }
+
+    const { getQueuedPromptsStore } = await import('../RepositoryManager');
+    const queueStore = getQueuedPromptsStore();
+
+    // Captures whether the just-settled child chain ended in 'error' so the
+    // meta-agent wakeup (onAfterSettled) can skip re-driving the parent for a
+    // dead child. endSession (in onChainSettled, which runs before onAfterSettled)
+    // evicts the child from the state manager, so its terminal status must be
+    // read in onChainSettled before that happens.
+    let settledChildErrored = false;
+
+    return tryClaimAndDispatchNextQueuedPrompt({
+      continueQueuedPromptChain: (nextSessionId, nextWorkspacePath, nextTargetWindow, nextSource) =>
+        this.continueQueuedPromptChain(nextSessionId, nextWorkspacePath, nextTargetWindow, nextSource),
+      logError: (message, error) => logger.main.error(message, error),
+      logInfo: (message) => logger.main.info(message),
+      onAfterSettled: async () => {
+        try {
+          const { AISessionsRepository } = await import('@nimbalyst/runtime/storage/repositories/AISessionsRepository');
+          const childSession = await AISessionsRepository.get(sessionId);
+          if (!childSession?.createdBySessionId) return;
+
+          // Honor fire-and-forget. spawn_session sets metadata.notifyParent=false
+          // on the child for /launch-new-session-style hand-offs where the parent
+          // does not want to be re-driven when the child settles. Without this
+          // guard, every child settle wakes the parent unconditionally, which
+          // re-drives the meta-agent in a loop. Matches the guard in
+          // MetaAgentService.handleChildSessionEvent.
+          const childMetadata = (childSession.metadata as Record<string, unknown> | undefined) ?? undefined;
+          if (childMetadata && childMetadata.notifyParent === false) return;
+
+          // Do not re-drive the parent when the child chain just settled in
+          // 'error'. A failed child (e.g. an antigravity 429) has no result to
+          // deliver, and waking the parent on every such settle is the meta-agent
+          // spin loop. Native children settle 'completed', so this is a no-op for
+          // them. settledChildErrored is captured in onChainSettled before
+          // endSession evicts the child's in-memory state.
+          if (settledChildErrored) return;
+
+          const metaSession = await AISessionsRepository.get(childSession.createdBySessionId);
+          if (!metaSession?.workspacePath) return;
+
+          const stateManager = getSessionStateManager();
+          const metaState = stateManager.getSessionState(metaSession.id);
+          const metaStatus = metaState?.status || 'idle';
+          if (metaStatus === 'idle' || metaStatus === 'error') {
+            logger.main.info(`[AIService] ${source}: waking meta-agent ${metaSession.id} after child ${sessionId} completed`);
+            this.triggerQueuedPromptProcessingForSession(metaSession.id, metaSession.workspacePath).catch((err) => {
+              logger.main.error('[AIService] Failed to trigger meta-agent queue processing:', err);
+            });
+          }
+        } catch (metaErr) {
+          logger.main.error(`[AIService] ${source}: error checking meta-agent wakeup:`, metaErr);
+        }
+      },
+      onChainSettled: async ({ sessionId: settledSessionId, source: settledSource }) => {
+        // The completion handler in MessageStreamingHandler deferred endSession
+        // because processingSet still contained this session while the inner
+        // sendMessage was running. Now that the chain has fully drained, mark
+        // the session idle and stop its file watcher.
+        const stateManager = getSessionStateManager();
+        // Capture the child's terminal status BEFORE endSession evicts it from
+        // the state manager, so onAfterSettled can avoid waking the parent for a
+        // child that just failed. getSessionState reads the in-memory map, which
+        // endSession clears on the next line.
+        settledChildErrored = stateManager.getSessionState(settledSessionId)?.status === 'error';
+        logger.main.info(`[AIService] ${settledSource}: chain settled for session ${settledSessionId}, ending session`);
+        await stateManager.endSession(settledSessionId);
+        this.hooklessWatcher.scheduleStop(settledSessionId, 500);
+      },
+      onPromptClaimed: ({ sessionId: claimedSessionId, promptId }) => {
+        targetWindow?.webContents.send('ai:promptClaimed', {
+          sessionId: claimedSessionId,
+          promptId,
+        });
+      },
+      processingSet: this.sessionsProcessingQueue,
+      queueStore,
+      sendMessageHandler: this.sendMessageHandler,
+      sessionId,
+      source,
+      startSession: ({ sessionId: activeSessionId, workspacePath: activeWorkspacePath }) =>
+        getSessionStateManager().startSession({
+          sessionId: activeSessionId,
+          workspacePath: activeWorkspacePath,
+        }),
+      targetWindow,
+      workspacePath,
+    });
+  }
+
+  /**
+   * NIM-834: deliver queued prompts to a claude-code-cli session via the CLI
+   * rails (launch + PID-watcher idle flush) instead of the SDK dispatcher.
+   * Worktree-linked sessions spawn the CLI in the worktree so edits land where
+   * the session's view points.
+   */
+  private async dispatchQueuedPromptToClaudeCliSession(
+    sessionId: string,
+    workspacePath: string,
+    session: { model?: string | null; worktreeId?: string | null },
+    source: string,
+  ): Promise<boolean> {
+    let cwd: string | undefined;
+    if (session.worktreeId) {
+      try {
+        const { createWorktreeStore } = await import('../WorktreeStore');
+        const { getDatabase } = await import('../../database/initialize');
+        const db = getDatabase();
+        const worktree = db ? await createWorktreeStore(db).get(session.worktreeId) : null;
+        cwd = worktree?.path ?? undefined;
+      } catch (worktreeError) {
+        logger.main.warn(`[AIService] ${source}: worktree lookup failed for CLI queued dispatch:`, worktreeError);
+      }
+    }
+
+    const terminalManager = getTerminalSessionManager();
+    return dispatchQueuedPromptToClaudeCli(
+      {
+        isTerminalActive: (id) => terminalManager.isTerminalActive(id),
+        ensureSession: (input) => ensureClaudeCliSession(input),
+        getLiveTurnState: (id) => terminalManager.getClaudeCliLiveTurnState(id),
+        getSnapshotStatus: (id) => getSessionStateManager().getSessionState(id)?.status ?? null,
+        flushNext: (id, ws) => flushNextClaudeCliQueuedPromptForSession(id, ws),
+        logInfo: (message) => logger.main.info(`[AIService] ${source}: ${message}`),
+        logWarn: (message) => logger.main.warn(`[AIService] ${source}: ${message}`),
+      },
+      { sessionId, workspacePath, model: session.model, cwd },
+    );
+  }
+
   /**
    * Process the next queued prompt for a session.
    * Called from mobile sync handler to ensure prompts are processed even when session isn't open.
    * Also used by the ai:triggerQueueProcessing IPC handler.
    */
   private async processQueuedPrompt(sessionId: string, workspacePath: string, targetWindow: Electron.BrowserWindow): Promise<boolean> {
-    // Prevent concurrent queue processing for the same session.
-    // Multiple callers (completion handler, triggerQueueProcessing IPC, mobile sync)
-    // can race here - only one should process at a time.
-    if (this.sessionsProcessingQueue.has(sessionId)) {
-      logger.main.info(`[AIService] processQueuedPrompt: session ${sessionId} already processing a queued prompt, skipping`);
-      return false;
-    }
-
-    const { getQueuedPromptsStore } = await import('../RepositoryManager');
-    const queueStore = getQueuedPromptsStore();
-    const pendingPrompts = await queueStore.listPending(sessionId);
-
-    if (pendingPrompts.length === 0) {
-      logger.main.info(`[AIService] processQueuedPrompt: no pending prompts for session ${sessionId}`);
-      return false;
-    }
-
-    const nextPrompt = pendingPrompts[0];
-    logger.main.info(`[AIService] processQueuedPrompt: processing prompt ${nextPrompt.id} for session ${sessionId}`);
-
-    // Claim the prompt atomically
-    const claimed = await queueStore.claim(nextPrompt.id);
-    if (!claimed) {
-      logger.main.info(`[AIService] processQueuedPrompt: prompt ${nextPrompt.id} already claimed`);
-      return false;
-    }
-
-    // Mark session as processing before the setImmediate
-    this.sessionsProcessingQueue.add(sessionId);
-
-    // Notify renderer that prompt was claimed (so UI removes it from queue list)
-    if (targetWindow && !targetWindow.isDestroyed()) {
-      targetWindow.webContents.send('ai:promptClaimed', {
-        sessionId,
-        promptId: claimed.id,
-      });
-    }
-
-    // Build document context for the queued prompt
-    const docContext = {
-      ...claimed.documentContext,
-      queuedPromptId: claimed.id,
-      attachments: claimed.attachments,
-    };
-
-    // Process the prompt via sendMessage
-    setImmediate(async () => {
-      try {
-        if (!this.sendMessageHandler) {
-          throw new Error('sendMessageHandler not initialized');
-        }
-        // Create a mock event with the target window's webContents
-        const mockEvent = {
-          sender: targetWindow.webContents,
-          senderFrame: targetWindow.webContents.mainFrame,
-        } as Electron.IpcMainInvokeEvent;
-
-        await this.sendMessageHandler(mockEvent, claimed.prompt, docContext as any, sessionId, workspacePath);
-        // Mark as completed
-        await queueStore.complete(claimed.id);
-      } catch (queueError) {
-        logger.main.error(`[AIService] Failed to process queued prompt ${claimed.id}:`, queueError);
-        await queueStore.fail(claimed.id, queueError instanceof Error ? queueError.message : 'Unknown error');
-      } finally {
-        this.sessionsProcessingQueue.delete(sessionId);
-
-        try {
-          await this.continueQueuedPromptChain(sessionId, workspacePath, targetWindow, 'processQueuedPrompt finally');
-        } catch (chainErr) {
-          logger.main.error('[AIService] processQueuedPrompt finally: error checking for pending prompts:', chainErr);
-        }
-
-        // If this was a meta-agent child session, ensure the meta-agent
-        // processes any queued notifications (wakeup safety net).
-        try {
-          const { AISessionsRepository } = await import('@nimbalyst/runtime/storage/repositories/AISessionsRepository');
-          const childSession = await AISessionsRepository.get(sessionId);
-          if (childSession?.createdBySessionId) {
-            const metaSession = await AISessionsRepository.get(childSession.createdBySessionId);
-            if (metaSession?.workspacePath) {
-              const stateManager = getSessionStateManager();
-              const metaState = stateManager.getSessionState(metaSession.id);
-              const metaStatus = metaState?.status || 'idle';
-              if (metaStatus === 'idle' || metaStatus === 'error') {
-                logger.main.info(`[AIService] processQueuedPrompt: waking meta-agent ${metaSession.id} after child ${sessionId} completed`);
-                this.triggerQueuedPromptProcessingForSession(metaSession.id, metaSession.workspacePath).catch((err) => {
-                  logger.main.error('[AIService] Failed to trigger meta-agent queue processing:', err);
-                });
-              }
-            }
-          }
-        } catch (metaErr) {
-          logger.main.error('[AIService] processQueuedPrompt: error checking meta-agent wakeup:', metaErr);
-        }
-      }
-    });
-
-    return true;
+    return this.tryDispatchNextQueuedPrompt(
+      sessionId,
+      workspacePath,
+      targetWindow,
+      'processQueuedPrompt',
+    );
   }
 
   private async initializeMobileSyncHandler() {
@@ -975,6 +1137,7 @@ export class AIService {
             const resolvedProvider = (request.provider || 'claude-code') as import('@nimbalyst/runtime/ai/server/types').AIProviderType;
             const resolvedModel = request.model || getDefaultAIModel() || 'claude-code:opus-1m';
             const resolvedSessionType = (request.sessionType || 'session') as import('@nimbalyst/runtime/ai/server/types').SessionType;
+            const resolvedAgentRole = (request.agentRole || 'standard') as import('@nimbalyst/runtime/ai/server/types').AgentRole;
             const session = await this.sessionManager.createSession(
               resolvedProvider,        // provider - from mobile or default
               undefined,               // documentContext
@@ -982,7 +1145,11 @@ export class AIService {
               undefined,               // providerConfig
               resolvedModel,           // model - from mobile or desktop default
               resolvedSessionType,     // sessionType - from mobile request
-              'agent'                  // mode
+              'agent',                 // mode
+              undefined,               // worktreeId
+              undefined,               // worktreePath
+              undefined,               // worktreeProjectPath
+              resolvedAgentRole        // agentRole - from mobile request or 'standard'
             );
 
             // If a parentSessionId was provided, set it on the session
@@ -998,12 +1165,19 @@ export class AIService {
             });
             if (session && syncProvider.syncSessionsToIndex) {
               // logger.main.info('[AIService] Syncing new session to index:', session.id);
+              // parentSessionId must be present here -- syncSessionsToIndex
+              // builds a fresh index entry from this payload and clobbers any
+              // partial parentSessionId set by the updateMetadata() above. Mobile
+              // clients (iOS) need the parent association on the first sight of
+              // the session or it shows up as a free-floating sibling.
               syncProvider.syncSessionsToIndex([{
                 id: session.id,
                 title: session.title ?? 'Untitled',
                 provider: session.provider,
                 model: session.model,
                 mode: session.mode,
+                sessionType: session.sessionType,
+                parentSessionId: request.parentSessionId ?? session.parentSessionId ?? undefined,
                 workspaceId: session.workspacePath,
                 workspacePath: session.workspacePath,
                 messageCount: session.messages.length,
@@ -1084,6 +1258,48 @@ export class AIService {
         // logger.main.info('[AIService] Session creation request handler initialized');
       } else {
         // logger.main.info('[AIService] onCreateSessionRequest not available on sync provider');
+      }
+
+      // Handle voice-tool requests from mobile (e.g. project-memory lookups).
+      // The mobile voice agent proxies desktop-hosted voice tools through here;
+      // we run the tool (gated to voiceAgent:true tools) and return the result.
+      if (syncProvider.onVoiceToolRequest && syncProvider.sendVoiceToolResponse) {
+        syncProvider.onVoiceToolRequest(async (request) => {
+          // Deduplicate - the same request can be delivered more than once.
+          if (this.processingMobileSessionRequests.has(request.requestId)) {
+            return;
+          }
+          this.processingMobileSessionRequests.add(request.requestId);
+          setTimeout(() => {
+            this.processingMobileSessionRequests.delete(request.requestId);
+          }, 60000);
+
+          try {
+            // Static import (top of file): a dynamic import() here re-runs the
+            // electron-log init chain in a separate chunk -> "Attempted to
+            // register a second handler for '__ELECTRON_LOG__'" crash. See the
+            // "No Dynamic Imports in Electron Main Process" rule in CLAUDE.md.
+            // request.projectId is the desktop workspace path.
+            const outcome = await handleMobileVoiceToolCall(
+              request.toolName,
+              request.argsJson,
+              request.projectId,
+            );
+            await syncProvider.sendVoiceToolResponse!({
+              requestId: request.requestId,
+              success: outcome.success,
+              resultJson: outcome.result ? JSON.stringify({ result: outcome.result }) : undefined,
+              error: outcome.error,
+            });
+          } catch (error) {
+            logger.main.error('[AIService] Voice tool request failed:', error);
+            await syncProvider.sendVoiceToolResponse!({
+              requestId: request.requestId,
+              success: false,
+              error: error instanceof Error ? error.message : String(error),
+            });
+          }
+        });
       }
 
       // Handle worktree creation requests from mobile
@@ -1167,6 +1383,8 @@ export class AIService {
                 provider: 'claude-code',
                 model: defaultModel,
                 mode: 'agent',
+                sessionType: 'session',
+                worktreeId: worktree.id,
                 workspaceId: request.projectId,
                 workspacePath: request.projectId,
                 messageCount: 0,
@@ -1197,7 +1415,19 @@ export class AIService {
 
       // Initialize mobile session control handler (cancel, question responses, etc.)
       // This is in a separate module to keep AIService focused
-      initMobileSessionControlHandler(syncProvider, findWindowByWorkspace);
+      initMobileSessionControlHandler(syncProvider, findWindowByWorkspace, {
+        triggerQueuedPromptProcessing: (sessionId, workspacePath) =>
+          this.triggerQueuedPromptProcessingForSession(sessionId, workspacePath),
+        rollbackExecutingPrompts: async (sessionId) => {
+          // Use the delivery-aware sweep so that a mobile-initiated cancel
+          // doesn't re-deliver a prompt that already landed in the
+          // conversation. Returns the count of rows that actually moved
+          // back to pending (matches the prior contract).
+          const { getQueuedPromptsStore } = await import('../RepositoryManager');
+          const { rolledBack } = await getQueuedPromptsStore().sweepExecutingForSession(sessionId);
+          return rolledBack;
+        },
+      });
     } catch (error) {
       logger.main.error('[AIService] Failed to initialize mobile sync handler:', error);
     }
@@ -1223,6 +1453,60 @@ export class AIService {
     // NOTE: Message sync is handled automatically by SyncedAgentMessagesStore
 
     return provider;
+  }
+
+  private getProviderWorkflowCatalog(request: {
+    sessionId?: string;
+    provider?: string | null;
+  }): { commands: string[]; skills: string[] } {
+    const providerCandidates = request.provider
+      ? [request.provider]
+      : ['claude-code', 'openai-codex', 'openai-codex-acp', 'opencode'];
+
+    let provider: AIProvider | undefined;
+    for (const providerType of providerCandidates) {
+      if (!request.sessionId) {
+        break;
+      }
+
+      provider = ProviderFactory.getProvider(providerType as AIProviderType, request.sessionId) ?? undefined;
+      if (provider) {
+        break;
+      }
+    }
+
+    if (isSlashCommandCatalogProvider(provider)) {
+      const commands = typeof provider.getSlashCommands === 'function'
+        ? provider.getSlashCommands()
+        : [];
+      const skills = typeof provider.getSkills === 'function'
+        ? provider.getSkills()
+        : [];
+
+      if (commands.length > 0 || skills.length > 0) {
+        return { commands, skills };
+      }
+    }
+
+    if (request.provider === 'claude-code' || !request.provider) {
+      return {
+        commands: ClaudeCodeProvider.getCachedSdkSlashCommands(),
+        skills: ClaudeCodeProvider.getCachedSdkSkills(),
+      };
+    }
+
+    if (request.provider === 'openai-codex' || request.provider === 'openai-codex-acp') {
+      return {
+        commands: OpenAICodexProvider.getKnownSlashCommands(),
+        skills: [],
+      };
+    }
+
+    if (supportsWorkspaceSlashWorkflowProvider(request.provider)) {
+      return { commands: [], skills: [] };
+    }
+
+    return { commands: [], skills: [] };
   }
 
   /**
@@ -1322,7 +1606,6 @@ export class AIService {
                     tokens: parsedUsage.totalTokens,
                     contextWindow: parsedUsage.contextWindow,
                   },
-                  updatedAt: Date.now(),
                 } as any,
               });
             }
@@ -1459,36 +1742,43 @@ export class AIService {
       // Get API key using project-aware helper (considers project overrides)
       let apiKey = this.getApiKeyForProvider(provider, workspacePath);
 
-      // Validate API key requirement based on provider
-      switch (provider) {
-        case 'claude':
-          if (!apiKey) {
-            throw new Error('Anthropic API key not configured');
-          }
-          break;
-        case 'claude-code':
-          // Claude Code: API key is optional, uses SSO login if not provided
-          // No error if missing - will use SSO login
-          break;
-        case 'openai':
-          if (!apiKey) {
-            throw new Error('OpenAI API key not configured');
-          }
-          break;
-        case 'openai-codex':
-          // Codex SDK uses its own auth (codex auth login), API key is optional
-          break;
-        case 'opencode':
-          // OpenCode uses its own config, API key is optional
-          break;
-        case 'copilot-cli':
-          // Copilot uses its own CLI auth (copilot auth login), no API key needed
-          break;
-        case 'lmstudio':
-          // LMStudio doesn't need an API key, just the base URL
-          break;
-        default:
-          throw new Error(`Unknown provider: ${provider}`);
+      // Validate API key requirement based on provider.
+      // Extension-agent providers defer auth to the extension itself, so they
+      // skip this switch entirely (no apiKey requirement on the host side).
+      if (!isExtensionAgentProvider(provider)) {
+        switch (provider) {
+          case 'claude':
+            if (!apiKey) {
+              throw new Error('Anthropic API key not configured');
+            }
+            break;
+          case 'claude-code':
+            // Claude Code: API key is optional, uses SSO login if not provided
+            // No error if missing - will use SSO login
+            break;
+          case 'claude-code-cli':
+            // Genuine `claude` CLI: uses its own login/subscription, no API key.
+            break;
+          case 'openai':
+            if (!apiKey) {
+              throw new Error('OpenAI API key not configured');
+            }
+            break;
+          case 'openai-codex':
+            // Codex SDK uses its own auth (codex auth login), API key is optional
+            break;
+          case 'opencode':
+            // OpenCode uses its own config, API key is optional
+            break;
+          case 'copilot-cli':
+            // Copilot uses its own CLI auth (copilot auth login), no API key needed
+            break;
+          case 'lmstudio':
+            // LMStudio doesn't need an API key, just the base URL
+            break;
+          default:
+            throw new Error(`Unknown provider: ${provider}`);
+        }
       }
 
       // Get model details if specified
@@ -1570,8 +1860,19 @@ export class AIService {
         });
       }
 
-      // Create and initialize provider
-      const providerInstance = ProviderFactory.createProvider(provider, session.id);
+      // Create and initialize provider. Extension-contributed agent providers
+      // are not in the built-in AIProviderType switch, so route them to the
+      // extension-agent factory (mirrors MessageStreamingHandler's lazy path).
+      // Calling createProvider for them would throw "Unknown provider".
+      const eagerExtAgentRef = resolveExtensionAgentRef(provider);
+      const providerInstance = eagerExtAgentRef
+        ? ProviderFactory.createExtensionAgentProvider({
+            extensionId: eagerExtAgentRef.extensionId,
+            contributionId: eagerExtAgentRef.contributionId,
+            sessionId: session.id,
+            model: session.model,
+          })
+        : ProviderFactory.createProvider(provider, session.id);
 
       // Build config based on provider type
       const initConfig: any = {
@@ -1632,16 +1933,19 @@ export class AIService {
         if (providerSettings?.['claude-code']?.allowedTools) {
           initConfig.allowedTools = providerSettings['claude-code'].allowedTools;
         }
-        // Pass effort level from session metadata (Opus 4.6 adaptive reasoning)
-        if ((session.metadata as any)?.effortLevel) {
-          initConfig.effortLevel = parseEffortLevel((session.metadata as any).effortLevel);
+        // Effort level: explicit session value, else the app-wide default the
+        // selector displays (Opus 4.6 adaptive reasoning).
+        const effortLevel = resolveEffortLevel((session.metadata as any)?.effortLevel, getDefaultEffortLevel());
+        if (effortLevel) {
+          initConfig.effortLevel = effortLevel;
         }
       }
 
       // Pass effort level for OpenAI Codex
       if (provider === 'openai-codex') {
-        if ((session.metadata as any)?.effortLevel) {
-          initConfig.effortLevel = parseEffortLevel((session.metadata as any).effortLevel);
+        const effortLevel = resolveEffortLevel((session.metadata as any)?.effortLevel, getDefaultEffortLevel());
+        if (effortLevel) {
+          initConfig.effortLevel = effortLevel;
         }
       }
 
@@ -1701,6 +2005,8 @@ export class AIService {
         console.log(`[SESSION] Session not found: ${sessionId} (this is normal if the session was deleted)`);
         return null;
       }
+
+      session.messages = await enrichTranscriptMessagesWithToolCallDiffs(session.id, session.messages);
 
       // Restore document context state from persisted data (if available)
       // This enables transition detection across app restarts
@@ -1895,14 +2201,22 @@ export class AIService {
 
       logger.main.info(`[AIService] createQueuedPrompt: created ${promptId} for session ${sessionId}`);
 
-      // Track ai_message_queued analytics event
+      // Look up the session once (lightweight — no message log) for both the
+      // analytics event and the claude-code-cli idle-flush kick below.
+      let queuedSession: { provider?: string; workspacePath?: string } | null = null;
       try {
         const { AISessionsRepository } = await import('@nimbalyst/runtime/storage/repositories/AISessionsRepository');
-        const session = await AISessionsRepository.get(sessionId);
-        if (session) {
+        queuedSession = await AISessionsRepository.get(sessionId);
+      } catch (lookupError) {
+        logger.main.warn('[AIService] createQueuedPrompt: session lookup failed:', lookupError);
+      }
+
+      // Track ai_message_queued analytics event
+      try {
+        if (queuedSession) {
           const fileExtension = getFileExtensionForAnalytics(documentContext?.filePath);
           AnalyticsService.getInstance().sendEvent('ai_message_queued', {
-            provider: session.provider,
+            provider: queuedSession.provider,
             source: 'local',
             hasDocumentContext: !!documentContext,
             hasAttachments: !!(attachments && attachments.length > 0),
@@ -1919,6 +2233,38 @@ export class AIService {
         sessionId,
         promptCount: 1
       });
+
+      // claude-code-cli (NIM-806): the CLI queue normally drains on the PID
+      // watcher's running->idle transition. But a prompt queued while the CLI is
+      // ALREADY idle (e.g. smart-commit on a session sitting at its prompt) has no
+      // transition to ride, so it would sit forever. If the terminal is live and
+      // the session is idle right now, kick a flush directly. The flush singleton's
+      // in-flight guard + DB claim make this safe against a concurrent transition
+      // flush; if the CLI is mid-turn (running/waiting), we skip and let the next
+      // idle transition drain it.
+      //
+      // NIM-821: idleness is decided from the LIVE PID file, not just
+      // SessionStateManager's snapshot — the snapshot is updated asynchronously
+      // from the PID watcher, and a prompt queued inside that gap (PID already
+      // idle, state still 'running') skipped the kick with no future idle
+      // transition ever coming. Either signal saying idle kicks the flush; the
+      // claim is race-safe, so erring toward flushing is fine.
+      if (queuedSession?.provider === 'claude-code-cli') {
+        const terminalManager = getTerminalSessionManager();
+        const state = getSessionStateManager().getSessionState(sessionId);
+        const workspacePath = queuedSession.workspacePath ?? state?.workspacePath;
+        if (terminalManager.isTerminalActive(sessionId) && workspacePath) {
+          if (state?.status === 'idle') {
+            void flushNextClaudeCliQueuedPromptForSession(sessionId, workspacePath);
+          } else {
+            void terminalManager.getClaudeCliLiveTurnState(sessionId).then((live) => {
+              if (live === 'idle') {
+                void flushNextClaudeCliQueuedPromptForSession(sessionId, workspacePath);
+              }
+            }).catch(() => {});
+          }
+        }
+      }
 
       return {
         id: created.id,
@@ -1947,72 +2293,14 @@ export class AIService {
       sessionId: string,
       workspacePath: string
     ) => {
-      // Check per-session guard - the completion handler may already be processing for this session
-      if (this.sessionsProcessingQueue.has(sessionId)) {
-        logger.main.info(`[AIService] triggerQueueProcessing: session ${sessionId} already processing a queued prompt, skipping`);
-        return { processed: false };
-      }
-
-      const { getQueuedPromptsStore } = await import('../RepositoryManager');
-      const queueStore = getQueuedPromptsStore();
-      const pendingPrompts = await queueStore.listPending(sessionId);
-
-      if (pendingPrompts.length === 0) {
-        logger.main.info(`[AIService] triggerQueueProcessing: no pending prompts for session ${sessionId}`);
-        return { processed: false };
-      }
-
-      const nextPrompt = pendingPrompts[0];
-      logger.main.info(`[AIService] triggerQueueProcessing: processing prompt ${nextPrompt.id} for session ${sessionId}`);
-
-      // Claim the prompt atomically
-      const claimed = await queueStore.claim(nextPrompt.id);
-      if (!claimed) {
-        logger.main.info(`[AIService] triggerQueueProcessing: prompt ${nextPrompt.id} already claimed`);
-        return { processed: false };
-      }
-
-      // Mark session as processing before the setImmediate
-      this.sessionsProcessingQueue.add(sessionId);
-
-      // Notify renderer that prompt was claimed (so UI removes it from queue list)
-      safeSend(event, 'ai:promptClaimed', {
+      const processed = await this.tryDispatchNextQueuedPrompt(
         sessionId,
-        promptId: claimed.id,
-      });
+        workspacePath,
+        BrowserWindow.fromWebContents(event.sender),
+        'triggerQueueProcessing',
+      );
 
-      // Build document context for the queued prompt
-      const docContext = {
-        ...claimed.documentContext,
-        queuedPromptId: claimed.id,
-        attachments: claimed.attachments,
-      };
-
-      // Process the prompt via sendMessage
-      setImmediate(async () => {
-        try {
-          await this.sendMessageHandler!(event, claimed.prompt, docContext as any, sessionId, workspacePath);
-          // Mark as completed
-          await queueStore.complete(claimed.id);
-        } catch (queueError) {
-          logger.main.error(`[AIService] Failed to process queued prompt ${claimed.id}:`, queueError);
-          await queueStore.fail(claimed.id, queueError instanceof Error ? queueError.message : 'Unknown error');
-        } finally {
-          this.sessionsProcessingQueue.delete(sessionId);
-          try {
-            await this.continueQueuedPromptChain(
-              sessionId,
-              workspacePath,
-              BrowserWindow.fromWebContents(event.sender),
-              'triggerQueueProcessing finally'
-            );
-          } catch (chainErr) {
-            logger.main.error('[AIService] triggerQueueProcessing finally: error checking for pending prompts:', chainErr);
-          }
-        }
-      });
-
-      return { processed: true };
+      return { processed };
     });
 
     // Save draft input
@@ -2133,13 +2421,19 @@ export class AIService {
         return { success: false, error: 'Session not found' };
       }
 
+      // External/agentless providers (e.g. claude-code-cli) have NO in-process
+      // provider instance holding the pending question — the MCP server handler is
+      // blocked on the IPC response channel instead (see interactiveToolHandlers
+      // handleAskUserQuestion). So a missing provider is NOT fatal: skip the
+      // provider-level resolve and fall through to the MCP-channel emit / DB
+      // fallback / auto-resume below. (Previously this returned early, so a CLI
+      // session's answered widget never reached the waiting MCP handler — NIM-806.)
       const provider = ProviderFactory.getProvider(session.provider as AIProviderType, resolvedSessionId);
       if (!provider) {
-        logger.main.warn(`[AIService] Provider not found for AskUserQuestion: ${resolvedSessionId}`);
-        return { success: false, error: 'Provider not found' };
+        logger.main.info(`[AIService] No in-process provider for AskUserQuestion (${session.provider}); routing via MCP/IPC channel: ${resolvedSessionId}`);
       }
 
-      const providerResolved = isAskUserQuestionProvider(provider)
+      const providerResolved = provider && isAskUserQuestionProvider(provider)
         ? provider.resolveAskUserQuestion(questionId, answers, resolvedSessionId, 'desktop')
         : false;
 
@@ -2258,13 +2552,14 @@ export class AIService {
         return { success: false, error: 'Session not found' };
       }
 
+      // Missing provider is non-fatal here too (claude-code-cli has no in-process
+      // instance) — fall through to the MCP/IPC cancel emit + DB fallback. NIM-806.
       const provider = ProviderFactory.getProvider(session.provider as AIProviderType, resolvedSessionId);
       if (!provider) {
-        logger.main.warn(`[AIService] Provider not found for AskUserQuestion cancel: ${resolvedSessionId}`);
-        return { success: false, error: 'Provider not found' };
+        logger.main.info(`[AIService] No in-process provider for AskUserQuestion cancel (${session.provider}); routing via MCP/IPC channel: ${resolvedSessionId}`);
       }
 
-      const providerSupportsCancel = typeof (provider as any).rejectAskUserQuestion === 'function';
+      const providerSupportsCancel = !!provider && typeof (provider as any).rejectAskUserQuestion === 'function';
       if (providerSupportsCancel) {
         (provider as any).rejectAskUserQuestion(questionId, new Error('User cancelled'));
       }
@@ -2324,7 +2619,7 @@ export class AIService {
       // interrupt the in-flight MCP request before the cancellation result is delivered.
       if (!hasMcpWaiter && !hasSessionFallbackWaiter) {
         // Provider-backed AskUserQuestion path (Claude Code): abort active turn.
-        provider.abort();
+        provider?.abort();
       }
 
       return { success: true };
@@ -2339,7 +2634,7 @@ export class AIService {
     }: {
       requestId: string;
       sessionId: string;
-      response: { decision: 'allow' | 'deny'; scope: 'once' | 'session' | 'always' }
+      response: { decision: 'allow' | 'deny'; scope: 'once' | 'session' | 'always' | 'always-all' }
     }) => {
       logger.main.info(`[AIService] Tool permission response received: requestId=${requestId}, decision=${response.decision}, scope=${response.scope}`);
 
@@ -2357,21 +2652,48 @@ export class AIService {
         return { success: false, error: 'Session not found' };
       }
 
+      // SDK path (ClaudeCodeProvider) resolves via the in-process provider.
       const provider = ProviderFactory.getProvider(session.provider as AIProviderType, sessionId);
-      if (!provider) {
-        logger.main.warn(`[AIService] Provider not found for tool permission: ${sessionId}`);
-        return { success: false, error: 'Provider not found' };
-      }
-
-      // Check if this is a ClaudeCodeProvider with the resolve method
-      if (typeof (provider as any).resolveToolPermission === 'function') {
-        // Pass sessionId for response message persistence
+      if (provider && typeof (provider as any).resolveToolPermission === 'function') {
         (provider as any).resolveToolPermission(requestId, response, sessionId, 'desktop');
         return { success: true };
-      } else {
-        logger.main.warn(`[AIService] Provider does not support tool permission: ${session.provider}`);
-        return { success: false, error: 'Provider does not support tool permission' };
       }
+
+      // External/agentless providers (e.g. claude-code-cli) have NO in-process
+      // provider holding the pending permission — the MCP handler
+      // (handleToolPermission) is blocked on the per-request IPC channel instead.
+      // So a missing/unsupported provider is NOT fatal: emit on that channel so
+      // the waiting MCP handler resolves and returns the decision to the CLI.
+      // (Mirrors the AskUserQuestion CLI fix — NIM-806.)
+      const { AgentMessagesRepository } = await import('@nimbalyst/runtime/storage/repositories/AgentMessagesRepository');
+      await AgentMessagesRepository.create({
+        sessionId,
+        source: 'nimbalyst',
+        direction: 'output',
+        createdAt: new Date(),
+        content: JSON.stringify(buildToolPermissionResponseRecord({
+          requestId,
+          answer: response,
+          respondedBy: 'desktop',
+        })),
+      });
+
+      const mcpPermissionChannel = `tool-permission-response:${sessionId}:${requestId}`;
+      const hasMcpWaiter = ipcMain.listenerCount(mcpPermissionChannel) > 0;
+      if (hasMcpWaiter) {
+        logger.main.info(`[AIService] Tool permission emitting on MCP channel: ${mcpPermissionChannel}`);
+        ipcMain.emit(mcpPermissionChannel, event, {
+          requestId,
+          sessionId,
+          decision: response.decision,
+          scope: response.scope,
+          respondedBy: 'desktop',
+        });
+        return { success: true };
+      }
+
+      logger.main.info(`[AIService] Tool permission response persisted without live MCP waiter: ${session.provider} (${sessionId})`);
+      return { success: true };
     });
 
     // Handle tool permission cancel from renderer
@@ -2399,22 +2721,33 @@ export class AIService {
         return { success: false, error: 'Session not found' };
       }
 
+      // SDK path: reject via the in-process provider and abort the turn.
       const provider = ProviderFactory.getProvider(session.provider as AIProviderType, sessionId);
-      if (!provider) {
-        logger.main.warn(`[AIService] Provider not found for tool permission cancel: ${sessionId}`);
-        return { success: false, error: 'Provider not found' };
-      }
-
-      // Check if this is a ClaudeCodeProvider with the reject method
-      if (typeof (provider as any).rejectToolPermission === 'function') {
+      if (provider && typeof (provider as any).rejectToolPermission === 'function') {
         (provider as any).rejectToolPermission(requestId, new Error('User cancelled'));
-        // Also abort the provider to stop the AI request
         provider.abort();
         return { success: true };
-      } else {
-        logger.main.warn(`[AIService] Provider does not support tool permission cancel: ${session.provider}`);
-        return { success: false, error: 'Provider does not support tool permission cancel' };
       }
+
+      // External CLI: no provider to reject. Settle the blocked MCP handler with a
+      // cancelled deny so it returns {behavior:'deny'} to the CLI (NIM-806).
+      const mcpPermissionChannel = `tool-permission-response:${sessionId}:${requestId}`;
+      const hasMcpWaiter = ipcMain.listenerCount(mcpPermissionChannel) > 0;
+      if (hasMcpWaiter) {
+        logger.main.info(`[AIService] Tool permission cancel emitting on MCP channel: ${mcpPermissionChannel}`);
+        ipcMain.emit(mcpPermissionChannel, event, {
+          requestId,
+          sessionId,
+          decision: 'deny',
+          scope: 'once',
+          cancelled: true,
+          respondedBy: 'desktop',
+        });
+        return { success: true };
+      }
+
+      logger.main.warn(`[AIService] No provider or MCP waiter for tool permission cancel: ${session.provider} (${sessionId})`);
+      return { success: false, error: 'No handler for tool permission cancel' };
     });
 
     // Cancel current request
@@ -2434,6 +2767,23 @@ export class AIService {
         return { success: false, error: 'Session not found' };
       }
 
+      if (session.provider === 'claude-code-cli') {
+        const terminalManager = getTerminalSessionManager();
+        if (!terminalManager.isTerminalActive(sessionId)) {
+          console.warn(`[AIService] Cancel failed - no active claude-code-cli terminal for session: ${sessionId}`);
+          return { success: false, error: 'No active terminal for session' };
+        }
+
+        terminalManager.writeToTerminal(sessionId, '\x03');
+        this.analytics.sendEvent('ai_stream_interrupted', {
+          provider: 'claude-code-cli',
+          chunksReceived: chunksReceived || 0,
+          reason: 'user_cancel'
+        });
+        this.analytics.sendEvent('cancel_ai_request', { provider: 'claude-code-cli' });
+        return { success: true };
+      }
+
       // console.log(`[AIService] Session found, provider type: ${session.provider}`);
       const provider = ProviderFactory.getProvider(session.provider as AIProviderType, sessionId);
       // console.log(`[AIService] Provider lookup result: ${provider ? 'found' : 'NOT FOUND'}`);
@@ -2448,6 +2798,27 @@ export class AIService {
           reason: 'user_cancel'
         });
 
+        // Defensive cleanup: if the in-flight turn was processing a queued
+        // prompt, drop the in-memory guard and unwedge any DB row stuck in
+        // 'executing'. sweepExecutingForSession is delivery-aware -- a
+        // prompt whose user message already landed in ai_agent_messages is
+        // marked completed instead of rolled back, so the queue trigger
+        // that follows the abort doesn't immediately re-claim and re-send
+        // the same input (NIM-615).
+        this.sessionsProcessingQueue.delete(sessionId);
+        try {
+          const { getQueuedPromptsStore } = await import('../RepositoryManager');
+          const queueStore = getQueuedPromptsStore();
+          const { completed, rolledBack } = await queueStore.sweepExecutingForSession(sessionId);
+          if (completed > 0 || rolledBack > 0) {
+            logger.main.info(
+              `[AIService] cancelRequest: swept session ${sessionId} -- ${completed} delivered marked completed, ${rolledBack} undelivered rolled back`
+            );
+          }
+        } catch (sweepErr) {
+          logger.main.error('[AIService] cancelRequest: sweepExecutingForSession failed:', sweepErr);
+        }
+
         provider.abort();
         // console.log(`[AIService] Cancelled request for session ${sessionId}`);
         this.analytics.sendEvent('cancel_ai_request', {provider: providerType})
@@ -2457,10 +2828,18 @@ export class AIService {
       return { success: false, error: 'No active provider for session' };
     });
 
-    // Interrupt the current turn (graceful) so queued prompts are processed sooner.
-    // Unlike cancelRequest (abort), this uses the SDK's interrupt() which stops the
-    // current turn but keeps the session alive. The completion handler will fire
-    // normally and process the next queued prompt.
+    // Interrupt the current turn (graceful when possible) so queued prompts
+    // are processed sooner. Providers that support a true mid-stream interrupt
+    // (Claude Code) wrap up cleanly; others fall back to abort() via the
+    // BaseAIProvider default. Returns { method } so the renderer can
+    // distinguish the two paths.
+    //
+    // Defensive cleanup runs before the interrupt: clear the in-memory
+    // sessionsProcessingQueue guard and unwedge any PGLite rows stuck in
+    // 'executing' via sweepExecutingForSession (delivery-aware -- already
+    // delivered prompts are marked completed, not rolled back, so the
+    // follow-up ai:triggerQueueProcessing doesn't re-send the same input
+    // -- NIM-615).
     safeHandle('ai:interruptCurrentTurn', async (_event, sessionId: string) => {
       if (!sessionId) {
         throw new Error('Session ID is required to interrupt');
@@ -2472,20 +2851,39 @@ export class AIService {
         return { success: false, error: 'Session not found' };
       }
 
+      if (session.provider === 'claude-code-cli') {
+        const terminalManager = getTerminalSessionManager();
+        if (!terminalManager.isTerminalActive(sessionId)) {
+          return { success: false, error: 'No active terminal for session' };
+        }
+
+        terminalManager.writeToTerminal(sessionId, '\x03');
+        logger.main.info(`[AIService] Interrupted claude-code-cli terminal for session ${sessionId}`);
+        return { success: true, method: 'terminal-ctrl-c' };
+      }
+
       const provider = ProviderFactory.getProvider(session.provider as AIProviderType, sessionId);
-      if (provider && typeof (provider as any).interruptCurrentTurn === 'function') {
-        await (provider as any).interruptCurrentTurn();
-        logger.main.info(`[AIService] Interrupted current turn for session ${sessionId}`);
-        return { success: true };
+      if (!provider) {
+        return { success: false, error: 'No active provider for session' };
       }
 
-      // Fallback to abort for providers that don't support interrupt
-      if (provider) {
-        provider.abort();
-        return { success: true };
+      this.sessionsProcessingQueue.delete(sessionId);
+      try {
+        const { getQueuedPromptsStore } = await import('../RepositoryManager');
+        const queueStore = getQueuedPromptsStore();
+        const { completed, rolledBack } = await queueStore.sweepExecutingForSession(sessionId);
+        if (completed > 0 || rolledBack > 0) {
+          logger.main.info(
+            `[AIService] interruptCurrentTurn: swept session ${sessionId} -- ${completed} delivered marked completed, ${rolledBack} undelivered rolled back`
+          );
+        }
+      } catch (sweepErr) {
+        logger.main.error('[AIService] interruptCurrentTurn: sweepExecutingForSession failed:', sweepErr);
       }
 
-      return { success: false, error: 'No active provider for session' };
+      const result = await provider.interruptCurrentTurn();
+      logger.main.info(`[AIService] Interrupted current turn for session ${sessionId} (method=${result.method})`);
+      return { success: true, method: result.method };
     });
 
     // Settings handlers
@@ -2493,10 +2891,12 @@ export class AIService {
       const apiKeys = this.getSettingsStore().get('apiKeys', {}) as Record<string, string>;
       const providerSettings = this.getNormalizedProviderSettings();
       const showToolCalls = this.getSettingsStore().get('showToolCalls', false) as boolean;
+      const chatShowToolCalls = this.getSettingsStore().get('chatShowToolCalls', true) as boolean;
       const aiDebugLogging = this.getSettingsStore().get('aiDebugLogging', false) as boolean;
       const showPromptAdditions = this.getSettingsStore().get('showPromptAdditions', false) as boolean;
       const showUsageIndicator = this.getSettingsStore().get('showUsageIndicator', true) as boolean;
       const showCodexUsageIndicator = this.getSettingsStore().get('showCodexUsageIndicator', true) as boolean;
+      const showGeminiUsageIndicator = this.getSettingsStore().get('showGeminiUsageIndicator', true) as boolean;
       const customClaudeCodePath = this.getSettingsStore().get('customClaudeCodePath', '') as string;
       const autoCommitEnabled = this.getSettingsStore().get('autoCommitEnabled', false) as boolean;
       const trackerAutomation = this.getSettingsStore().get('trackerAutomation', {
@@ -2515,10 +2915,12 @@ export class AIService {
         apiKeys: this.maskApiKeys(apiKeys),
         providerSettings,
         showToolCalls,
+        chatShowToolCalls,
         aiDebugLogging,
         showPromptAdditions,
         showUsageIndicator,
         showCodexUsageIndicator,
+        showGeminiUsageIndicator,
         customClaudeCodePath,
         autoCommitEnabled,
         trackerAutomation,
@@ -2527,135 +2929,118 @@ export class AIService {
     });
 
     safeHandle('ai:saveSettings', async (event, settings: any) => {
+      // Legacy compat shim: this used to spread the incoming blob over the
+      // stored blob (`{...currentProviderSettings, ...settings.providerSettings}`),
+      // which silently dropped fields whenever the renderer's view was stale
+      // (NIM-801, codex-lost). Now every field is routed through the per-key
+      // SettingsService -- one validated write per key, broadcast to every
+      // window, no blob in the wire payload to lose anything from.
+      //
+      // Renderer code that wants to be safe should call `window.electronAPI.settingsSet`
+      // directly; this handler stays only for callers that haven't been
+      // migrated yet (and as the implementation behind the convenience helpers
+      // like `scheduleAIDebugPersist` until those are removed too).
+      const svc = getSettingsService();
+
+      const safeSet = (key: string, value: unknown): void => {
+        try {
+          svc.set(key as any, value as any);
+        } catch (err) {
+          logger.main.error(`[ai:saveSettings] svc.set(${key}) rejected:`, err);
+        }
+      };
+
       if (settings.defaultProvider !== undefined) {
-        this.getSettingsStore().set('defaultProvider', settings.defaultProvider);
+        safeSet('ai.defaultProvider', settings.defaultProvider);
       }
 
       if (settings.apiKeys) {
-        // Only update changed API keys
-        const currentKeys = this.getSettingsStore().get('apiKeys', {}) as Record<string, string>;
-
-        // Save Anthropic key
-        if (settings.apiKeys.anthropic !== undefined) {
-          const key = settings.apiKeys.anthropic;
-          if (!key) {
-            delete currentKeys['anthropic'];
-          } else if (key !== this.maskApiKey(currentKeys['anthropic'] || '')) {
-            currentKeys['anthropic'] = key as string;
+        // The renderer sends the masked form of unchanged keys so it can show
+        // them in form fields. Don't overwrite real keys with masks; compare
+        // each incoming value against the stored mask before writing.
+        const stored = (this.getSettingsStore().get('apiKeys', {}) as Record<string, string>) ?? {};
+        const writeApiKey = (name: string, incoming: unknown): void => {
+          if (incoming === undefined) return;
+          if (!incoming) {
+            // Empty string / null clears the key.
+            safeSet(`ai.apiKey.${name}`, '');
+            return;
           }
-        }
-
-        // Save Claude Code key (kept separate from anthropic)
-        if (settings.apiKeys['claude-code'] !== undefined) {
-          const key = settings.apiKeys['claude-code'];
-          if (!key) {
-            delete currentKeys['claude-code'];
-          } else if (key !== this.maskApiKey(currentKeys['claude-code'] || '')) {
-            currentKeys['claude-code'] = key as string;
-          }
-        }
-
-        // Save OpenAI key
-        if (settings.apiKeys.openai !== undefined) {
-          const key = settings.apiKeys.openai;
-          if (!key) {
-            delete currentKeys['openai'];
-          } else if (key !== this.maskApiKey(currentKeys['openai'] || '')) {
-            currentKeys['openai'] = key as string;
-            // Sync to mobile devices for voice mode
+          if (typeof incoming !== 'string') return;
+          if (incoming === this.maskApiKey(stored[name] || '')) return; // unchanged
+          safeSet(`ai.apiKey.${name}`, incoming);
+          if (name === 'openai') {
+            // Sync openai key to mobile devices for voice mode.
             import('../SyncManager').then(({ syncSettingsToMobile }) => {
-              syncSettingsToMobile(key as string);
-            }).catch(() => {
-              // Sync manager may not be available
-            });
+              syncSettingsToMobile(incoming);
+            }).catch(() => { /* sync manager may not be available */ });
           }
-        }
-
-        // Save OpenAI Codex key
-        if (settings.apiKeys['openai-codex'] !== undefined) {
-          const key = settings.apiKeys['openai-codex'];
-          if (!key) {
-            delete currentKeys['openai-codex'];
-          } else if (key !== this.maskApiKey(currentKeys['openai-codex'] || '')) {
-            currentKeys['openai-codex'] = key as string;
-          }
-        }
-
-        // Save LMStudio URL
-        if (settings.apiKeys.lmstudio_url !== undefined) {
-          currentKeys['lmstudio_url'] = settings.apiKeys.lmstudio_url as string;
-        }
-
-        this.getSettingsStore().set('apiKeys', currentKeys);
-      }
-
-      if (settings.providerSettings) {
-        // Renderer sends only the provider slices it touched; merge at the
-        // provider-id level so untouched providers are preserved on disk.
-        // Each incoming slice replaces the stored slice wholesale -- the
-        // renderer owns the full config for any provider it sends.
-        //
-        // Cache invalidation order matters: getNormalizedProviderSettings()
-        // re-populates the cache from disk, so we must invalidate AFTER the
-        // disk write or subsequent reads return the pre-save snapshot
-        // (toggled-off providers reappear as enabled, etc.).
-        this.cachedNormalizedProviderSettings = null;
-        const currentProviderSettings = this.getNormalizedProviderSettings();
-        const mergedProviderSettings: Record<string, unknown> = {
-          ...currentProviderSettings,
-          ...(settings.providerSettings as Record<string, unknown>),
         };
+        writeApiKey('anthropic', settings.apiKeys.anthropic);
+        writeApiKey('claude-code', settings.apiKeys['claude-code']);
+        writeApiKey('openai', settings.apiKeys.openai);
+        writeApiKey('openai-codex', settings.apiKeys['openai-codex']);
+        if (settings.apiKeys.lmstudio_url !== undefined) {
+          // lmstudio_url is a regular setting -- no masking, just write it.
+          safeSet('ai.apiKey.lmstudio_url', settings.apiKeys.lmstudio_url);
+        }
+      }
 
-        this.getSettingsStore().set('providerSettings', this.normalizeProviderSettings(mergedProviderSettings));
+      if (settings.providerSettings && typeof settings.providerSettings === 'object') {
+        // Each incoming slice replaces the stored slice wholesale -- the
+        // renderer owns the full config for any provider it sends. By writing
+        // per provider id we never touch providers the caller didn't name.
+        //
+        // normalizeProviderSettings runs per-slice so transient/UI-only fields
+        // (testStatus: 'testing', etc.) don't reach disk.
+        const normalizedAll = this.normalizeProviderSettings(
+          settings.providerSettings as Record<string, unknown>,
+        ) as Record<string, unknown>;
+        for (const [providerId, config] of Object.entries(normalizedAll)) {
+          if (config === undefined) continue;
+          safeSet(`ai.provider.${providerId}`, config);
+        }
+        // Provider cache must be invalidated after writes so the next read
+        // returns the new value rather than the pre-save snapshot.
         this.cachedNormalizedProviderSettings = null;
+        // Enabling/disabling a provider changes the model list mobile can pick
+        // from (e.g. openai-codex). Push a refreshed list so the iOS picker
+        // updates without waiting for a restart/reconnect (NIM-976).
+        scheduleMobileSettingsSync();
       }
 
-      if (settings.showToolCalls !== undefined) {
-        this.getSettingsStore().set('showToolCalls', settings.showToolCalls);
-      }
+      if (settings.showToolCalls !== undefined)        safeSet('ai.showToolCalls', settings.showToolCalls);
+      if (settings.chatShowToolCalls !== undefined)    safeSet('ai.chatShowToolCalls', settings.chatShowToolCalls);
+      if (settings.aiDebugLogging !== undefined)       safeSet('ai.aiDebugLogging', settings.aiDebugLogging);
+      if (settings.showPromptAdditions !== undefined)  safeSet('ai.showPromptAdditions', settings.showPromptAdditions);
+      if (settings.customClaudeCodePath !== undefined) safeSet('ai.customClaudeCodePath', settings.customClaudeCodePath);
+      if (settings.autoCommitEnabled !== undefined)    safeSet('ai.autoCommitEnabled', settings.autoCommitEnabled);
 
-      if (settings.aiDebugLogging !== undefined) {
-        this.getSettingsStore().set('aiDebugLogging', settings.aiDebugLogging);
-      }
+      if (settings.showUsageIndicator !== undefined)       safeSet('ai.showUsageIndicator', settings.showUsageIndicator);
+      if (settings.showCodexUsageIndicator !== undefined)  safeSet('ai.showCodexUsageIndicator', settings.showCodexUsageIndicator);
+      if (settings.showGeminiUsageIndicator !== undefined) safeSet('ai.showGeminiUsageIndicator', settings.showGeminiUsageIndicator);
 
-      if (settings.showPromptAdditions !== undefined) {
-        this.getSettingsStore().set('showPromptAdditions', settings.showPromptAdditions);
-      }
-
-      if (settings.showUsageIndicator !== undefined) {
-        this.getSettingsStore().set('showUsageIndicator', settings.showUsageIndicator);
-      }
-
-      if (settings.showCodexUsageIndicator !== undefined) {
-        this.getSettingsStore().set('showCodexUsageIndicator', settings.showCodexUsageIndicator);
-      }
-
-      if (settings.customClaudeCodePath !== undefined) {
-        this.getSettingsStore().set('customClaudeCodePath', settings.customClaudeCodePath);
-      }
-
-      if (settings.autoCommitEnabled !== undefined) {
-        this.getSettingsStore().set('autoCommitEnabled', settings.autoCommitEnabled);
-      }
-
-      if (settings.trackerAutomation !== undefined) {
-        // Merge with existing to allow partial updates
-        const current = this.getSettingsStore().get('trackerAutomation', {
+      if (settings.trackerAutomation !== undefined && typeof settings.trackerAutomation === 'object') {
+        // Merge with current for partial updates (callers may send just the
+        // toggled field). Whole-object write through SettingsService below.
+        const current = (this.getSettingsStore().get('trackerAutomation', {
           enabled: false,
           autoCloseOnCommit: true,
-        }) as Record<string, unknown>;
-        this.getSettingsStore().set('trackerAutomation', { ...current, ...settings.trackerAutomation });
+        }) as Record<string, unknown>) ?? {};
+        safeSet('ai.trackerAutomation', { ...current, ...settings.trackerAutomation });
       }
 
       if (settings.diffPeekSize !== undefined) {
-        // Allow null to clear; otherwise expect { width, height }.
+        // null clears, otherwise expect { width, height }. SettingsService's
+        // Zod schema validates the structure too -- safeSet is just additional
+        // input shaping.
         if (
           settings.diffPeekSize === null ||
           (typeof settings.diffPeekSize === 'object' &&
             typeof settings.diffPeekSize.width === 'number' &&
             typeof settings.diffPeekSize.height === 'number')
         ) {
-          this.getSettingsStore().set('diffPeekSize', settings.diffPeekSize);
+          safeSet('ai.diffPeekSize', settings.diffPeekSize);
         }
       }
 
@@ -2666,43 +3051,64 @@ export class AIService {
     safeHandle('ai:testConnection', async (event, provider: string, workspacePath?: string) => {
       const apiKeys = this.getSettingsStore().get('apiKeys', {}) as Record<string, string>;
 
-      // Get the appropriate API key based on provider
+      // Get the appropriate API key based on provider.
+      // Extension-agent providers (aiAgentProviders contributions) handle their
+      // own auth inside the extension's backend module (e.g. Antigravity rides
+      // ~/.gemini OAuth via AntigravityServerManager.hasGeminiAuth). On the host
+      // side we treat them as 'not-required' and return success: the extension's
+      // own backend healthcheck would be the ideal probe, but that contract
+      // sits behind the seed PR's coordinated host scaffolding work. For now,
+      // accepting indicates the extension is installed + the provider is
+      // registered, which is what the user sees the green check confirming.
       let apiKey: string | undefined;
-      switch (provider) {
-        case 'claude':
-          apiKey = apiKeys['anthropic'];
-          if (!apiKey) {
-            return { success: false, error: 'Anthropic API key not configured' };
-          }
-          break;
-        case 'claude-code':
-          // Claude Code: API key is optional, uses SSO login if not provided
-          apiKey = apiKeys['claude-code'];
-          // No error if missing - will use SSO login
-          break;
-        case 'openai':
-          apiKey = apiKeys['openai'];
-          if (!apiKey) {
-            return { success: false, error: 'OpenAI API key not configured' };
-          }
-          break;
-        case 'openai-codex':
-          apiKey = apiKeys['openai-codex'];
-          break;
-        case 'opencode':
-          // OpenCode: API key is optional, uses its own config
-          apiKey = apiKeys['opencode'] || 'not-required';
-          break;
-        case 'copilot-cli':
-          // Copilot uses its own CLI auth, no API key needed
-          apiKey = 'not-required';
-          break;
-        case 'lmstudio':
-          // LMStudio doesn't need an API key, just test the connection
-          apiKey = 'not-required';
-          break;
-        default:
-          return { success: false, error: `Unknown provider: ${provider}` };
+      if (isExtensionAgentProvider(provider)) {
+        apiKey = 'not-required';
+      } else {
+        switch (provider) {
+          case 'claude':
+            apiKey = apiKeys['anthropic'];
+            if (!apiKey) {
+              return { success: false, error: 'Anthropic API key not configured' };
+            }
+            break;
+          case 'claude-code':
+            // Claude Code: API key is optional, uses SSO login if not provided
+            apiKey = apiKeys['claude-code'];
+            // No error if missing - will use SSO login
+            break;
+          case 'openai':
+            apiKey = apiKeys['openai'];
+            if (!apiKey) {
+              return { success: false, error: 'OpenAI API key not configured' };
+            }
+            break;
+          case 'openai-codex':
+            apiKey = apiKeys['openai-codex'];
+            break;
+          case 'opencode':
+            // OpenCode: API key is optional, uses its own config
+            apiKey = apiKeys['opencode'] || 'not-required';
+            break;
+          case 'copilot-cli':
+            // Copilot uses its own CLI auth, no API key needed
+            apiKey = 'not-required';
+            break;
+          case 'lmstudio':
+            // LMStudio doesn't need an API key, just test the connection
+            apiKey = 'not-required';
+            break;
+          default:
+            return { success: false, error: `Unknown provider: ${provider}` };
+        }
+      }
+
+      // Extension-agent providers: skip the per-provider connectivity probes
+      // below and return success directly. The 'try' block below contains
+      // provider-specific connectivity logic (list models, run a real SDK
+      // request, etc.) tied to each built-in id; none of it applies to an
+      // extension-agent and the IDs would all miss the conditional checks.
+      if (isExtensionAgentProvider(provider)) {
+        return { success: true, provider };
       }
 
       try {
@@ -2716,9 +3122,13 @@ export class AIService {
         if (provider === 'openai-codex') {
           const defaultModel = await ModelRegistry.getDefaultModel('openai-codex');
           const testProvider = new OpenAICodexProvider(apiKey ? { apiKey } : undefined);
-          const windowState = windowStates.get(event.sender.id);
+          // Honor the project rail's active selection (#544). windowStates is
+          // keyed by Nimbalyst's window id, not webContents.id, so resolve the
+          // window id via getWindowId before the lookup.
+          const browserWindow = BrowserWindow.fromWebContents(event.sender);
+          const windowId = browserWindow ? getWindowId(browserWindow) : null;
           const effectiveWorkspacePath =
-            workspacePath || windowState?.workspacePath;
+            workspacePath || resolveActiveWorkspacePathForWindowId(windowId);
 
           if (!effectiveWorkspacePath) {
             return {
@@ -2764,14 +3174,25 @@ export class AIService {
           return { success: true, provider };
         }
 
-        // For OpenCode, verify the CLI is installed
+        // For OpenCode, verify the CLI is installed. Electron's spawn
+        // inherits a restricted PATH that does not include version-manager
+        // bin directories (nvm, asdf, Volta, fnm). When the user installs
+        // opencode-ai under nvm the binary lives at
+        // ~/.nvm/versions/node/<version>/bin/opencode and naked execSync
+        // returns "command not found" -- the user sees "OpenCode CLI not
+        // found" even though `opencode` resolves fine in their shell.
+        // CLIManager.getEnhancedPath() already builds the augmented PATH
+        // used by every other CLI check; route through it here too.
+        // See nimbalyst#184.
         if (provider === 'opencode') {
           try {
             const { execSync } = await import('child_process');
+            const { getEnhancedPath } = await import('../CLIManager');
+            const enhancedPath = getEnhancedPath();
             const version = execSync('opencode --version', {
               encoding: 'utf8',
               timeout: 5000,
-              env: process.env as Record<string, string>,
+              env: { ...process.env, PATH: enhancedPath } as Record<string, string>,
               stdio: ['pipe', 'pipe', 'pipe'],
             }).trim();
             return { success: true, provider, version };
@@ -2878,6 +3299,18 @@ export class AIService {
       };
       const allModels = await ModelRegistry.getAllModels(modelsConfig, enabledSet);
 
+      // Append extension-contributed agent provider models (see ai:getModels).
+      for (const agentEntry of getAgentProviderRegistry().list()) {
+        if (agentEntry.status === 'denied') continue;
+        for (const m of agentEntry.contribution.models ?? []) {
+          allModels.push({
+            id: m.id,
+            name: m.name,
+            provider: agentEntry.contributionId as AIProviderType,
+          });
+        }
+      }
+
       // Group ALL models by provider (for configuration UI)
       const grouped: Record<string, any[]> = {};
       for (const model of allModels) {
@@ -2905,30 +3338,61 @@ export class AIService {
       return { success: true };
     });
 
-    // Get slash commands from active claude-code provider
-    safeHandle('ai:getSlashCommands', async (event, sessionId?: string) => {
+    safeHandle('ai:getAgentWorkflows', async (
+      _event,
+      payload?: {
+        workspacePath?: string;
+        sessionId?: string;
+        provider?: string | null;
+      }
+    ) => {
       try {
-        // Try the specific session's provider first
-        let provider: AIProvider | undefined;
-        if (sessionId) {
-          provider = ProviderFactory.getProvider('claude-code', sessionId) ?? undefined;
+        const request = payload ?? {};
+        if (!request.workspacePath) {
+          throw new Error('ai:getAgentWorkflows requires workspacePath');
         }
 
-        if (provider && 'getSlashCommands' in provider && typeof (provider as any).getSlashCommands === 'function') {
-          const commands = (provider as any).getSlashCommands();
-          const skills = 'getSkills' in provider && typeof (provider as any).getSkills === 'function'
-            ? (provider as any).getSkills()
-            : [];
+        const resolvedProvider = request.provider ?? 'claude-code';
+        const nativeCatalog = this.getProviderWorkflowCatalog({
+          sessionId: request.sessionId,
+          provider: resolvedProvider,
+        });
 
-          if (commands.length > 0 || skills.length > 0) {
-            return { success: true, commands, skills };
-          }
-        }
+        // NIM-845: for a genuine claude-code-cli session, hide extension-plugin
+        // (namespaced) commands when the resolved `claude` is too old to accept
+        // `--plugin-dir` — those plugins can't load, so the commands would never
+        // resolve. The SDK `claude-code` path always loads them in-process.
+        const excludePluginCommands =
+          resolvedProvider === 'claude-code-cli' && !claudeCliSessionSupportsPlugins();
 
-        // Fall back to static cache (populated by any previous session's init chunk)
-        const cachedCommands = ClaudeCodeProvider.getCachedSdkSlashCommands();
-        const cachedSkills = ClaudeCodeProvider.getCachedSdkSkills();
-        return { success: true, commands: cachedCommands, skills: cachedSkills };
+        const workflows = await getAgentWorkflowService(request.workspacePath).listEntries({
+          provider: resolvedProvider,
+          nativeCommands: nativeCatalog.commands,
+          nativeSkills: nativeCatalog.skills,
+          excludePluginCommands,
+        });
+
+        return { success: true, workflows };
+      } catch (error) {
+        console.error('[AIService] Error getting agent workflows:', error);
+        return {
+          success: false,
+          workflows: [],
+          error: error instanceof Error ? error.message : 'Unknown error',
+        };
+      }
+    });
+
+    safeHandle('ai:getSlashCommands', async (
+      _event,
+      payload?: string | { sessionId?: string; provider?: string | null }
+    ) => {
+      try {
+        const request = typeof payload === 'string'
+          ? { sessionId: payload, provider: undefined }
+          : payload ?? {};
+        const { commands, skills } = this.getProviderWorkflowCatalog(request);
+        return { success: true, commands, skills };
       } catch (error) {
         console.error('[AIService] Error getting slash commands:', error);
         return { success: false, commands: [], skills: [], error: error instanceof Error ? error.message : 'Unknown error' };
@@ -2957,6 +3421,12 @@ export class AIService {
           // Respect the user's toggle but don't require an API key—Claude Code uses CLI auth
           enabled: claudeCodeSettings.enabled !== false,
           models: claudeCodeSettings.models
+        },
+        'claude-code-cli': {
+          // Genuine `claude` CLI on the user's subscription. On by default (like
+          // `claude-code`); no API key required — the CLI uses its own login.
+          enabled: providerSettings['claude-code-cli']?.enabled !== false,
+          models: providerSettings['claude-code-cli']?.models
         },
         'openai': {
           enabled: providerSettings['openai']?.enabled === true && !!apiKeys['openai'],
@@ -3000,35 +3470,37 @@ export class AIService {
       // console.log('[AIService] ai:getModels - claude-code models from registry:',
       //   claudeCodeModels.map(m => ({ id: m.id, name: m.name })));
 
-      // Filter to only enabled models
-      const enabledModels = allModels.filter(model => {
-        const provider = enabledProviders[model.provider as AIProviderType];
-        // if (model.provider === 'openai-codex') {
-        //   console.log('[AIService] Filtering openai-codex model:', {
-        //     modelId: model.id,
-        //     providerEnabled: provider?.enabled,
-        //     selectedModels: provider?.models
-        //   });
-        // }
-        if (!provider?.enabled) return false;
-        // If specific models are selected, filter to those
-        if (provider.models && provider.models.length > 0) {
-          if (model.provider === 'claude-code' && provider.models.includes('claude-code')) {
-            return true;
-          }
-          // For Claude Code: if base model is selected, also include 1M variants
-          // e.g., if 'claude-code:sonnet' is selected, also include 'claude-code:sonnet-1m'
-          if (model.provider === 'claude-code' && model.id.includes('-1m')) {
-            const baseModelId = model.id.replace(/-1m$/, '');
-            if (provider.models.includes(baseModelId)) {
-              return true;
-            }
-          }
-          return provider.models.includes(model.id);
+      // Filter to only enabled models. The gate is extracted to a pure,
+      // unit-tested function so the claude-code family (SDK + CLI) can't silently
+      // hide a shipped variant again (NIM-1486).
+      const enabledModels = allModels.filter(model =>
+        isModelEnabled(model, enabledProviders[model.provider as AIProviderType]),
+      );
+
+      // Surface extension-contributed agent providers (aiAgentProviders) in the
+      // picker. The built-in `enabledProviders` map is keyed on AIProviderType,
+      // so the filter above drops them; append after it. Each registered,
+      // non-denied entry contributes its manifest models under its flat
+      // contribution id -- the value session.provider carries and the host-side
+      // resolver (providerResolution.ts) looks up. Descriptor/affordance shape
+      // flagged for Greg's call in the seed PR.
+      const providerLabels: Record<string, string> = {};
+      const providerIcons: Record<string, string> = {};
+      for (const agentEntry of getAgentProviderRegistry().list()) {
+        if (agentEntry.status === 'denied') continue;
+        providerLabels[agentEntry.contributionId] =
+          agentEntry.contribution.displayName || agentEntry.contributionId;
+        if (agentEntry.contribution.icon) {
+          providerIcons[agentEntry.contributionId] = agentEntry.contribution.icon;
         }
-        // Otherwise include all models for this provider
-        return true;
-      });
+        for (const m of agentEntry.contribution.models ?? []) {
+          enabledModels.push({
+            id: m.id,
+            name: m.name,
+            provider: agentEntry.contributionId as AIProviderType,
+          });
+        }
+      }
 
       // Group ENABLED models by provider (not all models)
       const grouped: Record<string, any[]> = {};
@@ -3053,7 +3525,12 @@ export class AIService {
           maxTokens: m.maxTokens
         })),
         grouped,  // This now contains only enabled models
-        providers: enabledProviders
+        providers: enabledProviders,
+        // Maps of extension contribution id -> manifest displayName / icon, so
+        // the picker labels extension agent groups (e.g. "Gemini" + auto_awesome)
+        // instead of prettifying the raw contribution id.
+        providerLabels,
+        providerIcons
       };
     });
 
@@ -3121,6 +3598,7 @@ export class AIService {
       const apiKeys = this.getSettingsStore().get('apiKeys', {}) as Record<string, string>;
       const providerSettings = this.getSettingsStore().get('providerSettings', {}) as any;
       const showToolCalls = this.getSettingsStore().get('showToolCalls', false) as boolean;
+      const chatShowToolCalls = this.getSettingsStore().get('chatShowToolCalls', true) as boolean;
       const aiDebugLogging = this.getSettingsStore().get('aiDebugLogging', false) as boolean;
       const showPromptAdditions = this.getSettingsStore().get('showPromptAdditions', false) as boolean;
       const defaultProvider = this.getSettingsStore().get('defaultProvider', 'claude-code') as string;
@@ -3130,6 +3608,7 @@ export class AIService {
         apiKeys: this.maskApiKeys(apiKeys),
         providerSettings,
         showToolCalls,
+        chatShowToolCalls,
         aiDebugLogging,
         showPromptAdditions,
       };
@@ -3165,16 +3644,12 @@ export class AIService {
         throw new Error('prompt is required');
       }
 
-      // Get workspace path from window state using BrowserWindow lookup
+      // Resolve the workspace from the window, honoring the project rail's
+      // active selection. Reading the raw primary `workspacePath` would route
+      // the new session to the startup project in Multi-Project mode (#544).
       const browserWindow = BrowserWindow.fromWebContents(event.sender);
-      let workspacePath: string | undefined;
-      if (browserWindow) {
-        const windowId = getWindowId(browserWindow);
-        if (windowId !== null) {
-          const windowState = windowStates.get(windowId);
-          workspacePath = windowState?.workspacePath || undefined;
-        }
-      }
+      const windowId = browserWindow ? getWindowId(browserWindow) : null;
+      const workspacePath = resolveActiveWorkspacePathForWindowId(windowId);
       if (!workspacePath) {
         throw new Error('No workspace path available for extension AI prompt');
       }
@@ -3233,6 +3708,72 @@ export class AIService {
       const response = result?.content || '';
 
       return { sessionId: session.id, response };
+    });
+
+    // Extension SDK: renderer->backend READ bridge. Lets an extension's renderer
+    // half (settings panel, voice context provider) call one of ITS OWN backend
+    // module's MCP tools and get the parsed result. Tool calls otherwise route
+    // main->backend with no renderer hop; this is the one path the renderer needs
+    // for read access (live index status, listing facts, triggering a rebuild).
+    //
+    // SECURITY: `callerExtensionId` is injected by the host that builds the
+    // bridge (ExtensionLoader / settings panel) from the extension's own
+    // manifest id — it is NOT supplied by extension code. We enforce that the
+    // resolved tool belongs to the calling extension so one enabled extension
+    // can't reach into another extension's backend tools (e.g. memory.delete_fact)
+    // just by knowing the name.
+    safeHandle('extensions:ai-call-backend-tool', async (
+      event,
+      options: {
+        toolName: string;
+        args?: Record<string, unknown>;
+        workspacePath?: string;
+        callerExtensionId?: string;
+      }
+    ) => {
+      const toolName = options?.toolName;
+      if (!toolName) {
+        throw new Error('toolName is required');
+      }
+      const callerExtensionId = options?.callerExtensionId;
+      if (!callerExtensionId) {
+        throw new Error('callerExtensionId is required for backend tool call');
+      }
+
+      // Resolve the workspace: explicit arg wins, else the window's active
+      // project (honors the project rail selection in Multi-Project mode).
+      let workspacePath = options?.workspacePath;
+      if (!workspacePath) {
+        const browserWindow = BrowserWindow.fromWebContents(event.sender);
+        const windowId = browserWindow ? getWindowId(browserWindow) : null;
+        workspacePath = resolveActiveWorkspacePathForWindowId(windowId) ?? undefined;
+      }
+      if (!workspacePath) {
+        throw new Error('No workspace path available for backend tool call');
+      }
+
+      // Resolve worktree paths to the project path the backend module was started
+      // for, then route to the module over the typed RPC bridge.
+      const resolved = await resolveBackendWorkspacePath(workspacePath);
+
+      // Enforce caller ownership of the tool. Fail closed: an unknown tool and a
+      // cross-extension call both reject without dispatching.
+      const entry = findOwnedBackendTool(resolved, toolName, callerExtensionId);
+      if (!entry) {
+        throw new Error(`Backend tool not available to this extension: ${toolName}`);
+      }
+
+      const result = await handleBackendTool(toolName, toolName, options?.args ?? {}, resolved);
+      const text = result.content?.[0]?.text ?? '';
+      if (result.isError) {
+        throw new Error(text || `Backend tool ${toolName} failed`);
+      }
+      try {
+        return JSON.parse(text);
+      } catch {
+        // Tool returned a non-JSON string payload; hand it back as-is.
+        return text;
+      }
     });
 
     // Extension SDK: List available chat models
@@ -3515,7 +4056,7 @@ export class AIService {
 
     session.worktreePath = worktreePath;
     session.worktreeProjectPath = worktreeProjectPath;
-    await this.hooklessWatcher.ensureForSession(session.id, worktreePath, event);
+    await this.hooklessWatcher.ensureForSession(session.id, worktreePath);
 
     logger.main.info('[AIService] Adopted worktree path for session:', {
       sessionId: session.id,
@@ -3542,13 +4083,6 @@ export class AIService {
     }
     this.matchDebounceTimers.clear();
 
-    // Clear any remaining references
-    try {
-      this.sessionManager = null as any;
-      this.settingsStore = null;
-    } catch (error) {
-      console.error('[AIService] Error clearing references:', error);
-    }
   }
 
   // ============================================================================

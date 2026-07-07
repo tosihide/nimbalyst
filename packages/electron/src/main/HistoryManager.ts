@@ -6,6 +6,7 @@ import * as zlib from 'zlib';
 import { promisify } from 'util';
 import { database } from './database/PGLiteDatabaseWorker';
 import { logger } from './utils/logger';
+import { parseJsonObjectColumn } from './utils/jsonColumn';
 
 const gzip = promisify(zlib.gzip);
 const gunzip = promisify(zlib.gunzip);
@@ -52,6 +53,30 @@ export class HistoryManager {
   private pendingSnapshots = new Map<string, { promise: Promise<void>; timestamp: number }>(); // Track in-flight snapshot creations
   private readonly DEDUP_WINDOW_MS = 1500; // Only deduplicate within 1500ms window
 
+  // Short-TTL cache + in-flight dedup for getPendingFilesForSession.
+  // The underlying query (LIKE workspacePath% + two metadata->>? JSON extracts)
+  // is 50-127ms on SQLite, and was being fanned out hundreds of times per
+  // second from the renderer. Cache invalidates on createTag/markTagReviewed.
+  private pendingFilesCache = new Map<string, { value: string[]; expiresAt: number }>();
+  private pendingFilesInFlight = new Map<string, Promise<string[]>>();
+  private readonly PENDING_FILES_TTL_MS = 2000;
+
+  private invalidatePendingFilesForWorkspace(workspacePath: string): void {
+    const prefix = `${workspacePath}|`;
+    for (const key of this.pendingFilesCache.keys()) {
+      if (key.startsWith(prefix)) this.pendingFilesCache.delete(key);
+    }
+  }
+
+  // Trailing-debounce for the pending-count broadcast. getPendingCount is a
+  // 100ms-ish full scan (no index serves file_path LIKE + status without a
+  // sessionId), and a single git commit auto-approves N tags back-to-back --
+  // each tag update used to fire its own count query, producing an N+1 burst
+  // of identical scans. Coalesce them: invalidate the files cache immediately
+  // (correctness), but run the count+emit once after the burst settles.
+  private pendingCountEmitTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  private readonly PENDING_COUNT_EMIT_DEBOUNCE_MS = 50;
+
   constructor() {}
 
   /**
@@ -69,9 +94,31 @@ export class HistoryManager {
   }
 
   /**
-   * Emit pending count changed event to all windows for a workspace
+   * Schedule a pending-count-changed broadcast for a workspace.
+   *
+   * Cache invalidation is immediate (so getPendingFilesForSession never serves
+   * stale data), but the expensive count query + IPC emit are trailing-debounced
+   * so a burst of tag mutations (e.g. commit auto-approval over N files)
+   * collapses into a single count query instead of N.
    */
-  private async emitPendingCountChanged(workspacePath: string): Promise<void> {
+  private emitPendingCountChanged(workspacePath: string): void {
+    // Any code path that mutates pending state ends up here, so this is the
+    // single invalidation point for the getPendingFilesForSession cache.
+    this.invalidatePendingFilesForWorkspace(workspacePath);
+
+    const existing = this.pendingCountEmitTimers.get(workspacePath);
+    if (existing) clearTimeout(existing);
+    const timer = setTimeout(() => {
+      this.pendingCountEmitTimers.delete(workspacePath);
+      void this.flushPendingCountChanged(workspacePath);
+    }, this.PENDING_COUNT_EMIT_DEBOUNCE_MS);
+    // Don't keep the process alive just for a pending count broadcast.
+    timer.unref?.();
+    this.pendingCountEmitTimers.set(workspacePath, timer);
+  }
+
+  /** Run the actual count query and broadcast it to all windows. */
+  private async flushPendingCountChanged(workspacePath: string): Promise<void> {
     try {
       const count = await this.getPendingCount(workspacePath);
       const windows = BrowserWindow.getAllWindows();
@@ -240,13 +287,16 @@ export class HistoryManager {
         ORDER BY timestamp DESC
       `, [filePath]);
 
-      return result.rows.map(row => ({
-        timestamp: new Date(row.timestamp).toISOString(),
-        type: row.metadata?.type || 'manual',
-        size: row.size_bytes,
-        baseMarkdownHash: row.metadata?.baseMarkdownHash || '',
-        metadata: row.metadata
-      }));
+      return result.rows.map(row => {
+        const metadata = parseJsonObjectColumn(row.metadata);
+        return {
+          timestamp: new Date(row.timestamp).toISOString(),
+          type: metadata.type || 'manual',
+          size: row.size_bytes,
+          baseMarkdownHash: metadata.baseMarkdownHash || '',
+          metadata,
+        };
+      });
     } catch (error) {
       logger.main.error('[HistoryManager] Failed to list snapshots:', error);
       return [];
@@ -393,7 +443,8 @@ export class HistoryManager {
     tagId: string,
     content: string,
     sessionId: string,
-    toolUseId: string
+    toolUseId: string,
+    options?: { replaceSpeculative?: boolean }
   ): Promise<void> {
     try {
       // Ensure database is initialized
@@ -435,9 +486,63 @@ export class HistoryManager {
           }
         }
 
+        const existingTagId = existing.rows[0].tag_id;
+        const replaceSpeculative = options?.replaceSpeculative === true;
+
+        // Authoritative attribution override: when an explicitly
+        // authoritative caller (file_change `pre_edit_snapshot`, OpenCode
+        // / Codex-ACP edit tool handlers) calls with a different tagId
+        // than the existing tag, replace tagId, toolUseId, AND content in
+        // place. The flag is required -- a heuristic on the toolUseId
+        // string is not sufficient, because watcher-attribution callers
+        // (HooklessAgentFileWatcher's trackBashEditsFromCommand, the
+        // workspace-edit watcher) ALSO mint `nimtc|`-prefixed IDs by
+        // attributing to a recent Bash tool call's editGroupId, and a
+        // stale `sed` command can outscore a still-being-stored file_change
+        // in the same chokidar tick. Without an explicit caller signal we
+        // can't tell speculative `nimtc|` IDs from authoritative ones.
+        // Run BEFORE the upgrade-empty branch so an authoritative caller
+        // always wins -- otherwise an existing-empty + authoritative-new
+        // combo would only update content (not toolUseId) and the diff
+        // would still mis-attribute via ToolCallMatcher.computeHistoryDiff.
+        if (replaceSpeculative && existingTagId !== tagId) {
+          logger.main.info('[HistoryManager] Replacing speculative pre-edit tag with authoritative attribution:', {
+            filePath,
+            sessionId,
+            previousTagId: existingTagId,
+            newTagId: tagId,
+            newToolUseId: toolUseId,
+            existingWasEmpty: existingIsEmpty,
+            replaceSpeculative,
+          });
+          await database.query(`
+            UPDATE document_history
+            SET content = $1,
+                size_bytes = $2,
+                timestamp = $3,
+                metadata = jsonb_set(
+                  jsonb_set(
+                    jsonb_set(metadata, '{tagId}', to_jsonb($4::text)),
+                    '{toolUseId}', to_jsonb($5::text)
+                  ),
+                  '{updatedAt}', to_jsonb($6::bigint)
+                )
+            WHERE file_path = $7
+              AND metadata->>'tagId' = $8
+          `, [compressed, compressed.length, now, tagId, toolUseId, now, filePath, existingTagId]);
+
+          const windows = BrowserWindow.getAllWindows();
+          for (const window of windows) {
+            if (!window.isDestroyed()) {
+              window.webContents.send('history:pending-tag-created', { path: filePath });
+              window.webContents.send('file-changed-on-disk', { path: filePath });
+            }
+          }
+          return;
+        }
+
         if (existingIsEmpty && content.length > 0) {
           // Upgrade the empty tag with real baseline content
-          const existingTagId = existing.rows[0].tag_id;
           logger.main.info('[HistoryManager] Upgrading empty pre-edit tag with real baseline:', {
             filePath,
             sessionId,
@@ -571,16 +676,17 @@ export class HistoryManager {
       const decompressed = await gunzip(compressed);
       const content = decompressed.toString('utf-8');
 
+      const metadata = parseJsonObjectColumn(row.metadata);
       return {
         id: tagId,
         filePath,
         content,
-        type: row.metadata.type || 'pre-edit',
-        status: row.metadata.status,
-        sessionId: row.metadata.sessionId,
-        toolUseId: row.metadata.toolUseId,
-        createdAt: new Date(row.metadata.createdAt),
-        updatedAt: new Date(row.metadata.updatedAt)
+        type: metadata.type || 'pre-edit',
+        status: metadata.status,
+        sessionId: metadata.sessionId,
+        toolUseId: metadata.toolUseId,
+        createdAt: new Date(metadata.createdAt),
+        updatedAt: new Date(metadata.updatedAt)
       };
     } catch (error) {
       logger.main.error('[HistoryManager] Failed to get tag:', error);
@@ -713,16 +819,17 @@ export class HistoryManager {
         const decompressed = await gunzip(compressed);
         const content = decompressed.toString('utf-8');
 
+        const metadata = parseJsonObjectColumn(row.metadata);
         tags.push({
-          id: row.metadata.tagId,
+          id: metadata.tagId,
           filePath: row.file_path,
           content,
-          type: row.metadata.type,
-          status: row.metadata.status,
-          sessionId: row.metadata.sessionId,
-          toolUseId: row.metadata.toolUseId,
-          createdAt: new Date(row.metadata.createdAt),
-          updatedAt: new Date(row.metadata.updatedAt)
+          type: metadata.type,
+          status: metadata.status,
+          sessionId: metadata.sessionId,
+          toolUseId: metadata.toolUseId,
+          createdAt: new Date(metadata.createdAt),
+          updatedAt: new Date(metadata.updatedAt)
         });
       }
 
@@ -864,12 +971,21 @@ export class HistoryManager {
         await database.initialize();
       }
 
+      // The status predicate must textually match the partial index
+      // idx_history_one_pending_per_file or the planner falls back to a full
+      // table scan (~100ms). SQLite indexes the json_extract form; PGLite the
+      // ->> form. A ->> query does NOT match a json_extract index on SQLite.
+      const isSqlite = database.getEngine() === 'sqlite';
+      const statusExpr = isSqlite
+        ? `json_extract(metadata, '$.status')`
+        : `metadata->>'status'`;
+
       // Use file_path LIKE to match all files within the workspace directory
       const result = await database.query<{ count: string }>(`
         SELECT COUNT(DISTINCT file_path) as count
         FROM document_history
         WHERE file_path LIKE $1
-          AND metadata->>'status' = 'pending-review'
+          AND ${statusExpr} = 'pending-review'
       `, [workspacePath + '%']);
 
       return parseInt(result.rows[0]?.count || '0', 10);
@@ -883,23 +999,53 @@ export class HistoryManager {
    * Get list of files with pending-review tags for a specific session
    */
   async getPendingFilesForSession(workspacePath: string, sessionId: string): Promise<string[]> {
-    try {
-      if (!database.isInitialized()) {
-        await database.initialize();
+    const cacheKey = `${workspacePath}|${sessionId}`;
+    const now = Date.now();
+    const cached = this.pendingFilesCache.get(cacheKey);
+    if (cached && cached.expiresAt > now) return cached.value;
+    const inFlight = this.pendingFilesInFlight.get(cacheKey);
+    if (inFlight) return inFlight;
+
+    const promise = (async () => {
+      try {
+        if (!database.isInitialized()) {
+          await database.initialize();
+        }
+
+        // SQLite uses json_extract so the planner can match
+        // idx_history_pending_session_file (migration 2). PGLite needs the
+        // PostgreSQL ->> operator: its metadata column is jsonb, and
+        // json_extract has no (jsonb, unknown) overload there. The dialect
+        // split is required -- a single form cannot satisfy both engines.
+        const isSqlite = database.getEngine() === 'sqlite';
+        const sessionIdExpr = isSqlite
+          ? `json_extract(metadata, '$.sessionId')`
+          : `metadata->>'sessionId'`;
+        const statusExpr = isSqlite
+          ? `json_extract(metadata, '$.status')`
+          : `metadata->>'status'`;
+        const result = await database.query<{ file_path: string }>(`
+          SELECT DISTINCT file_path
+          FROM document_history
+          WHERE ${sessionIdExpr} = $1
+            AND ${statusExpr} = 'pending-review'
+            AND file_path LIKE $2
+        `, [sessionId, workspacePath + '%']);
+
+        return result.rows.map((row: { file_path: string }) => row.file_path);
+      } catch (error) {
+        logger.main.error('[HistoryManager] Failed to get pending files for session:', error);
+        return [];
       }
+    })();
 
-      const result = await database.query<{ file_path: string }>(`
-        SELECT DISTINCT file_path
-        FROM document_history
-        WHERE file_path LIKE $1
-          AND metadata->>'status' = 'pending-review'
-          AND metadata->>'sessionId' = $2
-      `, [workspacePath + '%', sessionId]);
-
-      return result.rows.map((row: { file_path: string }) => row.file_path);
-    } catch (error) {
-      logger.main.error('[HistoryManager] Failed to get pending files for session:', error);
-      return [];
+    this.pendingFilesInFlight.set(cacheKey, promise);
+    try {
+      const value = await promise;
+      this.pendingFilesCache.set(cacheKey, { value, expiresAt: Date.now() + this.PENDING_FILES_TTL_MS });
+      return value;
+    } finally {
+      this.pendingFilesInFlight.delete(cacheKey);
     }
   }
 
@@ -1105,6 +1251,42 @@ export class HistoryManager {
    * With the unique constraint, there's only ONE pending tag per file.
    * It will be either a pre-edit tag or an incremental-approval tag.
    */
+  /**
+   * Fetch the most recent snapshot content for (filePath, sessionId,
+   * snapshotType). Used by session-aware diff IPC to retrieve the pre-edit
+   * baseline (snapshotType='pre-edit') or the AI's post-edit output
+   * (snapshotType='ai-edit') for the active session.
+   */
+  async getLatestSnapshotContent(
+    filePath: string,
+    sessionId: string,
+    snapshotType: SnapshotType | 'pre-edit',
+  ): Promise<string | null> {
+    try {
+      if (!database.isInitialized()) {
+        await database.initialize();
+      }
+      const result = await database.query<{ content: Buffer }>(
+        `
+          SELECT content
+          FROM document_history
+          WHERE file_path = $1
+            AND metadata->>'sessionId' = $2
+            AND metadata->>'type' = $3
+          ORDER BY timestamp DESC
+          LIMIT 1
+        `,
+        [filePath, sessionId, snapshotType],
+      );
+      if (result.rows.length === 0) return null;
+      const decompressed = await gunzip(result.rows[0].content);
+      return decompressed.toString('utf-8');
+    } catch (error) {
+      logger.main.error('[HistoryManager] getLatestSnapshotContent failed:', error);
+      return null;
+    }
+  }
+
   async getDiffBaseline(filePath: string): Promise<{ content: string; tagType: 'pre-edit' | 'incremental-approval' } | null> {
     try {
       // SIMPLIFIED: With the unique constraint, there's only ONE pending tag per file

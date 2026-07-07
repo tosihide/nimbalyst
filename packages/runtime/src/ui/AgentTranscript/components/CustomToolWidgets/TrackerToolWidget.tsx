@@ -94,10 +94,18 @@ function getResultText(result: unknown): string | null {
   }
   if (r.result != null) return getResultText(r.result);
   if (r.output != null && typeof r.output === 'string') return r.output;
+  if (r.summary != null && typeof r.summary === 'string') return r.summary;
   return null;
 }
 
 function extractStructured(tool: { result?: unknown }): { structured: StructuredResult; summary: string } | null {
+  if (tool.result && typeof tool.result === 'object' && !Array.isArray(tool.result)) {
+    const r = tool.result as any;
+    if (r.structured && r.summary) {
+      return { structured: r.structured as StructuredResult, summary: r.summary as string };
+    }
+  }
+
   const text = getResultText(tool.result);
   if (!text) return null;
   try {
@@ -318,8 +326,22 @@ const WidgetShell: React.FC<{ header: React.ReactNode; children: React.ReactNode
 // ---------- Per-action renderers ----------
 
 const SecondaryTypeBadges: React.FC<{ typeTags?: string[]; primaryType: string }> = ({ typeTags, primaryType }) => {
-  if (!typeTags) return null;
-  const secondary = typeTags.filter(t => t !== primaryType);
+  // Older transcripts may have persisted typeTags as a JSON-encoded string (SQLite
+  // shape) rather than an array; tolerate that instead of crashing the widget.
+  const tags: string[] | undefined = Array.isArray(typeTags)
+    ? typeTags
+    : typeof typeTags === 'string'
+      ? (() => {
+          try {
+            const parsed = JSON.parse(typeTags);
+            return Array.isArray(parsed) ? (parsed as string[]) : undefined;
+          } catch {
+            return undefined;
+          }
+        })()
+      : undefined;
+  if (!tags) return null;
+  const secondary = tags.filter(t => t !== primaryType);
   if (secondary.length === 0) return null;
   return (
     <>
@@ -377,6 +399,77 @@ const CreatedView: React.FC<{ data: StructuredCreated }> = ({ data }) => {
   );
 };
 
+// Fields rendered by dedicated UI; everything else falls through to GenericChangeRow
+// so custom tracker types (incident, decision, plan, ...) show their field updates.
+const SPECIAL_CHANGE_KEYS = new Set([
+  'status', 'priority', 'title', 'owner', 'archived', 'progress', 'tags', 'description',
+]);
+
+function formatChangeValue(value: any): string {
+  if (value === null || value === undefined || value === '') return 'none';
+  if (typeof value === 'boolean') return value ? 'true' : 'false';
+  if (Array.isArray(value)) return value.length === 0 ? 'none' : value.map((v) => String(v)).join(', ');
+  if (typeof value === 'object') {
+    try { return JSON.stringify(value); } catch { return String(value); }
+  }
+  const s = String(value);
+  return s.length > 120 ? s.slice(0, 117) + '...' : s;
+}
+
+function humanizeFieldName(field: string): string {
+  // camelCase / snake_case -> "Title Case With Spaces"
+  return field
+    .replace(/_/g, ' ')
+    .replace(/([a-z])([A-Z])/g, '$1 $2')
+    .replace(/^./, (c) => c.toUpperCase());
+}
+
+function normalizeTagList(value: unknown): string[] {
+  if (Array.isArray(value)) {
+    return value
+      .filter((tag): tag is string => typeof tag === 'string')
+      .map((tag) => tag.trim())
+      .filter(Boolean);
+  }
+  if (typeof value === 'string') {
+    return value
+      .split(',')
+      .map((tag) => tag.trim())
+      .filter(Boolean);
+  }
+  return [];
+}
+
+const GenericChangeRow: React.FC<{ field: string; change: { from: any; to: any } }> = ({ field, change }) => (
+  <Row>
+    <Label>{humanizeFieldName(field)}</Label>
+    <span style={{ fontSize: '10px', color: 'var(--nim-text-faint)', textDecoration: 'line-through' }}>
+      {formatChangeValue(change.from)}
+    </span>
+    <Arrow />
+    <span style={{ fontSize: '11px', color: 'var(--nim-text-muted)' }}>
+      {formatChangeValue(change.to)}
+    </span>
+  </Row>
+);
+
+const DescriptionChangeRow: React.FC<{ change: { from: any; to: any } }> = ({ change }) => {
+  const fromLen = typeof change.from === 'string' ? change.from.length : 0;
+  const toLen = typeof change.to === 'string' ? change.to.length : 0;
+  return (
+    <Row>
+      <Label>Description</Label>
+      <span style={{ fontSize: '10px', color: 'var(--nim-text-faint)' }}>
+        {fromLen.toLocaleString()} chars
+      </span>
+      <Arrow />
+      <span style={{ fontSize: '11px', color: 'var(--nim-text-muted)' }}>
+        {toLen.toLocaleString()} chars
+      </span>
+    </Row>
+  );
+};
+
 const UpdatedView: React.FC<{ data: StructuredUpdated }> = ({ data }) => {
   const { changes } = data;
   const changedKeys = Object.keys(changes);
@@ -385,8 +478,8 @@ const UpdatedView: React.FC<{ data: StructuredUpdated }> = ({ data }) => {
   // Compute tag diff
   let tagDiff: { kept: string[]; added: string[]; removed: string[] } | null = null;
   if (changes.tags) {
-    const fromTags: string[] = changes.tags.from || [];
-    const toTags: string[] = changes.tags.to || [];
+    const fromTags = normalizeTagList(changes.tags.from);
+    const toTags = normalizeTagList(changes.tags.to);
     const fromSet = new Set(fromTags);
     const toSet = new Set(toTags);
     tagDiff = {
@@ -395,6 +488,8 @@ const UpdatedView: React.FC<{ data: StructuredUpdated }> = ({ data }) => {
       removed: fromTags.filter((t) => !toSet.has(t)),
     };
   }
+
+  const otherChangedKeys = changedKeys.filter((k) => !SPECIAL_CHANGE_KEYS.has(k));
 
   return (
     <WidgetShell
@@ -484,6 +579,10 @@ const UpdatedView: React.FC<{ data: StructuredUpdated }> = ({ data }) => {
           </div>
         </Row>
       )}
+      {changes.description && <DescriptionChangeRow change={changes.description} />}
+      {otherChangedKeys.map((key) => (
+        <GenericChangeRow key={key} field={key} change={changes[key]} />
+      ))}
     </WidgetShell>
   );
 };

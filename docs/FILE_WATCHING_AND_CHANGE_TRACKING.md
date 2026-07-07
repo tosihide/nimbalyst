@@ -658,16 +658,6 @@ Entries are removed when the renderer fires `editor:released-deleted-path` after
 
 For autosaves, the renderer never auto-overwrites on conflict. It surfaces a non-blocking banner: `"File changed on disk. Reload to see new content (your unsaved edits are preserved)."` with Reload / Dismiss buttons. The buffer stays dirty. Manual save retains the original prompt path.
 
-### Telemetry
-
-`file_save_blocked_after_delete` PostHog event fires whenever any layer blocks a save. Properties:
-
-- `layer`: `recently-deleted` | `document-model-deleted` | `conflict-mismatch`
-- `fileType`: extension classification
-- `wasAutosave`: boolean
-
-Documented in `docs/POSTHOG_EVENTS.md`. Zero blocked saves over a multi-day window would suggest the layered defense is silently bypassed.
-
 ### Deletion Sequence (ASCII)
 
 ```

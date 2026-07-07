@@ -46,6 +46,13 @@ export function initUpdateListeners(): () => void {
   // States that should not be overwritten by a stale 'available' event
   const ACTIVE_STATES = new Set(['downloading', 'ready', 'waiting-for-sessions', 'viewing-notes']);
 
+  // Track the last version we sent `update_toast_shown` for. The hourly
+  // auto-check re-fires `update-available` for the same version every poll,
+  // and the toast can dismiss back to 'idle' between polls — so the
+  // state-based dedup below isn't enough. We only want one analytics event
+  // per distinct new_version per app run.
+  let lastTrackedToastVersion: string | null = null;
+
   const handleUpdateAvailable = async (data: {
     currentVersion: string;
     newVersion: string;
@@ -84,12 +91,12 @@ export function initUpdateListeners(): () => void {
 
     // Suppression checks passed; the toast is actually about to display.
     // Track here (not in main) so we count real displays, not every
-    // electron-updater 'update-available' callback. Skip if we're already
-    // showing the toast for this same version (no re-display happening).
-    const latest = store.get(updateStateAtom);
-    const alreadyShowingSameVersion =
-      latest.state === 'available' && latest.updateInfo?.version === data.newVersion;
-    if (!alreadyShowingSameVersion) {
+    // electron-updater 'update-available' callback. Fire at most once per
+    // distinct version per app run -- the hourly poll keeps re-firing
+    // `update-available` for the same version and the toast can dismiss
+    // between polls, so a state-based guard alone over-counts ~40x.
+    if (lastTrackedToastVersion !== data.newVersion) {
+      lastTrackedToastVersion = data.newVersion;
       window.electronAPI.send('analytics:update-toast-shown', {
         releaseChannel: data.releaseChannel ?? 'unknown',
         newVersion: data.newVersion,

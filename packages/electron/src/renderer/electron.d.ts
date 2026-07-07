@@ -29,7 +29,131 @@ interface ArchiveTask {
   error?: string;
 }
 
+interface GhCliStatus {
+  installed: boolean;
+  version?: string;
+  authed: boolean;
+  host?: string;
+  user?: string;
+}
+
+interface PullRequestReviewer {
+  login: string;
+  state: string;
+}
+
+interface PullRequestRow {
+  id: string;
+  workspaceId: string;
+  remote: string;
+  number: number;
+  title: string;
+  body: string | null;
+  state: 'open' | 'closed' | 'merged';
+  isDraft: boolean;
+  authorLogin: string | null;
+  authorAvatarUrl: string | null;
+  headRef: string;
+  headSha: string;
+  baseRef: string;
+  mergeable: 'mergeable' | 'conflicting' | 'unknown' | null;
+  commentsCount: number;
+  reviewCommentsCount: number;
+  additions: number;
+  deletions: number;
+  changedFiles: number;
+  ciStatus: 'success' | 'failure' | 'pending' | null;
+  reviewers: PullRequestReviewer[];
+  labels: string[];
+  raw: unknown;
+  etag: string | null;
+  createdAt: number;
+  updatedAt: number;
+  fetchedAt: number;
+}
+
+interface PullRequestFileRow {
+  prId: string;
+  path: string;
+  status: 'added' | 'modified' | 'removed' | 'renamed';
+  additions: number;
+  deletions: number;
+  patch: string | null;
+  previousPath: string | null;
+  fetchedAt: number;
+}
+
+interface PullRequestCommitRow {
+  prId: string;
+  sha: string;
+  message: string;
+  authorLogin: string | null;
+  authoredAt: number;
+  additions: number;
+  deletions: number;
+}
+
+interface PullRequestCheckRow {
+  prId: string;
+  checkName: string;
+  status: 'queued' | 'in_progress' | 'completed';
+  conclusion:
+    | 'success'
+    | 'failure'
+    | 'neutral'
+    | 'cancelled'
+    | 'skipped'
+    | 'timed_out'
+    | 'action_required'
+    | null;
+  detailsUrl: string | null;
+  startedAt: number | null;
+  completedAt: number | null;
+  fetchedAt: number;
+}
+
+interface PullRequestTimelineEntry {
+  id: string;
+  type: 'issue_comment' | 'review' | 'review_comment';
+  authorLogin: string | null;
+  authorAvatarUrl: string | null;
+  body: string;
+  state?: string;
+  createdAt: number;
+  url: string | null;
+}
+
+interface PullRequestListFilters {
+  state?: 'open' | 'closed' | 'all';
+  awaitingMyReview?: boolean;
+  createdByMe?: boolean;
+  withConflicts?: boolean;
+  search?: string;
+}
+
+interface SemanticSearchResult {
+  refType: string;
+  refId: string;
+  sourceClass: string;
+  sourcePath: string;
+  title: string;
+  snippet: string;
+  score: number;
+  signals: { dense: boolean; sparse: boolean };
+}
+
 interface ElectronAPI {
+  // Global semantic search (nimbalyst-memory). Empty/false when memory is off.
+  semanticSearch: {
+    isAvailable: (workspacePath: string) => Promise<boolean>;
+    query: (
+      workspacePath: string,
+      query: string,
+      k?: number,
+      sourceClasses?: string[],
+    ) => Promise<SemanticSearchResult[]>;
+  };
+
   // File menu callbacks
   onFileNew: (callback: () => void) => () => void;
   onFileNewInWorkspace: (callback: () => void) => () => void;
@@ -86,6 +210,7 @@ interface ElectronAPI {
   // Theme operations
   getTheme: () => Promise<string>;
   getThemeSync: () => string;
+  getResolvedThemeSync: () => string;
   getAppVersion: () => Promise<string>;
   setTheme: (theme: string) => Promise<void>;
 
@@ -100,6 +225,18 @@ interface ElectronAPI {
   saveFile: (content: string, filePath: string, lastKnownContent?: string) => Promise<{ success: boolean; filePath: string; conflict?: boolean; diskContent?: string } | null>;
   saveFileAs: (content: string) => Promise<{ success: boolean; filePath: string } | null>;
   showErrorDialog: (title: string, message: string) => Promise<void>;
+  showSaveDialogPdf: (options: { defaultPath?: string }) => Promise<string | null>;
+  exportHtmlToPdf: (options: {
+    html: string;
+    outputPath: string;
+    pageSize?: 'A4' | 'Letter' | 'Legal';
+    landscape?: boolean;
+    generateDocumentOutline?: boolean;
+    generateTaggedPDF?: boolean;
+    margins?: { top?: number; bottom?: number; left?: number; right?: number };
+  }) => Promise<{ success: boolean; error?: string }>;
+  exportSessionToHtml: (options: { sessionId: string }) => Promise<{ success: boolean; filePath?: string; error?: string }>;
+  exportSessionToClipboard: (options: { sessionId: string }) => Promise<{ success: boolean; error?: string }>;
 
   // Share operations
   shareSessionAsLink: (options: { sessionId: string; expirationDays?: number }) => Promise<{ success: boolean; url?: string; shareId?: string; isUpdate?: boolean; encryptionKey?: string; error?: string }>;
@@ -116,7 +253,13 @@ interface ElectronAPI {
   reportUserActivity?: () => void;
 
   // Get initial window state
-  getInitialState: () => Promise<{ mode: string; workspacePath?: string; workspaceName?: string } | null>;
+  getInitialState: () => Promise<{
+    mode: string;
+    workspacePath?: string;
+    workspaceName?: string;
+    activeWorkspacePath?: string | null;
+    openProjectPaths?: string[];
+  } | null>;
 
   // Workspace operations
   getFolderContents: (dirPath: string) => Promise<FileTreeItem[]>;
@@ -140,7 +283,9 @@ interface ElectronAPI {
   showInFinder: (filePath: string) => Promise<{ success: boolean; error?: string }>;
   moveFile: (sourcePath: string, targetPath: string) => Promise<{ success: boolean; newPath?: string; error?: string }>;
   copyFile: (sourcePath: string, targetPath: string) => Promise<{ success: boolean; newPath?: string; error?: string }>;
+  getPathForFile: (file: File) => string;
   copyToClipboard: (text: string) => Promise<{ success: boolean }>;
+  copyImageToClipboard: (payload: { filePath?: string; dataUrl?: string }) => Promise<{ success: boolean; error?: string }>;
   readClipboard: () => Promise<{ success: boolean; text?: string }>;
 
   // Settings operations
@@ -150,9 +295,9 @@ interface ElectronAPI {
   // QuickOpen operations
   buildQuickOpenCache: (workspacePath: string) => Promise<{ success: boolean; fileCount?: number; error?: string }>;
   searchWorkspaceFiles: (workspacePath: string, query: string) => Promise<any[]>;
-  searchWorkspaceFileNames: (workspacePath: string, query: string) => Promise<any[]>;
+  searchWorkspaceFileNames: (workspacePath: string, query: string, options?: { fileMask?: string | null }) => Promise<any[]>;
   searchWorkspaceFileContent: (workspacePath: string, query: string) => Promise<any[]>;
-  getRecentWorkspaceFiles: () => Promise<string[]>;
+  getRecentWorkspaceFiles: (workspacePath?: string) => Promise<string[]>;
   addToWorkspaceRecentFiles: (filePath: string) => void;
 
   // History operations
@@ -190,10 +335,11 @@ interface ElectronAPI {
 
   // Session state tracking operations
   sessionState: {
-    getActiveSessionIds: () => Promise<{ success: boolean; sessionIds: string[]; error?: string }>;
+    getTrackedSessionIds: () => Promise<{ success: boolean; sessionIds: string[]; error?: string }>;
+    getRunningSessionIds: () => Promise<{ success: boolean; sessionIds: string[]; error?: string }>;
     getSessionState: (sessionId: string) => Promise<any>;
     isSessionActive: (sessionId: string) => Promise<boolean>;
-    subscribe: (workspacePath?: string) => Promise<void>;
+    subscribe: (workspacePath?: string | string[]) => Promise<void>;
     unsubscribe: () => Promise<void>;
     startSession: (sessionId: string, workspacePath?: string) => Promise<void>;
     updateActivity: (sessionId: string, status?: string, isStreaming?: boolean) => Promise<void>;
@@ -206,7 +352,7 @@ interface ElectronAPI {
   // AI operations (flat methods)
   aiHasApiKey: () => Promise<boolean>;
   aiInitialize: (provider?: string, apiKey?: string) => Promise<any>;
-  aiCreateSession: (provider: 'claude' | 'claude-code' | 'openai' | 'openai-codex' | 'opencode' | 'copilot-cli' | 'lmstudio', documentContext?: any, workspacePath?: string, modelId?: string, sessionType?: string, worktreeId?: string) => Promise<any>;
+  aiCreateSession: (provider: 'claude' | 'claude-code' | 'claude-code-cli' | 'openai' | 'openai-codex' | 'opencode' | 'copilot-cli' | 'lmstudio', documentContext?: any, workspacePath?: string, modelId?: string, sessionType?: string, worktreeId?: string) => Promise<any>;
   aiSendMessage: (message: string, documentContext?: any, sessionId?: string, workspacePath?: string) => Promise<any>;
   aiGetSessions: (workspacePath?: string) => Promise<any>;
   aiLoadSession: (sessionId: string, workspacePath?: string, trackAsResume?: boolean) => Promise<any>;
@@ -216,6 +362,14 @@ interface ElectronAPI {
   aiDeleteSession: (sessionId: string, workspacePath?: string) => Promise<{ success: boolean }>;
   aiCancelRequest: (sessionId: string) => Promise<{ success: boolean; error?: string }>;
   aiApplyEdit: (edit: any) => Promise<any>;
+
+  // Flat-key settings -- single read-everything snapshot, single per-key write,
+  // single per-key broadcast. See shared/settings/keys.ts for the registry.
+  settingsGetAll: () => Promise<Record<string, unknown>>;
+  settingsSet: (key: string, value: unknown) => Promise<{ ok: true }>;
+  settingsDelete: (key: string) => Promise<{ ok: true }>;
+  onSettingsChanged: (callback: (payload: { key: string; value: unknown }) => void) => () => void;
+
   getAISettings: () => Promise<any>;
   saveAISettings: (settings: any) => Promise<void>;
   testAIConnection: (provider: 'claude' | 'claude-code' | 'openai' | 'lmstudio') => Promise<any>;
@@ -278,7 +432,7 @@ interface ElectronAPI {
   ai: {
     hasApiKey: () => Promise<boolean>;
     initialize: (provider?: string, apiKey?: string) => Promise<any>;
-    createSession: (provider: 'claude' | 'claude-code' | 'openai' | 'openai-codex' | 'lmstudio', documentContext?: any, workspacePath?: string, modelId?: string, sessionType?: string, worktreeId?: string) => Promise<any>;
+    createSession: (provider: 'claude' | 'claude-code' | 'claude-code-cli' | 'openai' | 'openai-codex' | 'lmstudio', documentContext?: any, workspacePath?: string, modelId?: string, sessionType?: string, worktreeId?: string) => Promise<any>;
     sendMessage: (message: string, documentContext?: any, sessionId?: string, workspacePath?: string) => Promise<any>;
     getSessions: (workspacePath?: string) => Promise<any>;
     getSessionList: (workspacePath?: string) => Promise<any>;
@@ -352,6 +506,10 @@ interface ElectronAPI {
       updates: Record<string, any>;
       syncMode?: string;
     }) => Promise<{ success: boolean; item?: any; error?: string }>;
+    setTrackerItemShared: (payload: {
+      itemId: string;
+      shared: boolean;
+    }) => Promise<{ success: boolean; item?: any; error?: string }>;
     updateTrackerItemContent: (payload: {
       itemId: string;
       content: any;
@@ -359,6 +517,13 @@ interface ElectronAPI {
     getTrackerItemContent: (payload: {
       itemId: string;
     }) => Promise<{ success: boolean; content?: any; error?: string }>;
+    getTrackerBodyCacheForDetail: (payload: {
+      itemId: string;
+    }) => Promise<{
+      success: boolean;
+      row?: { bodyVersion: number; content: any } | null;
+      error?: string;
+    }>;
     archiveTrackerItem: (payload: {
       itemId: string;
       archive: boolean;
@@ -459,10 +624,11 @@ interface ElectronAPI {
   // Extensions API
   extensions: {
     listInstalled: () => Promise<Array<{ id: string; path: string; manifest: any; name: string; enabled: boolean }>>;
-    getAllSettings: () => Promise<Record<string, { enabled: boolean; claudePluginEnabled?: boolean }>>;
+    getAllSettings: () => Promise<Record<string, { enabled: boolean; claudePluginEnabled?: boolean; agentWorkflowsEnabled?: boolean }>>;
     getEnabled: (extensionId: string, defaultEnabled?: boolean) => Promise<boolean>;
     setEnabled: (extensionId: string, enabled: boolean) => Promise<{ success: boolean; error?: string }>;
     setClaudePluginEnabled: (extensionId: string, enabled: boolean) => Promise<{ success: boolean; error?: string }>;
+    setAgentWorkflowsEnabled: (extensionId: string, enabled: boolean) => Promise<{ success: boolean; error?: string }>;
     getClaudePluginCommands: () => Promise<Array<{
       extensionId: string;
       extensionName: string;
@@ -480,6 +646,56 @@ interface ElectronAPI {
     devUnload: (extensionId: string) => Promise<{ success: boolean; error?: string }>;
     onDevReload: (callback: (data: { extensionId: string; extensionPath: string }) => void) => () => void;
     onDevUnload: (callback: (data: { extensionId: string }) => void) => () => void;
+
+    permissions: {
+      listDescriptors: () => Promise<Array<{
+        id: string;
+        label: string;
+        description: string;
+        risk: 'low' | 'elevated' | 'high';
+      }>>;
+      listEffective: (workspacePath?: string) => Promise<Array<PermissionGrantRow>>;
+      listAtScope: (scope: 'workspace' | 'global', workspacePath?: string) => Promise<Array<PermissionGrantRow>>;
+      listEnabledModules: (workspacePath?: string) => Promise<Array<{
+        extensionId: string;
+        moduleId: string;
+        scopes: Array<'workspace' | 'global'>;
+      }>>;
+      isModuleEnabled: (args: {
+        extensionId: string;
+        moduleId: string;
+        declaredPermissions: string[];
+        workspacePath?: string;
+      }) => Promise<boolean>;
+      grantModule: (args: {
+        extensionId: string;
+        moduleId: string;
+        permissions: string[];
+        scope: 'workspace' | 'global';
+        workspacePath?: string;
+      }) => Promise<{ success: boolean; grants: Array<PermissionGrantRow> }>;
+      revokeModule: (args: {
+        extensionId: string;
+        moduleId: string;
+        scope: 'workspace' | 'global';
+        workspacePath: string;
+      }) => Promise<{ success: boolean; removedRows: number }>;
+      handleUninstall: (args: { extensionId: string; workspacePath?: string }) => Promise<{ success: boolean }>;
+      listHostState: () => Promise<Array<ModuleHandleRow>>;
+      usageSummary: () => Promise<Array<UsageSummaryRow>>;
+      usageEventsForModule: (args: { extensionId: string; moduleId: string }) => Promise<Array<UsageEventRow>>;
+      usageEventsAll: () => Promise<Array<UsageEventRow>>;
+      onStateChanged: (callback: (handle: ModuleHandleRow) => void) => () => void;
+      onPromptRaised: (
+        callback: (request: PermissionPromptRequestRow) => void
+      ) => () => void;
+      onPromptResolved: (callback: (data: { promptId: string }) => void) => () => void;
+      resolvePrompt: (
+        promptId: string,
+        resolution: { decision: 'enable-workspace' | 'enable-global' | 'not-now' }
+      ) => void;
+      listPendingPrompts: () => Promise<Array<PermissionPromptRequestRow>>;
+    };
   };
 
   // Claude Code API
@@ -489,6 +705,39 @@ interface ElectronAPI {
     setUserCommandsEnabled: (enabled: boolean) => Promise<void>;
     getEnv: () => Promise<Record<string, string>>;
     setEnv: (env: Record<string, string>) => Promise<void>;
+  };
+
+  agentWorkflows: {
+    getSettings: () => Promise<{
+      sourceSettings: {
+        workspaceClaudeCompatibilityEnabled: boolean;
+        includeProjectClaudeSources: boolean;
+        includeUserClaudeSources: boolean;
+        extensionWorkflowsEnabled: boolean;
+      };
+      exportSettings: {
+        codexEnabled: boolean;
+        claudeGeneratedExtensionWorkflowsEnabled: boolean;
+      };
+    }>;
+    setSourceSettings: (updates: {
+      workspaceClaudeCompatibilityEnabled?: boolean;
+      includeProjectClaudeSources?: boolean;
+      includeUserClaudeSources?: boolean;
+      extensionWorkflowsEnabled?: boolean;
+    }) => Promise<{
+      workspaceClaudeCompatibilityEnabled: boolean;
+      includeProjectClaudeSources: boolean;
+      includeUserClaudeSources: boolean;
+      extensionWorkflowsEnabled: boolean;
+    }>;
+    setExportSettings: (updates: {
+      codexEnabled?: boolean;
+      claudeGeneratedExtensionWorkflowsEnabled?: boolean;
+    }) => Promise<{
+      codexEnabled: boolean;
+      claudeGeneratedExtensionWorkflowsEnabled: boolean;
+    }>;
   };
 
   // Extension Development Kit (EDK) API
@@ -590,6 +839,11 @@ interface ElectronAPI {
 
     // PTY operations
     initialize: (terminalId: string, options: { workspacePath: string; cwd?: string; cols?: number; rows?: number }) => Promise<{ success: boolean; alreadyActive?: boolean; error?: string }>;
+    ensureClaudeCliSession: (payload: { sessionId: string; workspacePath: string; cwd?: string; model?: string; resumeSessionId?: string; cols?: number; rows?: number }) => Promise<{ success: boolean; alreadyActive?: boolean; error?: string; claudeNotInstalled?: boolean }>;
+    isClaudeCliInstalled: () => Promise<boolean>;
+    submitClaudeCliPrompt: (payload: { sessionId: string; workspacePath: string; prompt: string; attachments?: unknown[]; documentContext?: unknown }) => Promise<{ success: boolean }>;
+    setClaudeCliModel: (sessionId: string, model: string) => Promise<{ success: boolean; cliArg: string }>;
+    interruptClaudeCli: (sessionId: string) => Promise<{ success: boolean; resolvedAfter?: 'first-interrupt' | 'second-interrupt' | 'sigint' | 'unresolved' }>;
     isActive: (terminalId: string) => Promise<boolean>;
     write: (terminalId: string, data: string) => Promise<void>;
     resize: (terminalId: string, cols: number, rows: number) => Promise<void>;
@@ -634,13 +888,24 @@ interface ElectronAPI {
 
   // Document Sync (collaborative editing)
   documentSync: {
-    open: (workspacePath: string, documentId: string, title?: string) => Promise<{
+    open: (
+      workspacePath: string,
+      documentId: string,
+      title?: string,
+      documentType?: string,
+    ) => Promise<{
       success: boolean;
       config?: {
         orgId: string;
         documentId: string;
         title: string;
+        documentType?: string;
+        keyCustody?: 'legacy-e2e' | 'server-managed';
         orgKeyBase64: string;
+        /** Legacy org key for reading pre-migration rows in server-managed mode (NIM-878). */
+        legacyOrgKeyBase64?: string;
+        /** All candidate legacy org-key epochs for pre-migration rows that may span rotations (NIM-959). */
+        legacyOrgKeysBase64?: string[];
         orgKeyFingerprint?: string;
         serverUrl: string;
         userId: string;
@@ -659,7 +924,160 @@ interface ElectronAPI {
       success: boolean;
       error?: string;
     }>;
-    getJwt: (orgId: string) => Promise<{
+    seedSharedDocument: (
+      workspacePath: string,
+      documentId: string,
+      documentType: string,
+      content: string
+    ) => Promise<{
+      success: boolean;
+      error?: string;
+    }>;
+    registerCollabAdapterDescriptor: (descriptor: unknown) => Promise<{
+      success: boolean;
+      error?: string;
+    }>;
+    getLocalOrigin: (workspacePath: string, documentId: string) => Promise<{
+      success: boolean;
+      binding?: {
+        orgId: string;
+        documentId: string;
+        gitRemoteHash: string | null;
+        workspacePathHash: string | null;
+        relativePath: string;
+        documentType: string;
+        sourceBasename: string;
+        lastLocalContentHash: string | null;
+        lastCollabContentHash: string | null;
+        lastSyncedAt: string | null;
+        lastSeenMtimeMs: number | null;
+        lastSeenSizeBytes: number | null;
+        resolutionStatus: 'resolved' | 'missing' | 'relinked' | 'conflict';
+        resolutionError: string | null;
+        createdAt: string;
+        updatedAt: string;
+        resolvedPath: string | null;
+      } | null;
+      error?: string;
+    }>;
+    saveLocalOrigin: (payload: {
+      workspacePath: string;
+      documentId: string;
+      documentType: string;
+      sourceFilePath: string;
+      lastLocalContentHash: string | null;
+      lastCollabContentHash: string | null;
+    }) => Promise<{
+      success: boolean;
+      binding?: {
+        orgId: string;
+        documentId: string;
+        gitRemoteHash: string | null;
+        workspacePathHash: string | null;
+        relativePath: string;
+        documentType: string;
+        sourceBasename: string;
+        lastLocalContentHash: string | null;
+        lastCollabContentHash: string | null;
+        lastSyncedAt: string | null;
+        lastSeenMtimeMs: number | null;
+        lastSeenSizeBytes: number | null;
+        resolutionStatus: 'resolved' | 'missing' | 'relinked' | 'conflict';
+        resolutionError: string | null;
+        createdAt: string;
+        updatedAt: string;
+        resolvedPath: string | null;
+      } | null;
+      error?: string;
+    }>;
+    relinkLocalOrigin: (payload: {
+      workspacePath: string;
+      documentId: string;
+      documentType: string;
+      sourceFilePath: string;
+    }) => Promise<{
+      success: boolean;
+      binding?: {
+        orgId: string;
+        documentId: string;
+        gitRemoteHash: string | null;
+        workspacePathHash: string | null;
+        relativePath: string;
+        documentType: string;
+        sourceBasename: string;
+        lastLocalContentHash: string | null;
+        lastCollabContentHash: string | null;
+        lastSyncedAt: string | null;
+        lastSeenMtimeMs: number | null;
+        lastSeenSizeBytes: number | null;
+        resolutionStatus: 'resolved' | 'missing' | 'relinked' | 'conflict';
+        resolutionError: string | null;
+        createdAt: string;
+        updatedAt: string;
+        resolvedPath: string | null;
+      } | null;
+      error?: string;
+    }>;
+    clearLocalOrigin: (workspacePath: string, documentId: string) => Promise<{
+      success: boolean;
+      error?: string;
+    }>;
+    reuploadLocalOrigin: (payload: {
+      workspacePath: string;
+      documentId: string;
+      forceOverwriteShared?: boolean;
+    }) => Promise<{
+      success: boolean;
+      status: 'noop' | 'uploaded' | 'conflict' | 'missing-source' | 'unsupported' | 'error';
+      conflictKind?: 'missing-baseline' | 'shared-ahead' | 'diverged';
+      message?: string;
+      binding?: {
+        orgId: string;
+        documentId: string;
+        gitRemoteHash: string | null;
+        workspacePathHash: string | null;
+        relativePath: string;
+        documentType: string;
+        sourceBasename: string;
+        lastLocalContentHash: string | null;
+        lastCollabContentHash: string | null;
+        lastSyncedAt: string | null;
+        lastSeenMtimeMs: number | null;
+        lastSeenSizeBytes: number | null;
+        resolutionStatus: 'resolved' | 'missing' | 'relinked' | 'conflict';
+        resolutionError: string | null;
+        createdAt: string;
+        updatedAt: string;
+        resolvedPath: string | null;
+      } | null;
+      migration?: { okCount: number; failedCount: number };
+      lastEditorId?: string | null;
+      lastEditedAt?: number | null;
+    }>;
+    findLocalOriginLink: (workspacePath: string, sourceFilePath: string) => Promise<{
+      success: boolean;
+      binding?: {
+        orgId: string;
+        documentId: string;
+        gitRemoteHash: string | null;
+        workspacePathHash: string | null;
+        relativePath: string;
+        documentType: string;
+        sourceBasename: string;
+        lastLocalContentHash: string | null;
+        lastCollabContentHash: string | null;
+        lastSyncedAt: string | null;
+        lastSeenMtimeMs: number | null;
+        lastSeenSizeBytes: number | null;
+        resolutionStatus: 'resolved' | 'missing' | 'relinked' | 'conflict';
+        resolutionError: string | null;
+        createdAt: string;
+        updatedAt: string;
+        resolvedPath: string | null;
+      } | null;
+      error?: string;
+    }>;
+    getJwt: (orgId: string, forceRefresh?: boolean) => Promise<{
       success: boolean;
       jwt?: string;
       error?: string;
@@ -668,9 +1086,15 @@ interface ElectronAPI {
       success: boolean;
       config?: {
         orgId: string;
+        teamProjectId?: string | null;
+        keyCustody?: 'legacy-e2e' | 'server-managed';
         orgKeyBase64: string;
+        /** Legacy org-key epochs (current + archived) for reading/healing pre-migration ciphertext titles in server-managed mode (NIM-906/910). */
+        legacyOrgKeysBase64?: string[];
+        orgKeyFingerprint: string | null;
         serverUrl: string;
         userId: string;
+        personalOrgId?: string;
         userName?: string;
         userEmail?: string;
       };
@@ -704,10 +1128,50 @@ interface ElectronAPI {
       error?: string;
     }>;
     getPersonalJwt: () => Promise<{ success: boolean; jwt?: string; error?: string }>;
+
+    // Collaborative document attachments
+    closeDoc: (documentId: string) => Promise<{ success: boolean; error?: string }>;
+    uploadAsset: (payload: {
+      orgId: string;
+      documentId: string;
+      fileBytes: ArrayBuffer;
+      mimeType: string;
+      fileName: string;
+    }) => Promise<{ success: boolean; assetId?: string; uri?: string; error?: string }>;
+    migrateLocalAssets: (payload: {
+      workspacePath: string;
+      orgId: string;
+      documentId: string;
+      sourceFilePath: string;
+      markdown: string;
+    }) => Promise<{
+      success: boolean;
+      rewrittenMarkdown?: string;
+      results?: Array<
+        | { ref: string; status: 'ok'; uri: string; bytes: number }
+        | { ref: string; status: 'missing' }
+        | { ref: string; status: 'rejected'; reason: string }
+        | { ref: string; status: 'skipped'; reason: string }
+        | { ref: string; status: 'failed'; error: string }
+      >;
+      error?: string;
+    }>;
+    gcAssets: (payload: {
+      orgId: string;
+      documentId: string;
+      removedUris: string[];
+    }) => Promise<{
+      success: boolean;
+      requested?: number;
+      deleted?: number;
+      failed?: number;
+      skipped?: number;
+      error?: string;
+    }>;
   };
 
   // Worktree operations
-  worktreeCreate: (workspacePath: string, name?: string) => Promise<{
+  worktreeCreate: (workspacePath: string, options?: { name?: string; baseBranch?: string }) => Promise<{
     success: boolean;
     error?: string;
     worktree?: {
@@ -807,6 +1271,190 @@ interface ElectronAPI {
     count?: number;
   }>;
 
+  // PR review panel — gh CLI status (Phase A of issue #307)
+  ghCliStatus: () => Promise<{
+    success: boolean;
+    error?: string;
+    data?: GhCliStatus;
+  }>;
+  ghCliRefreshStatus: () => Promise<{
+    success: boolean;
+    error?: string;
+    data?: GhCliStatus;
+  }>;
+  onGhCliStatusChanged: (callback: (status: GhCliStatus) => void) => () => void;
+
+  // PR review panel — GitHub API (Phase C of issue #307)
+  prDetectRemote: (workspacePath: string) => Promise<{
+    success: boolean;
+    error?: string;
+    data?: { remote: string; host: string } | null;
+  }>;
+  prList: (
+    workspaceId: string,
+    remote: string,
+    filters?: PullRequestListFilters,
+  ) => Promise<{ success: boolean; error?: string; data?: PullRequestRow[] }>;
+  prGet: (
+    workspaceId: string,
+    remote: string,
+    number: number,
+  ) => Promise<{ success: boolean; error?: string; data?: PullRequestRow }>;
+  prFiles: (
+    workspaceId: string,
+    remote: string,
+    number: number,
+  ) => Promise<{ success: boolean; error?: string; data?: PullRequestFileRow[] }>;
+  prFileContents: (
+    workspaceId: string,
+    remote: string,
+    ref: string,
+    path: string,
+  ) => Promise<{ success: boolean; error?: string; data?: { content: string } }>;
+  prCommits: (
+    workspaceId: string,
+    remote: string,
+    number: number,
+  ) => Promise<{ success: boolean; error?: string; data?: PullRequestCommitRow[] }>;
+  prChecks: (
+    workspaceId: string,
+    remote: string,
+    number: number,
+  ) => Promise<{ success: boolean; error?: string; data?: PullRequestCheckRow[] }>;
+  prConversation: (
+    workspaceId: string,
+    remote: string,
+    number: number,
+  ) => Promise<{ success: boolean; error?: string; data?: PullRequestTimelineEntry[] }>;
+  prConversationRefresh: (
+    workspaceId: string,
+    remote: string,
+    number: number,
+  ) => Promise<{ success: boolean; error?: string; data?: PullRequestTimelineEntry[] }>;
+  prReviewThreads: (
+    workspaceId: string,
+    remote: string,
+    number: number,
+  ) => Promise<{
+    success: boolean;
+    error?: string;
+    data?: {
+      threads: Array<{
+        id: string;
+        isResolved: boolean;
+        isOutdated: boolean;
+        path: string | null;
+        line: number | null;
+        comments: Array<{
+          id: string;
+          authorLogin: string | null;
+          body: string;
+          createdAt: number;
+          url: string | null;
+        }>;
+      }>;
+      truncated: boolean;
+    };
+  }>;
+  prRefresh: (
+    workspaceId: string,
+    remote: string,
+    number?: number,
+  ) => Promise<{ success: boolean; error?: string; data?: { fetchedAt: number } }>;
+
+  // PR review panel — review/merge actions + access control (issue #307)
+  prPermissions: (
+    workspaceId: string,
+    remote: string,
+    number: number,
+  ) => Promise<{
+    success: boolean;
+    error?: string;
+    data?: {
+      viewerLogin: string | null;
+      canApprove: boolean;
+      canMerge: boolean;
+      mergeMethods: { squash: boolean; merge: boolean; rebase: boolean };
+      mergeable: boolean | null;
+      mergeableState: string | null;
+      state: 'open' | 'closed' | 'merged';
+      isDraft: boolean;
+    };
+  }>;
+  prApprove: (
+    workspaceId: string,
+    remote: string,
+    number: number,
+    body?: string,
+  ) => Promise<{ success: boolean; error?: string; data?: { ok: boolean } }>;
+  prComment: (
+    workspaceId: string,
+    remote: string,
+    number: number,
+    body: string,
+  ) => Promise<{ success: boolean; error?: string; data?: { ok: boolean } }>;
+  prMerge: (
+    workspaceId: string,
+    remote: string,
+    number: number,
+    method: 'merge' | 'squash' | 'rebase',
+    commitTitle?: string,
+    commitMessage?: string,
+  ) => Promise<{ success: boolean; error?: string; data?: { merged: boolean; sha: string | null } }>;
+
+  // PR review panel — polling scheduler (Phase D of issue #307)
+  prStartPolling: (
+    workspacePath: string,
+    workspaceId: string,
+    remote: string,
+  ) => Promise<{ success: boolean; error?: string; data?: { started: boolean } }>;
+  prStopPolling: (
+    workspacePath: string,
+  ) => Promise<{ success: boolean; error?: string; data?: { stopped: boolean } }>;
+  prPollNow: (
+    workspacePath: string,
+  ) => Promise<{ success: boolean; error?: string; data?: { ok: boolean } }>;
+  prFocus: (workspacePath: string, focused: boolean) => void;
+  onPrListUpdated: (
+    callback: (payload: { workspacePath: string; remote: string }) => void,
+  ) => () => void;
+  prOpenWorktree: (
+    workspacePath: string,
+    remote: string,
+    number: number,
+  ) => Promise<{
+    success: boolean;
+    error?: string;
+    data?: {
+      id: string;
+      name: string;
+      path: string;
+      branch: string;
+      prNumber?: number;
+      prRemote?: string;
+      prUrl?: string;
+    };
+  }>;
+
+  // PR review panel — per-project gh account selection (issue #307)
+  prGhAccounts: () => Promise<{
+    success: boolean;
+    error?: string;
+    data?: Array<{ login: string; host: string; active: boolean }>;
+  }>;
+  prGetAccountConfig: (workspacePath?: string) => Promise<{
+    success: boolean;
+    error?: string;
+    data?: { defaultAccount: string | null; override: string | null; effective: string | null };
+  }>;
+  prSetDefaultAccount: (
+    login: string | null,
+  ) => Promise<{ success: boolean; error?: string; data?: { ok: boolean } }>;
+  prSetAccountOverride: (
+    workspacePath: string,
+    login: string | null,
+  ) => Promise<{ success: boolean; error?: string; data?: { ok: boolean } }>;
+
   // Archive progress operations
   archive: {
     getTasks: () => Promise<{
@@ -838,6 +1486,58 @@ interface InstalledExtension {
   manifest: any;
   name: string;
   enabled: boolean;
+}
+
+// Privileged-capability permission types (Phase 4)
+interface PermissionGrantRow {
+  extensionId: string;
+  moduleId: string;
+  permissionId: string;
+  scope: 'workspace' | 'global';
+  workspacePath?: string;
+  grantedAt: number;
+  grantedBy: 'user';
+  permissionVersion: number;
+}
+
+interface ModuleHandleRow {
+  extensionId: string;
+  moduleId: string;
+  workspacePath: string;
+  state: unknown;
+}
+
+interface UsageSummaryRow {
+  extensionId: string;
+  moduleId: string;
+  permissionId: string;
+  total: number;
+  allowed: number;
+  denied: number;
+  lastAt?: number;
+}
+
+interface UsageEventRow {
+  extensionId: string;
+  moduleId: string;
+  permissionId: string;
+  timestamp: number;
+  outcome: 'allowed' | 'denied';
+  method?: string;
+}
+
+interface PermissionPromptRequestRow {
+  id: string;
+  extensionId: string;
+  extensionName: string;
+  moduleId: string;
+  purpose: string;
+  declaredPermissions: string[];
+  workspacePath: string;
+  reason:
+    | { kind: 'first-use' }
+    | { kind: 're-prompt-update'; addedPermissions: string[]; existingScopes: Array<'workspace' | 'global'> };
+  raisedAt: number;
 }
 
 interface Window {

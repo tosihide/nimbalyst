@@ -1,7 +1,12 @@
+import fs from 'fs/promises';
+import os from 'os';
+import path from 'path';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { OpenAICodexProvider } from '../OpenAICodexProvider';
+import { configureMcpServers } from '../../services/mcpServerConfig';
 import * as codexBinaryPath from '../codex/codexBinaryPath';
 import * as codexSdkLoader from '../codex/codexSdkLoader';
+import { AISessionsRepository } from '../../../../storage/repositories/AISessionsRepository';
 
 function createAsyncEventStream(events: any[]): AsyncIterable<any> {
   return {
@@ -21,9 +26,7 @@ describe('OpenAICodexProvider', () => {
     OpenAICodexProvider.setPermissionPatternChecker(null);
     OpenAICodexProvider.setPermissionPatternSaver(null);
     OpenAICodexProvider.setSecurityLogger(null);
-    OpenAICodexProvider.setMcpServerPort(null);
-    OpenAICodexProvider.setSessionNamingServerPort(null);
-    OpenAICodexProvider.setExtensionDevServerPort(null);
+    configureMcpServers({ mcpServerPort: null, extensionDevServerPort: null });
     OpenAICodexProvider.setMCPConfigLoader(null);
     OpenAICodexProvider.setClaudeSettingsEnvLoader(null);
     OpenAICodexProvider.setShellEnvironmentLoader(null);
@@ -36,8 +39,62 @@ describe('OpenAICodexProvider', () => {
     OpenAICodexProvider.setSecurityLogger(() => {});
   });
 
+  it('updates currentTodos for app-server todoList raw events', async () => {
+    const updateMetadata = vi.fn(async () => {});
+    AISessionsRepository.setStore({
+      ensureReady: async () => {},
+      create: async () => {},
+      updateMetadata,
+      get: async () => ({ metadata: { existing: true } } as any),
+      list: async () => [],
+      search: async () => [],
+      delete: async () => {},
+    });
+
+    try {
+      const provider = new OpenAICodexProvider({ apiKey: 'test-key' });
+      (provider as any).handleTodoListEvent({
+        method: 'item/completed',
+        params: {
+          item: {
+            id: 'todo-1',
+            type: 'todoList',
+            items: [
+              { text: 'Inspect transcript parser', completed: true },
+              { text: 'Add parity coverage', completed: false },
+            ],
+          },
+        },
+      }, 'session-appserver-todos');
+
+      await vi.waitFor(() => {
+        expect(updateMetadata).toHaveBeenCalledWith('session-appserver-todos', {
+          metadata: {
+            existing: true,
+            currentTodos: [
+              {
+                id: 'codex-todo-0',
+                content: 'Inspect transcript parser',
+                activeForm: 'Inspect transcript parser',
+                status: 'completed',
+              },
+              {
+                id: 'codex-todo-1',
+                content: 'Add parity coverage',
+                activeForm: 'Add parity coverage',
+                status: 'in_progress',
+              },
+            ],
+          },
+        });
+      });
+    } finally {
+      AISessionsRepository.clearStore();
+    }
+  });
+
   it('returns fallback models when SDK model discovery is unavailable', async () => {
-    expect(OpenAICodexProvider.DEFAULT_MODEL).toBe('openai-codex:gpt-5.4');
+    expect(OpenAICodexProvider.DEFAULT_MODEL).toBe('openai-codex:gpt-5.5');
 
     const models = await OpenAICodexProvider.getModels(undefined, {
       loadSdkModule: async () => {
@@ -56,6 +113,12 @@ describe('OpenAICodexProvider', () => {
         provider: 'openai-codex',
       }),
     ]));
+  });
+
+  it('normalizes legacy codex default aliases to the GPT-5.5 default', () => {
+    expect(OpenAICodexProvider.normalizeModelSelection('openai-codex:openai-codex-cli')).toBe('openai-codex:gpt-5.5');
+    expect(OpenAICodexProvider.normalizeModelSelection('openai-codex:default')).toBe('openai-codex:gpt-5.5');
+    expect(OpenAICodexProvider.normalizeModelSelection('cli')).toBe('openai-codex:gpt-5.5');
   });
 
   it('uses SDK-provided model discovery when available', async () => {
@@ -451,6 +514,82 @@ describe('OpenAICodexProvider', () => {
     );
   });
 
+  it('does not append unsupported-attachment hints for text documents', async () => {
+    const tmpFile = path.join(os.tmpdir(), `nimbalyst-codex-provider-doc-${Date.now()}.txt`);
+    await fs.writeFile(tmpFile, 'provider attachment body', 'utf-8');
+
+    const createSession = vi.fn(async () => ({
+      id: 'thread-document-forward',
+      platform: 'codex-sdk',
+      raw: { thread: { runStreamed: vi.fn() } },
+    }));
+    const sendMessage = vi.fn((_session, _message) => createAsyncEventStream([
+      {
+        type: 'complete',
+        content: 'done',
+        usage: { input_tokens: 1, output_tokens: 1, total_tokens: 2 },
+      },
+    ]));
+    const protocol = {
+      platform: 'codex-sdk',
+      createSession,
+      resumeSession: vi.fn(),
+      forkSession: vi.fn(),
+      sendMessage,
+      abortSession: vi.fn(),
+      cleanupSession: vi.fn(),
+    } as any;
+
+    const provider = new OpenAICodexProvider(
+      { apiKey: 'test-key' },
+      {
+        protocol,
+      }
+    );
+
+    await provider.initialize({
+      apiKey: 'test-key',
+      model: 'openai-codex:gpt-5',
+    });
+
+    const attachments = [
+      {
+        id: 'doc-1',
+        filename: 'notes.txt',
+        filepath: tmpFile,
+        mimeType: 'text/plain',
+        size: 24,
+        type: 'document' as const,
+        addedAt: Date.now(),
+      },
+    ];
+
+    try {
+      for await (const _chunk of provider.sendMessage(
+        'Review @notes.txt',
+        undefined,
+        'session-document-forward',
+        [],
+        process.cwd(),
+        attachments
+      )) {
+        // drain
+      }
+
+      expect(sendMessage).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({
+          content: expect.not.stringContaining('Attached files:'),
+          attachments,
+          sessionId: 'session-document-forward',
+          mode: 'agent',
+        })
+      );
+    } finally {
+      await fs.unlink(tmpFile).catch(() => {});
+    }
+  });
+
   it('passes packaged codexPathOverride into SDK construction when available', async () => {
     let codexConstructorOptions: Record<string, unknown> | undefined;
 
@@ -645,9 +784,7 @@ describe('OpenAICodexProvider', () => {
     OpenAICodexProvider.setPermissionPatternChecker(async () => false);
     OpenAICodexProvider.setPermissionPatternSaver(async () => {});
     OpenAICodexProvider.setSecurityLogger(() => {});
-    OpenAICodexProvider.setMcpServerPort(41001);
-    OpenAICodexProvider.setSessionNamingServerPort(41002);
-    OpenAICodexProvider.setExtensionDevServerPort(41003);
+    configureMcpServers({ mcpServerPort: 41001, extensionDevServerPort: 41003 });
     OpenAICodexProvider.setMCPConfigLoader(async () => ({
       custom_stdio: {
         command: 'npx',
@@ -742,12 +879,19 @@ describe('OpenAICodexProvider', () => {
       // drain
     }
 
+    expect(codexConstructorOptions?.config?.show_raw_agent_reasoning).toBe(true);
     const mcpServers = codexConstructorOptions?.config?.mcp_servers as Record<string, any>;
     expect(mcpServers).toBeDefined();
     expect(Object.keys(mcpServers)).toEqual(
       expect.arrayContaining([
-        'nimbalyst-mcp',
-        'nimbalyst-session-naming',
+        // The legacy monolith `nimbalyst-mcp` is retired; every tool now lives on
+        // a split endpoint of the unified server: core (update_session_meta +
+        // glue) / host (settings + session-context + meta-agent) / trackers /
+        // situational, plus the standalone extension-dev server.
+        'nimbalyst',
+        'nimbalyst-host',
+        'nimbalyst-trackers',
+        'nimbalyst-situational',
         'nimbalyst-extension-dev',
         'custom_stdio',
         'customer_io',
@@ -758,10 +902,14 @@ describe('OpenAICodexProvider', () => {
       ])
     );
 
-    expect(mcpServers['nimbalyst-mcp'].url).toContain('http://127.0.0.1:41001/mcp');
-    expect(mcpServers['nimbalyst-mcp'].url).toContain(`workspacePath=${encodeURIComponent(workspacePath)}`);
-    expect(mcpServers['nimbalyst-session-naming'].url).toContain('http://127.0.0.1:41002/mcp');
-    expect(mcpServers['nimbalyst-session-naming'].url).toContain('sessionId=session-mcp');
+    expect(mcpServers['nimbalyst-mcp']).toBeUndefined();
+    // update_session_meta rides on the eager core `nimbalyst` (/mcp/core) on the
+    // unified port (41001).
+    expect(mcpServers['nimbalyst'].url).toContain('http://127.0.0.1:41001/mcp/core');
+    expect(mcpServers['nimbalyst'].url).toContain('sessionId=session-mcp');
+    expect(mcpServers['nimbalyst'].url).toContain(`workspacePath=${encodeURIComponent(workspacePath)}`);
+    expect(mcpServers['nimbalyst-host'].url).toContain('http://127.0.0.1:41001/mcp/host');
+    expect(mcpServers['nimbalyst-situational'].url).toContain('http://127.0.0.1:41001/mcp/situational');
     expect(mcpServers['nimbalyst-extension-dev'].url).toContain('http://127.0.0.1:41003/mcp');
     expect(mcpServers['nimbalyst-extension-dev'].url).toContain(`workspacePath=${encodeURIComponent(workspacePath)}`);
 
@@ -934,10 +1082,78 @@ describe('OpenAICodexProvider', () => {
       // drain
     }
 
+    expect(codexConstructorOptions?.config?.show_raw_agent_reasoning).toBe(true);
     expect(codexConstructorOptions?.config?.mcp_servers?.supabase).toEqual({
       command: 'npx',
       args: ['-y', '@supabase/mcp'],
     });
+  });
+
+  it('allows internal MCP tools for meta-agent Codex sessions', async () => {
+    const runStreamed = vi.fn(async () => ({
+      threadId: 'thread-meta-agent',
+      events: createAsyncEventStream([
+        {
+          type: 'item.completed',
+          item: {
+            type: 'agent_message',
+            text: 'meta-agent ready',
+          },
+        },
+      ]),
+    }));
+    const startThread = vi.fn((options?: Record<string, unknown>) => ({
+      id: 'thread-meta-agent',
+      options,
+      runStreamed,
+    }));
+
+    vi.spyOn(AISessionsRepository, 'get').mockResolvedValue({
+      agentRole: 'meta-agent',
+    } as any);
+
+    configureMcpServers({ mcpServerPort: 41001 });
+
+    const provider = new OpenAICodexProvider(
+      { apiKey: 'test-key' },
+      {
+        loadSdkModule: async () =>
+          ({
+            Codex: class {
+              startThread = startThread;
+              resumeThread = startThread;
+            },
+          }) as any,
+      }
+    );
+
+    await provider.initialize({
+      apiKey: 'test-key',
+      model: 'openai-codex:gpt-5.5',
+    });
+
+    for await (const _chunk of provider.sendMessage('delegate work', undefined, 'session-meta-agent', [], process.cwd())) {
+      // drain
+    }
+
+    expect(startThread).toHaveBeenCalledWith(expect.objectContaining({
+      allowedTools: expect.arrayContaining([
+        // Meta-agent orchestration + session-context fold onto `nimbalyst-host`;
+        // update_session_meta onto the eager core `nimbalyst`.
+        'mcp__nimbalyst-host__create_session',
+        'mcp__nimbalyst-host__get_session_result',
+        'mcp__nimbalyst__update_session_meta',
+        'mcp__nimbalyst-host__get_workstream_overview',
+        'TaskCreate',
+        'TodoWrite',
+      ]),
+      disallowedTools: expect.arrayContaining([
+        'Read',
+        'Write',
+        'Edit',
+        'Bash',
+      ]),
+    }));
   });
 
   it('resumes an existing provider thread when provider session data is restored', async () => {
@@ -992,6 +1208,134 @@ describe('OpenAICodexProvider', () => {
     // Text chunks are also yielded alongside canonical events so AIService
     // can populate fullResponse for OS notification bodies.
     expect(chunks.some((chunk) => chunk.type === 'text')).toBe(true);
+  });
+
+  it('captures a new Codex thread ID before a blocked turn completes', async () => {
+    const createSession = vi.fn(async () => ({
+      id: 'thread-blocked',
+      platform: 'codex-app-server',
+      raw: { fake: true },
+    }));
+    const protocol = {
+      platform: 'codex-app-server',
+      createSession,
+      resumeSession: vi.fn(),
+      forkSession: vi.fn(),
+      async *sendMessage() {
+        yield {
+          type: 'tool_call',
+          toolCall: {
+            id: 'call_blocked',
+            name: 'mcp__nimbalyst-mcp__PromptForUserInput',
+            arguments: {
+              title: 'Blocked prompt',
+              fields: [],
+            },
+          },
+        };
+      },
+      abortSession: vi.fn(),
+      cleanupSession: vi.fn(),
+    } as any;
+
+    const provider = new OpenAICodexProvider(
+      { apiKey: 'test-key' },
+      { protocol },
+    );
+    await provider.initialize({ apiKey: 'test-key', model: 'openai-codex:gpt-5' });
+
+    const providerSessionReceived = vi.fn();
+    provider.on('session:providerSessionReceived', providerSessionReceived);
+
+    const iterator = provider.sendMessage(
+      'ask for approval',
+      undefined,
+      'session-blocked',
+      [],
+      process.cwd(),
+    )[Symbol.asyncIterator]();
+
+    const firstChunk = await iterator.next();
+    expect(firstChunk.done).toBe(false);
+    expect(firstChunk.value).toMatchObject({
+      type: 'tool_call',
+      toolCall: expect.objectContaining({ id: 'call_blocked' }),
+    });
+
+    expect(provider.getProviderSessionData('session-blocked')).toEqual({
+      providerSessionId: 'thread-blocked',
+      codexThreadId: 'thread-blocked',
+    });
+    expect(providerSessionReceived).toHaveBeenCalledWith({
+      sessionId: 'session-blocked',
+      providerSessionId: 'thread-blocked',
+    });
+  });
+
+  it('reuses the same live ProtocolSession across consecutive turns on one Nimbalyst session', async () => {
+    // Mock protocol -- the cache lives at the provider layer, so we want to
+    // pin down its create/resume/reuse behavior without depending on the SDK
+    // loader path. The bug we're protecting against: every turn calling
+    // protocol.resumeSession, which spawns a new child each time and orphans
+    // the previous one (high-severity finding from the codex app-server
+    // smoke-test review on 2026-05-14).
+    const createSession = vi.fn(async () => ({
+      id: 'thread-reuse',
+      platform: 'codex-app-server',
+      raw: { fake: true },
+    }));
+    const resumeSession = vi.fn();
+    const cleanupSession = vi.fn();
+    const sendMessage = vi.fn((_session, _message) => createAsyncEventStream([
+      {
+        type: 'complete',
+        content: 'ok',
+        usage: { input_tokens: 1, output_tokens: 1, total_tokens: 2 },
+      },
+    ]));
+    const protocol = {
+      platform: 'codex-app-server',
+      createSession,
+      resumeSession,
+      forkSession: vi.fn(),
+      sendMessage,
+      abortSession: vi.fn(),
+      cleanupSession,
+    } as any;
+
+    const provider = new OpenAICodexProvider(
+      { apiKey: 'test-key' },
+      { protocol },
+    );
+    await provider.initialize({ apiKey: 'test-key', model: 'openai-codex:gpt-5' });
+
+    // Turn 1.
+    for await (const _ of provider.sendMessage('first', undefined, 'session-reuse', [], process.cwd())) {
+      // drain
+    }
+    expect(createSession).toHaveBeenCalledTimes(1);
+    expect(resumeSession).not.toHaveBeenCalled();
+
+    // Turn 2 -- must reuse the cached ProtocolSession, NOT call resumeSession
+    // (which on the app-server transport would spawn another child).
+    for await (const _ of provider.sendMessage('second', undefined, 'session-reuse', [], process.cwd())) {
+      // drain
+    }
+    expect(createSession).toHaveBeenCalledTimes(1);
+    expect(resumeSession).not.toHaveBeenCalled();
+    expect(sendMessage).toHaveBeenCalledTimes(2);
+
+    // Both turns should have used the SAME ProtocolSession object the protocol
+    // handed us on turn 1.
+    const turn1Session = sendMessage.mock.calls[0][0];
+    const turn2Session = sendMessage.mock.calls[1][0];
+    expect(turn2Session).toBe(turn1Session);
+
+    // cleanupSession on the provider must release the cached protocol session
+    // so the codex child process actually dies.
+    provider.cleanupSession('session-reuse');
+    expect(cleanupSession).toHaveBeenCalledTimes(1);
+    expect(cleanupSession).toHaveBeenCalledWith(turn1Session);
   });
 
   it('denies Codex turns when workspace is not trusted', async () => {
@@ -1068,7 +1412,7 @@ describe('OpenAICodexProvider', () => {
     expect(errorChunk?.error).toContain('permission mode');
   });
 
-  it('maps legacy codex model ids to gpt-5.4 when starting a thread', async () => {
+  it('maps default codex cli aliases to gpt-5.5 when starting a thread', async () => {
     const startThread = vi.fn((config: { model: string }) => ({
       id: 'thread-legacy',
       runStreamed: async () => ({
@@ -1108,7 +1452,7 @@ describe('OpenAICodexProvider', () => {
 
     expect(startThread).toHaveBeenCalledTimes(1);
     const startArgs = (startThread.mock.calls as unknown as [Record<string, unknown>][])[0][0];
-    expect(startArgs.model).toBe('gpt-5.4');
+    expect(startArgs.model).toBe('gpt-5.5');
   });
 
   it('maps removed codex aliases to supported model ids', async () => {
@@ -1295,5 +1639,99 @@ describe('OpenAICodexProvider', () => {
       },
       120000
     );
+  });
+
+  describe('codex app-server auth gate', () => {
+    function buildAppServerProvider() {
+      const createSession = vi.fn(async () => ({
+        id: 'thread-app-server-auth',
+        platform: 'codex-app-server',
+        raw: {},
+      }));
+      const sendMessage = vi.fn((_session, _message) => createAsyncEventStream([]));
+      const protocol = {
+        platform: 'codex-app-server',
+        createSession,
+        resumeSession: vi.fn(),
+        forkSession: vi.fn(),
+        sendMessage,
+        abortSession: vi.fn(),
+        cleanupSession: vi.fn(),
+      } as any;
+
+      const provider = new OpenAICodexProvider(
+        {},
+        {
+          transport: 'app-server',
+          protocol,
+        },
+      );
+      return { provider, createSession, sendMessage };
+    }
+
+    beforeEach(() => {
+      OpenAICodexProvider.setCodexAuthGate(null);
+    });
+
+    it('short-circuits with an isCodexAuthRequired error chunk when the gate reports requiresOpenaiAuth', async () => {
+      const gate = vi.fn(async () => ({ requiresOpenaiAuth: true }));
+      OpenAICodexProvider.setCodexAuthGate(gate);
+
+      const { provider, createSession, sendMessage } = buildAppServerProvider();
+      await provider.initialize({ model: 'openai-codex:gpt-5' });
+
+      const chunks: any[] = [];
+      for await (const chunk of provider.sendMessage('hi', undefined, 'session-auth-required', [], process.cwd())) {
+        chunks.push(chunk);
+      }
+
+      expect(gate).toHaveBeenCalledTimes(1);
+      const errorChunk = chunks.find((c) => c.type === 'error');
+      expect(errorChunk).toBeDefined();
+      expect(errorChunk.isCodexAuthRequired).toBe(true);
+      expect(errorChunk.isAuthError).toBe(true);
+      expect(errorChunk.error).toMatch(/sign in/i);
+      expect(createSession).not.toHaveBeenCalled();
+      expect(sendMessage).not.toHaveBeenCalled();
+    });
+
+    it('proceeds to createSession when the gate reports no auth required', async () => {
+      const gate = vi.fn(async () => ({ requiresOpenaiAuth: false }));
+      OpenAICodexProvider.setCodexAuthGate(gate);
+
+      const { provider, createSession } = buildAppServerProvider();
+      await provider.initialize({ model: 'openai-codex:gpt-5' });
+
+      const chunks: any[] = [];
+      for await (const chunk of provider.sendMessage('hi', undefined, 'session-auth-ok', [], process.cwd())) {
+        chunks.push(chunk);
+      }
+
+      expect(gate).toHaveBeenCalledTimes(1);
+      expect(chunks.some((c) => c.type === 'error' && c.isCodexAuthRequired)).toBe(false);
+      expect(createSession).toHaveBeenCalledTimes(1);
+    });
+
+    it('falls through on gate failure instead of blocking the turn', async () => {
+      const gate = vi.fn(async () => { throw new Error('gate exploded'); });
+      OpenAICodexProvider.setCodexAuthGate(gate);
+
+      const { provider, createSession } = buildAppServerProvider();
+      await provider.initialize({ model: 'openai-codex:gpt-5' });
+
+      const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      try {
+        const chunks: any[] = [];
+        for await (const chunk of provider.sendMessage('hi', undefined, 'session-gate-broken', [], process.cwd())) {
+          chunks.push(chunk);
+        }
+
+        expect(gate).toHaveBeenCalledTimes(1);
+        expect(chunks.some((c) => c.type === 'error' && c.isCodexAuthRequired)).toBe(false);
+        expect(createSession).toHaveBeenCalledTimes(1);
+      } finally {
+        warnSpy.mockRestore();
+      }
+    });
   });
 });

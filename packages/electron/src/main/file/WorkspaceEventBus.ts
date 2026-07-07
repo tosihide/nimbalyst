@@ -4,6 +4,7 @@ import * as path from 'path';
 import chokidar, { FSWatcher as ChokidarFSWatcher } from 'chokidar';
 import ignore, { Ignore } from 'ignore';
 import { logger } from '../utils/logger';
+import { shouldExcludeDir } from '../utils/fileFilters';
 import { isPathInWorkspace } from '../utils/workspaceDetection';
 
 /**
@@ -90,6 +91,11 @@ function normalizeToForwardSlash(p: string): string {
   return p.replace(/\\/g, '/');
 }
 
+function pathContainsExcludedDir(relativePath: string): boolean {
+  const segments = normalizeToForwardSlash(relativePath).split('/').filter(Boolean);
+  return segments.some((segment) => shouldExcludeDir(segment));
+}
+
 // ---------------------------------------------------------------------------
 // Workspace path safety
 // ---------------------------------------------------------------------------
@@ -142,6 +148,8 @@ interface CircuitBreakerState {
   writeIndex: number;
   /** Whether this breaker has already tripped. */
   tripped: boolean;
+  /** Whether the deferred watcher teardown has already been scheduled (idempotency). */
+  teardownScheduled: boolean;
 }
 
 function createCircuitBreaker(): CircuitBreakerState {
@@ -149,6 +157,7 @@ function createCircuitBreaker(): CircuitBreakerState {
     timestamps: new Array(CIRCUIT_BREAKER_THRESHOLD).fill(0),
     writeIndex: 0,
     tripped: false,
+    teardownScheduled: false,
   };
 }
 
@@ -182,6 +191,8 @@ function recordEvent(cb: CircuitBreakerState): boolean {
 
 export type WorkspaceEventType = 'change' | 'add' | 'unlink';
 
+type GitignoreChangeHandler = (workspacePath: string) => void;
+
 export interface WorkspaceEventListener {
   onChange: (filePath: string, gitignoreBypassed?: boolean) => void;
   onAdd: (filePath: string, gitignoreBypassed?: boolean) => void;
@@ -213,14 +224,22 @@ const REPLAY_BUFFER_MAX = 50;
 /** TTL for replay buffer entries (ms). */
 const REPLAY_BUFFER_TTL_MS = 5000;
 
+let gitignoreChangeHandler: GitignoreChangeHandler | null = null;
+
 interface BusEntry {
   watcher: fs.FSWatcher | ChokidarFSWatcher;
   /** Subscriber IDs currently using this watcher */
   refCount: number;
   /** Callbacks to invoke for each fs event, keyed by subscriber ID */
   listeners: Map<string, WorkspaceEventListener>;
-  /** The loaded .gitignore filter */
-  gitignoreFilter: Ignore;
+  /** Absolute (resolved) workspace path. Cached so isGitignoredScoped doesn't re-resolve per event. */
+  workspaceAbs: string;
+  /** Workspace-root .gitignore filter (or fallback patterns when none exists). */
+  workspaceGitignoreFilter: Ignore;
+  /** Lazily loaded nested-repo .gitignore filters, keyed by absolute git-root path. */
+  nestedGitignoreCache: Map<string, Ignore>;
+  /** Memoized git-root lookup keyed by directory, so the chokidar walk visits each ancestor at most once. */
+  gitRootDirCache: Map<string, string | null>;
   /** Event rate circuit breaker — kills the watcher if events flood in. */
   circuitBreaker: CircuitBreakerState;
   /** Absolute paths that bypass gitignore filtering. */
@@ -256,6 +275,10 @@ function shouldIgnoreHardcoded(relativePath: string): boolean {
     }
   }
 
+  if (pathContainsExcludedDir(relativePath)) {
+    return true;
+  }
+
   const basename = segments[segments.length - 1];
 
   // Ignore OS junk files
@@ -281,12 +304,185 @@ async function loadGitignoreFilter(workspacePath: string): Promise<Ignore> {
   }
 }
 
+function loadWorkspaceGitignoreFilterSync(workspacePath: string): Ignore {
+  const gitignorePath = path.join(workspacePath, '.gitignore');
+  try {
+    const content = fs.readFileSync(gitignorePath, 'utf-8');
+    return ignore().add(content);
+  } catch {
+    return ignore().add(FALLBACK_IGNORE_PATTERNS);
+  }
+}
+
+/**
+ * Synchronous loader for nested-repo `.gitignore`s. Used from the chokidar
+ * `ignored` callback, which must return synchronously, so the `Ignore` instance
+ * has to materialize on first miss without `await`. Returns an empty filter
+ * when the nested repo has no `.gitignore` — we don't fall back to the workspace
+ * patterns at the nested level because a nested repo's silence is its own choice.
+ */
+function loadGitignoreFilterSync(rootPath: string): Ignore {
+  const gitignorePath = path.join(rootPath, '.gitignore');
+  try {
+    const content = fs.readFileSync(gitignorePath, 'utf-8');
+    return ignore().add(content);
+  } catch {
+    return ignore();
+  }
+}
+
+/**
+ * Walk up from `dirname(absolutePath)` to find the deepest enclosing directory
+ * that contains a `.git` entry, bounded at `workspaceAbs`. Memoizes per-directory
+ * results so a chokidar walk over 100k entries does at most one `existsSync`
+ * per unique ancestor. Mirrors the boundary semantics of
+ * `GitStatusService.findGitRootForFile` — out-of-boundary inputs return null
+ * so we never resolve to an unrelated repo higher up the filesystem.
+ */
+function findGitRootForPathCached(
+  absolutePath: string,
+  workspaceAbs: string,
+  cache: Map<string, string | null>,
+): string | null {
+  const sep = process.platform === 'win32' ? '\\' : '/';
+  const boundaryWithSep = workspaceAbs.endsWith(sep) ? workspaceAbs : workspaceAbs + sep;
+  if (absolutePath !== workspaceAbs && !absolutePath.startsWith(boundaryWithSep)) {
+    return null;
+  }
+
+  const ancestorsVisited: string[] = [];
+  let dir = path.dirname(absolutePath);
+  let result: string | null = null;
+
+  while (true) {
+    const cached = cache.get(dir);
+    if (cached !== undefined) {
+      result = cached;
+      break;
+    }
+    ancestorsVisited.push(dir);
+
+    try {
+      if (fs.existsSync(path.join(dir, '.git'))) {
+        result = dir;
+        break;
+      }
+    } catch {
+      // ignore - keep walking
+    }
+
+    if (dir === workspaceAbs) {
+      result = null;
+      break;
+    }
+    const parent = path.dirname(dir);
+    if (parent === dir) {
+      result = null;
+      break;
+    }
+    if (!parent.startsWith(boundaryWithSep) && parent !== workspaceAbs) {
+      result = null;
+      break;
+    }
+    dir = parent;
+  }
+
+  // Every ancestor we crossed shares the same owning root.
+  for (const visited of ancestorsVisited) {
+    cache.set(visited, result);
+  }
+  return result;
+}
+
+/**
+ * Returns true if `absolutePath` is gitignored under either the workspace-root
+ * `.gitignore` (existing behavior) or the nearest enclosing nested repo's
+ * `.gitignore`. Honors the layout from issue #207, where a non-git workspace
+ * root contains nested git repos with their own ignore rules.
+ */
+function isGitignoredScoped(
+  absolutePath: string,
+  workspaceAbs: string,
+  entry: BusEntry,
+): boolean {
+  const wsRel = path.relative(workspaceAbs, absolutePath).split(path.sep).join('/');
+  if (wsRel === '' || wsRel.startsWith('..')) return false;
+
+  if (entry.workspaceGitignoreFilter.ignores(wsRel) ||
+      entry.workspaceGitignoreFilter.ignores(wsRel + '/')) {
+    return true;
+  }
+
+  const owningRoot = findGitRootForPathCached(absolutePath, workspaceAbs, entry.gitRootDirCache);
+  if (!owningRoot || owningRoot === workspaceAbs) return false;
+
+  let nestedFilter = entry.nestedGitignoreCache.get(owningRoot);
+  if (!nestedFilter) {
+    nestedFilter = loadGitignoreFilterSync(owningRoot);
+    entry.nestedGitignoreCache.set(owningRoot, nestedFilter);
+  }
+  const rootRel = path.relative(owningRoot, absolutePath).split(path.sep).join('/');
+  if (rootRel === '' || rootRel.startsWith('..')) return false;
+  return nestedFilter.ignores(rootRel) || nestedFilter.ignores(rootRel + '/');
+}
+
+function isGitignoreFile(absolutePath: string): boolean {
+  return path.basename(absolutePath) === '.gitignore';
+}
+
+function reloadGitignoreFiltersForPath(absolutePath: string, entry: BusEntry): boolean {
+  if (!isGitignoreFile(absolutePath)) return false;
+
+  const normalizedPath = path.resolve(absolutePath);
+  const workspaceGitignorePath = path.join(entry.workspaceAbs, '.gitignore');
+  let reloaded = false;
+
+  if (normalizedPath === workspaceGitignorePath) {
+    entry.workspaceGitignoreFilter = loadWorkspaceGitignoreFilterSync(entry.workspaceAbs);
+    reloaded = true;
+  } else {
+    const candidateRoot = path.dirname(normalizedPath);
+    if (entry.nestedGitignoreCache.has(candidateRoot) || fs.existsSync(path.join(candidateRoot, '.git'))) {
+      entry.nestedGitignoreCache.set(candidateRoot, loadGitignoreFilterSync(candidateRoot));
+      reloaded = true;
+    }
+  }
+
+  if (!reloaded) return false;
+
+  // Ignore semantics changed; dropped-event replay is no longer valid.
+  entry.replayBuffer = [];
+  gitignoreChangeHandler?.(entry.workspaceAbs);
+  return true;
+}
+
+function refreshGitignoreFiltersForEvent(
+  absolutePath: string,
+  eventType: 'change' | 'add' | 'unlink' | 'rename',
+  entry: BusEntry,
+): void {
+  if (!isGitignoreFile(absolutePath)) return;
+
+  if (eventType === 'rename') {
+    void pathExistsAfterRename(absolutePath).finally(() => {
+      reloadGitignoreFiltersForPath(absolutePath, entry);
+    });
+    return;
+  }
+
+  reloadGitignoreFiltersForPath(absolutePath, entry);
+}
+
 // ---------------------------------------------------------------------------
 // WorkspaceEventBus
 // ---------------------------------------------------------------------------
 
 /** Global registry of shared watchers, keyed by normalized workspace path. */
 const busEntries = new Map<string, BusEntry>();
+
+export function setGitignoreChangeHandler(handler: GitignoreChangeHandler | null): void {
+  gitignoreChangeHandler = handler;
+}
 
 /**
  * WorkspaceEventBus owns a single fs.watch/chokidar watcher per workspace,
@@ -414,6 +610,15 @@ export function addGitignoreBypass(workspacePath: string, absolutePath: string):
   // Validate that the path is inside the workspace
   if (!isPathInWorkspace(absolutePath, key)) {
     logger.main.debug('[WorkspaceEventBus] Rejected gitignore bypass for path outside workspace:', {
+      workspacePath: key,
+      absolutePath,
+    });
+    return;
+  }
+
+  const relativePath = path.relative(key, absolutePath);
+  if (relativePath && !relativePath.startsWith('..') && pathContainsExcludedDir(relativePath)) {
+    logger.main.debug('[WorkspaceEventBus] Rejected gitignore bypass for excluded path:', {
       workspacePath: key,
       absolutePath,
     });
@@ -558,19 +763,38 @@ function closeWatcher(watcher: fs.FSWatcher | ChokidarFSWatcher): void {
   }
 }
 
+/**
+ * Close a watcher from OUTSIDE its own delivery callback.
+ *
+ * On macOS, `fs.watch(recursive:true)` is FSEvents-backed and `close()` performs
+ * a blocking round-trip to the FSEvents CFRunLoop thread (`uv__fsevents_close`).
+ * Calling that synchronously from inside the watch callback — while libuv is still
+ * delivering the current event batch — can abort Electron (SIGABRT/SIGTRAP). This
+ * is exactly what happens when the circuit breaker trips during an event storm
+ * (issue #629). Deferring to `setImmediate` runs the close in the next loop's
+ * check phase, after the native batch has fully unwound. Use this from any code
+ * path that closes a watcher from within a watcher callback (circuit breaker,
+ * EMFILE/ENFILE error handlers); use the synchronous `closeWatcher` from app-driven
+ * paths (`unsubscribe`, `stopAll`) where we are not inside a delivery callback.
+ */
+function closeWatcherDeferred(
+  key: string,
+  watcher: fs.FSWatcher | ChokidarFSWatcher,
+  reason: string,
+): void {
+  setImmediate(() => {
+    try {
+      closeWatcher(watcher);
+    } catch (error) {
+      logger.main.error(
+        `[WorkspaceEventBus] Error closing watcher for "${key}" (${reason}):`,
+        error,
+      );
+    }
+  });
+}
+
 /** Returns true if the relative path should be filtered out. */
-function shouldFilter(relativePath: string, ig: Ignore): boolean {
-  if (shouldIgnoreHardcoded(relativePath)) return true;
-  // .gitignore check - test both file and directory forms
-  if (ig.ignores(relativePath) || ig.ignores(relativePath + '/')) return true;
-  return false;
-}
-
-/** Returns true if the relative path is gitignored (but NOT hardcoded-ignored). */
-function isGitignored(relativePath: string, ig: Ignore): boolean {
-  return ig.ignores(relativePath) || ig.ignores(relativePath + '/');
-}
-
 /** Returns true if a file has a .md extension. */
 function isMarkdownFile(filePath: string): boolean {
   return path.extname(filePath).toLowerCase() === '.md';
@@ -665,13 +889,28 @@ function replayDroppedEvents(entry: BusEntry, absolutePath: string): void {
 }
 
 function tripCircuitBreaker(key: string, entry: BusEntry): void {
+  // Idempotent: a burst delivers many events synchronously, and the breaker may
+  // be reached more than once before the deferred close runs. Schedule teardown
+  // exactly once so we never double-close the (now-closed) watcher.
+  if (entry.circuitBreaker.teardownScheduled) return;
+  entry.circuitBreaker.teardownScheduled = true;
+
   logger.main.error(
     `[WorkspaceEventBus] Circuit breaker tripped for "${key}" — ` +
     `received ${CIRCUIT_BREAKER_THRESHOLD} events in ${CIRCUIT_BREAKER_WINDOW_MS}ms. ` +
-    `Killing watcher to protect the process. This workspace may be too large or missing a .gitignore.`
+    `Killing watcher to protect the process. This workspace may be too large, ` +
+    `missing a .gitignore at the workspace root, or contain nested repos whose .gitignore is not honored.`
   );
-  closeWatcher(entry.watcher);
+
+  // Remove from the registry synchronously so further events in this burst
+  // early-return (recordEvent short-circuits on `tripped`) and so unsubscribe/
+  // stopAll won't also try to close this watcher.
   busEntries.delete(key);
+
+  // Defer the actual close out of the fs.watch/FSEvents delivery callback — see
+  // closeWatcherDeferred. Capture entry.watcher directly because the registry
+  // entry is already gone.
+  closeWatcherDeferred(key, entry.watcher, 'circuit breaker tripped');
 }
 
 function startRecursiveWatch(
@@ -686,7 +925,10 @@ function startRecursiveWatch(
     watcher: null!,
     refCount: 1,
     listeners: new Map([[subscriberId, listener]]),
-    gitignoreFilter: ig,
+    workspaceAbs: key,
+    workspaceGitignoreFilter: ig,
+    nestedGitignoreCache: new Map(),
+    gitRootDirCache: new Map(),
     circuitBreaker: cb,
     gitignoreBypassPaths: new Set(),
     replayBuffer: [],
@@ -711,11 +953,12 @@ function startRecursiveWatch(
       if (shouldIgnoreHardcoded(relativePath)) return;
 
       const absolutePath = path.join(workspacePath, filename);
+      refreshGitignoreFiltersForEvent(absolutePath, eventType === 'change' ? 'change' : 'rename', entry);
 
-      // Stage 2: gitignore check with bypass support
+      // Stage 2: gitignore check (workspace + nested-repo) with bypass support
       let bypassed = false;
       let dropForNonStructureListeners = false;
-      if (isGitignored(relativePath, ig)) {
+      if (isGitignoredScoped(absolutePath, key, entry)) {
         const action = getGitignoreAction(absolutePath, entry);
         if (action === 'drop') {
           // Store in replay buffer for potential late bypass registration.
@@ -761,8 +1004,11 @@ function startRecursiveWatch(
           `closing watcher. File changes will not be detected.`
         );
         if (busEntries.has(key)) {
-          (watcher as fs.FSWatcher).close();
+          // Delete synchronously, but defer the close: this 'error' handler can
+          // fire from within FSEvents delivery, where a synchronous close can
+          // abort Electron (same hazard as the circuit breaker — issue #629).
           busEntries.delete(key);
+          closeWatcherDeferred(key, watcher, `${code} too many open files`);
         }
       } else if (code === 'EPERM' || code === 'EACCES' || code === 'UNKNOWN') {
         logger.main.debug('[WorkspaceEventBus] Skipping unwatchable path:', error);
@@ -834,7 +1080,10 @@ function startChokidarWatch(
       watcher: null!,
       refCount: 1,
       listeners: new Map([[subscriberId, listener]]),
-      gitignoreFilter: ig,
+      workspaceAbs: key,
+      workspaceGitignoreFilter: ig,
+      nestedGitignoreCache: new Map(),
+      gitRootDirCache: new Map(),
       circuitBreaker: cb,
       gitignoreBypassPaths: new Set(),
       replayBuffer: [],
@@ -849,7 +1098,10 @@ function startChokidarWatch(
         const relativePath = path.relative(workspacePath, filePath);
         if (!relativePath) return false;
         if (shouldIgnoreHardcoded(relativePath)) return true;
-        if (!isGitignored(relativePath, ig)) return false;
+        // Honors workspace-root .gitignore AND any nested-repo .gitignore — so
+        // chokidar does not recurse into directories like a nested repo's
+        // ignored build-output tree (issue #207).
+        if (!isGitignoredScoped(filePath, key, entry)) return false;
         // Gitignored — let through if bypassed
         return getGitignoreAction(filePath, entry) === 'drop';
       },
@@ -882,22 +1134,25 @@ function startChokidarWatch(
     const isBypassed = (filePath: string): boolean => {
       const relativePath = path.relative(workspacePath, filePath);
       if (!relativePath) return false;
-      return isGitignored(relativePath, ig);
+      return isGitignoredScoped(filePath, key, entry);
     };
 
     watcher
       .on('change', (filePath: string) => {
         if (checkBreaker()) return;
+        refreshGitignoreFiltersForEvent(filePath, 'change', entry);
         const bypassed = isBypassed(filePath) || undefined;
         for (const l of entry.listeners.values()) l.onChange(filePath, bypassed);
       })
       .on('add', (filePath: string) => {
         if (checkBreaker()) return;
+        refreshGitignoreFiltersForEvent(filePath, 'add', entry);
         const bypassed = isBypassed(filePath) || undefined;
         for (const l of entry.listeners.values()) l.onAdd(filePath, bypassed);
       })
       .on('unlink', (filePath: string) => {
         if (checkBreaker()) return;
+        refreshGitignoreFiltersForEvent(filePath, 'unlink', entry);
         const bypassed = isBypassed(filePath) || undefined;
         for (const l of entry.listeners.values()) l.onUnlink(filePath, bypassed);
       })
@@ -911,8 +1166,10 @@ function startChokidarWatch(
             `closing watcher to stop retry-spam. File changes will not be detected.`
           );
           if (busEntries.has(key)) {
-            closeWatcher(entry.watcher);
+            // Delete synchronously, defer the close out of chokidar's own
+            // event handler for symmetry with the recursive path (issue #629).
             busEntries.delete(key);
+            closeWatcherDeferred(key, entry.watcher, `${code} too many open files`);
           }
         } else if (code === 'EPERM' || code === 'EACCES' || code === 'UNKNOWN') {
           logger.main.debug('[WorkspaceEventBus] Skipping unwatchable path:', error);

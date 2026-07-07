@@ -14,10 +14,7 @@ import { registerTeamDialogs as _registerTeamDialogs } from './teamDialogs';
 export { DIALOG_IDS, type DialogId } from './registry';
 export {
   registerNavigationDialogs,
-  type QuickOpenData,
-  type SessionQuickOpenData,
-  type PromptQuickOpenData,
-  type ProjectQuickOpenData,
+  type UnifiedQuickOpenData,
 } from './navigation';
 export {
   registerSimpleDialogs,
@@ -45,6 +42,7 @@ export {
 export {
   registerTeamDialogs,
   type CreateTeamData,
+  type ShareToTeamData,
 } from './teamDialogs';
 export { useNavigationDialogs, type UseNavigationDialogsReturn } from './useNavigationDialogs';
 export { dialogRef, dialogReadyAtom, hasActiveDialogsAtom } from '../contexts/DialogContext';

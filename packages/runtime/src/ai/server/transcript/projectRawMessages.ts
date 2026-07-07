@@ -16,8 +16,11 @@ import { TranscriptWriter } from './TranscriptWriter';
 import { TranscriptProjector, type TranscriptViewMessage } from './TranscriptProjector';
 import { InMemoryTranscriptEventStore } from './InMemoryTranscriptEventStore';
 import { ClaudeCodeRawParser } from './parsers/ClaudeCodeRawParser';
-import { CodexRawParser } from './parsers/CodexRawParser';
+import { CodexRawParserDispatcher } from './parsers/CodexRawParserDispatcher';
+import { CodexACPRawParser } from './parsers/CodexACPRawParser';
+import { CopilotRawParser } from './parsers/CopilotRawParser';
 import { OpenCodeRawParser } from './parsers/OpenCodeRawParser';
+import { VoiceRawParser } from './parsers/VoiceRawParser';
 import type { IRawMessageParser, ParseContext } from './parsers/IRawMessageParser';
 import type { RawMessage } from './TranscriptTransformer';
 import type { TranscriptEvent } from './types';
@@ -25,8 +28,16 @@ import { processDescriptor, selectRawParser } from './processDescriptor';
 
 function createParser(provider: string): IRawMessageParser {
   const kind = selectRawParser(provider);
-  if (kind === 'codex') return new CodexRawParser();
+  // Codex has two transports (SDK / app-server) with different output shapes;
+  // route per-message via the same dispatcher the server-side transformer uses,
+  // otherwise app-server sessions parse with the SDK parser and silently drop
+  // every assistant/tool event (the catch in rawMessagesToCanonicalEvents
+  // swallows the resulting parse errors, leaving only user prompts visible).
+  if (kind === 'codex') return new CodexRawParserDispatcher();
+  if (kind === 'codex-acp') return new CodexACPRawParser();
+  if (kind === 'copilot') return new CopilotRawParser();
   if (kind === 'opencode') return new OpenCodeRawParser();
+  if (kind === 'voice') return new VoiceRawParser();
   return new ClaudeCodeRawParser();
 }
 
@@ -55,6 +66,8 @@ export async function rawMessagesToCanonicalEvents(
     hasSubagent: (id: string) => subagentEventIds.has(id),
     findByProviderToolCallId: (id: string) =>
       store.findByProviderToolCallId(id, sessionId),
+    findActiveToolCallByRawProviderId: (rawId: string) =>
+      store.findActiveToolCallByRawProviderId(rawId, sessionId),
   };
 
   for (const msg of rawMessages) {

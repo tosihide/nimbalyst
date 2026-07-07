@@ -2,6 +2,8 @@
 export * from './editor';
 export * from './core/types';
 export * from './core/DocumentService';
+export * from './core/trackerOrigin';
+export * from './auth/jwtScopes';
 export * from './core/FileSystemService';
 export * from './storage/repositories/DocumentsRepository';
 // AI
@@ -13,6 +15,7 @@ export * from './ai/tools';
 export * from './ai/modelConstants';
 export * from './ai/adapters/sessionStore';
 export { SessionManager } from './ai/server/SessionManager';
+export { slimClaudeCodeChunkForStorage } from './ai/server/providers/claudeCode/toolChunkUtils';
 export {
   DocumentContextService,
   type IDocumentContextService,
@@ -27,7 +30,6 @@ export * from './storage/repositories/AISessionsRepository';
 export * from './storage/repositories/SessionFilesRepository';
 export { AgentMessagesRepository } from './storage/repositories/AgentMessagesRepository';
 export type { AgentMessagesStore } from './storage/repositories/AgentMessagesRepository';
-export { TranscriptEventRepository } from './storage/repositories/TranscriptEventRepository';
 export { TranscriptMigrationRepository } from './storage/repositories/TranscriptMigrationRepository';
 // AI Chat Integration
 export { AIChatIntegrationPlugin } from './ai/plugins/AIChatIntegrationPlugin';
@@ -36,6 +38,20 @@ export type { EditorInstance } from './ai/EditorRegistry';
 // Plugins
 export { DocumentLinkPlugin } from './plugins/DocumentLinkPlugin';
 export { DocumentReferenceNode, DocumentReferenceTransformer, LegacyDocumentReferenceTransformer, $createDocumentReferenceNode, $isDocumentReferenceNode } from './plugins/DocumentLinkPlugin/DocumentLinkNode';
+export {
+  TrackerReferenceNode,
+  TrackerReferenceTransformer,
+  TrackerReferenceChip,
+  $createTrackerReferenceNode,
+  $isTrackerReferenceNode,
+  TRACKER_REFERENCE_URN_SCHEME,
+  useResolvedTrackerReference,
+  navigateToTrackerReference,
+} from './plugins/TrackerLinkPlugin';
+export type {
+  ResolvedTrackerReference,
+  SerializedTrackerReferenceNode,
+} from './plugins/TrackerLinkPlugin';
 // `DiffApprovalBarPlugin` / `DiffApprovalBar` were dropped -- the live diff approval UI is
 // `UnifiedDiffHeader` in the electron renderer, fed by `useLexicalDiffState`.
 export { useLexicalDiffState } from './plugins/DiffApprovalBar/useLexicalDiffState';
@@ -44,7 +60,10 @@ export { SearchReplacePlugin, SearchReplaceBar, SearchReplaceStateManager } from
 export type { SearchReplaceState } from './plugins/SearchReplace';
 // Unified Tracker Plugin
 export {
-  trackerPluginPackage,
+  TrackerPlugin,
+  TrackerLexicalExtension,
+  TRACKER_USER_COMMANDS,
+  TRACKER_ITEM_TRANSFORMERS,
   TrackerItemNode,
   $createTrackerItemNode,
   $getTrackerItemNode,
@@ -63,6 +82,7 @@ export {
   trackerDataLoadedAtom,
   trackerItemsArrayAtom,
   trackerItemsByTypeAtom,
+  trackerItemByReferenceKeyAtom,
   trackerItemCountByTypeAtom,
   upsertTrackerItemAtom,
   removeTrackerItemAtom,
@@ -116,6 +136,7 @@ export * from './utils/clipboard';
 export * from './utils/dateUtils';
 export * from './utils/fuzzyMatch';
 export * from './utils/documentDiff';
+export * from './utils/localAssetUrl';
 // Mockup types - shared across packages
 export type {
   DrawingPath,
@@ -137,6 +158,7 @@ export type {
 export { MOCKUP_TRANSFORMER } from './plugins/MockupPlugin/MockupTransformer';
 export {
   INSERT_MOCKUP_COMMAND,
+  MockupLexicalExtension,
   generateMockupScreenshot,
 } from './plugins/MockupPlugin';
 export type {
@@ -149,7 +171,6 @@ export {
   getMockupPlatformService,
   hasMockupPlatformService,
 } from './plugins/MockupPlugin/MockupPlatformService';
-export { default as MockupPlugin } from './plugins/MockupPlugin';
 // Config
 export { STYTCH_CONFIG, getStytchConfig } from './config/stytch';
 // Extensions
@@ -159,6 +180,12 @@ export { screenshotService } from './services/ScreenshotService';
 export type { ScreenshotCapability } from './services/ScreenshotService';
 // Editor context
 export { DocumentPathProvider, useDocumentPath } from './DocumentPathContext';
+// Workspace file link routing (NIM-1487)
+export {
+  isWorkspaceFileHref,
+  openWorkspaceFileLink,
+  setWorkspaceFileLinkOpener,
+} from './editor/utils/workspaceLinkNavigation';
 // Editor wrappers
 export * from './editors';
 // Sync types (for capacitor)

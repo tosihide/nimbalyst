@@ -12,30 +12,59 @@
  * (ClaudeCodeProvider, CodexProvider, etc.)
  */
 
+import {
+  MCP_CORE,
+  MCP_HOST,
+  MCP_TRACKERS,
+  MCP_SITUATIONAL,
+  extensionServerConfigKey,
+  extensionServerEndpointPath,
+} from './mcpTopology';
+
 export interface McpConfigServiceDeps {
-  /** Port for the main Nimbalyst MCP server (provides capture_editor_screenshot, etc.) */
+  /** Port for the unified internal Nimbalyst MCP HTTP server (all endpoints). */
   mcpServerPort: number | null;
 
-  /** Port for the session naming MCP server */
-  sessionNamingServerPort: number | null;
-
-  /** Port for the extension development MCP server */
+  /** Port for the extension development MCP server (profile-gated, separate server). */
   extensionDevServerPort: number | null;
 
-  /** Port for the Super Loop progress MCP server */
-  superLoopProgressServerPort: number | null;
+  /**
+   * Kill-switch loader for the settings tools. Returns true to omit the settings
+   * tools from `nimbalyst-host`. Read on every config build so flipping the
+   * toggle in Settings takes effect on the next session start without a restart.
+   */
+  settingsAgentToolsDisabledLoader?: (() => boolean) | null;
 
-  /** Port for the session context MCP server (provides session summary, workstream overview, etc.) */
-  sessionContextServerPort: number | null;
+  /**
+   * Per-project opt-out for the tracker feature. Returns true to omit the
+   * entire `nimbalyst-trackers` server (see mcpTopology). Read on every config
+   * build, mirroring `settingsAgentToolsDisabledLoader`.
+   *
+   * Takes the workspace path because `trackers.enabled` is a per-project
+   * workspace setting (unlike the global settings kill-switch). When the loader
+   * is absent the tracker server registers by default (opt-out, default on).
+   */
+  trackersAgentToolsDisabledLoader?: ((workspacePath?: string) => boolean) | null;
 
-  /** Port for the meta-agent MCP server */
-  metaAgentServerPort?: number | null;
+  /**
+   * Returns the short-names of currently-active extensions that contribute MCP
+   * tools for the given workspace (e.g. `['excalidraw', 'slides']`). Each
+   * becomes its own deferred `nimbalyst-<ext>` server (see mcpTopology
+   * `extensionServerConfigKey`). Read on every config build so newly-loaded
+   * extensions get a server on the next session start.
+   */
+  extensionMcpServerNamesLoader?: ((workspacePath?: string) => string[]) | null;
+
+  /**
+   * Per-launch bearer token for the internal Nimbalyst MCP HTTP servers.
+   * When set, the service emits an `Authorization: Bearer <token>` header on
+   * each `nimbalyst-*` server config. When null, no auth header is sent
+   * (test/legacy compatibility).
+   */
+  mcpAuthToken?: string | null;
 
   /** Loader for user and workspace MCP server configs */
   mcpConfigLoader: ((workspacePath?: string) => Promise<Record<string, any>>) | null;
-
-  /** Loader for extension plugins (not used for MCP config, but passed for completeness) */
-  extensionPluginsLoader: ((workspacePath?: string) => Promise<Array<{ type: 'local'; path: string }>>) | null;
 
   /** Loader for Claude settings environment variables */
   claudeSettingsEnvLoader: (() => Promise<Record<string, string>>) | null;
@@ -56,7 +85,7 @@ export class McpConfigService {
 
   /**
    * Get merged MCP server configuration from all sources:
-   * 1. Built-in Nimbalyst MCP servers (nimbalyst-mcp, session-naming, extension-dev)
+   * 1. Built-in Nimbalyst MCP servers (nimbalyst core/host/trackers/situational, per-extension, extension-dev)
    * 2. User-level MCP servers (~/.config/claude/mcp.json)
    * 3. Workspace-level MCP servers (.mcp.json)
    *
@@ -73,33 +102,128 @@ export class McpConfigService {
     const config: any = {};
     const isMetaAgent = profile === 'meta-agent';
 
-    // Include shared MCP server if it's started (provides capture_editor_screenshot, display_to_user, etc.)
-    // applyDiff and streamContent are NOT exposed via MCP - they're only for chat providers via IPC
+    // Authorization header for the internal Nimbalyst MCP HTTP servers.
+    // Issue #146: localhost MCP servers require a per-launch bearer token.
+    // Both the Claude Agent SDK and Codex SDK accept `headers` on remote MCP
+    // server configs and forward them on every request.
+    const authHeaders: Record<string, string> | undefined = this.deps.mcpAuthToken
+      ? { Authorization: `Bearer ${this.deps.mcpAuthToken}` }
+      : undefined;
+
+    // The internal Nimbalyst MCP surface is served by the unified HTTP server on
+    // `this.deps.mcpServerPort`, split across endpoint paths (one `config[name]`
+    // per server below). The legacy monolithic `nimbalyst-mcp` (`/mcp`) is fully
+    // retired — every tool now lives on a split server (core / host / trackers /
+    // situational / per-extension). `applyDiff` and `streamContent` are NOT
+    // exposed via MCP — they're chat-provider IPC only.
     if (this.deps.mcpServerPort !== null && workspacePath) {
-      let mcpUrl = `http://127.0.0.1:${this.deps.mcpServerPort}/mcp?workspacePath=${encodeURIComponent(workspacePath)}`;
-      if (sessionId) {
-        mcpUrl += `&sessionId=${encodeURIComponent(sessionId)}`;
-      }
-      config['nimbalyst-mcp'] = {
+      const port = this.deps.mcpServerPort;
+      const wsParam = `workspacePath=${encodeURIComponent(workspacePath)}`;
+      const sessParam = sessionId ? `&sessionId=${encodeURIComponent(sessionId)}` : '';
+      const query = `?${wsParam}${sessParam}`;
+      const endpointUrl = (endpointPath: string) =>
+        `http://127.0.0.1:${port}${endpointPath}${query}`;
+
+      // nimbalyst (eager core) — alwaysLoad. Universal agent↔host glue and the
+      // ONLY Nimbalyst surface that stays eager. Carries the long tool timeout
+      // because developer_git_commit_proposal / AskUserQuestion / PromptForUserInput
+      // block indefinitely on user input.
+      config[MCP_CORE] = {
         type: 'sse',
         transport: 'sse',
-        url: mcpUrl,
-        // Override default 60s tool timeout for Codex CLI.
-        // Some tools (e.g. developer_git_commit_proposal) block indefinitely
-        // waiting for user input — the user may leave and return hours or
-        // days later. Use a very large value (~7 days) to effectively disable.
+        url: endpointUrl('/mcp/core'),
+        alwaysLoad: true,
         tool_timeout_sec: 604800,
+        ...(authHeaders ? { headers: { ...authHeaders } } : {}),
       };
+
+      // nimbalyst-trackers (deferred) — tracker CRUD on `/mcp/trackers`. Per-
+      // project opt-out: when the workspace's `trackers.enabled` is off the
+      // loader returns true and the whole server (all tracker_* tools) is
+      // omitted from ToolSearch. Deferred, so it never touches the eager budget;
+      // legacy `/mcp` stops listing tracker tools automatically via the
+      // migration-state check in mcpTopology. No long tool_timeout_sec — tracker
+      // operations don't block on user input.
+      const trackersKilled = (() => {
+        try {
+          return !!this.deps.trackersAgentToolsDisabledLoader?.(workspacePath);
+        } catch {
+          return false;
+        }
+      })();
+      if (!trackersKilled) {
+        config[MCP_TRACKERS] = {
+          type: 'sse',
+          transport: 'sse',
+          url: endpointUrl('/mcp/trackers'),
+          ...(authHeaders ? { headers: { ...authHeaders } } : {}),
+        };
+      }
+
+      // nimbalyst-host (deferred) — app-config (settings) + session-context +
+      // child-session orchestration (meta-agent) on `/mcp/host` (MCP
+      // consolidation Phase 5). Never eager. The settings tools within host are
+      // excluded for the meta-agent profile (so it can't twiddle user prefs
+      // while orchestrating) and when the settings kill-switch is on; the
+      // unified server reads `hostExcludeSettings` to drop just those tools
+      // while keeping session-context + meta-agent. (`update_session_meta` folds
+      // into the eager core above, not host.)
+      const settingsKilled = (() => {
+        try {
+          return !!this.deps.settingsAgentToolsDisabledLoader?.();
+        } catch {
+          return false;
+        }
+      })();
+      const excludeSettings = isMetaAgent || settingsKilled;
+      config[MCP_HOST] = {
+        type: 'sse',
+        transport: 'sse',
+        url:
+          endpointUrl('/mcp/host') +
+          (excludeSettings ? '&hostExcludeSettings=1' : ''),
+        ...(authHeaders ? { headers: { ...authHeaders } } : {}),
+      };
+
+      // nimbalyst-situational (deferred) — voice + collab-doc + feedback tools on
+      // `/mcp/situational` (MCP consolidation Phase 6). Deferred, so it never
+      // touches the eager budget; the agent only reaches for these when its mode
+      // calls for them (voice mode, an open collab doc, filing feedback) and
+      // ToolSearch surfaces them on intent. Replaces the situational slice of the
+      // retired legacy monolith.
+      config[MCP_SITUATIONAL] = {
+        type: 'sse',
+        transport: 'sse',
+        url: endpointUrl('/mcp/situational'),
+        ...(authHeaders ? { headers: { ...authHeaders } } : {}),
+      };
+
+      if (this.deps.extensionMcpServerNamesLoader) {
+        let extensionShortNames: string[] = [];
+        try {
+          extensionShortNames =
+            this.deps.extensionMcpServerNamesLoader(workspacePath) ?? [];
+        } catch {
+          extensionShortNames = [];
+        }
+        for (const shortName of extensionShortNames) {
+          if (!shortName) continue;
+          config[extensionServerConfigKey(shortName)] = {
+            type: 'sse',
+            transport: 'sse',
+            url: endpointUrl(extensionServerEndpointPath(shortName)),
+            ...(authHeaders ? { headers: { ...authHeaders } } : {}),
+          };
+        }
+      }
     }
 
-    // Include session naming MCP server if it's started
-    if (this.deps.sessionNamingServerPort !== null && sessionId) {
-      config['nimbalyst-session-naming'] = {
-        type: 'sse',
-        transport: 'sse',
-        url: `http://127.0.0.1:${this.deps.sessionNamingServerPort}/mcp?sessionId=${encodeURIComponent(sessionId)}`
-      };
-    }
+    // MCP consolidation Phase 5: the standalone session-naming, session-context,
+    // meta-agent, and settings HTTP servers are no longer registered as separate
+    // SDK config entries — their tools fold onto the unified server's `/mcp/core`
+    // (update_session_meta) and `/mcp/host` endpoints above. The standalone HTTP
+    // servers keep running until Phase 7 retires their ports, but the agent only
+    // connects to the unified endpoints now.
 
     // Include extension dev MCP server if it's started (provides build, install, reload tools)
     if (!isMetaAgent && this.deps.extensionDevServerPort !== null) {
@@ -107,32 +231,13 @@ export class McpConfigService {
       config['nimbalyst-extension-dev'] = {
         type: 'sse',
         transport: 'sse',
-        url: `http://127.0.0.1:${this.deps.extensionDevServerPort}/mcp${params}`
+        url: `http://127.0.0.1:${this.deps.extensionDevServerPort}/mcp${params}`,
+        ...(authHeaders ? { headers: { ...authHeaders } } : {}),
       };
     }
 
     // Super Loop progress MCP server disabled - was leaking into non-super-loop sessions
     // TODO: Re-enable with proper gating so it only appears in super loop sessions
-
-    // Include session context MCP server if it's started (provides session summary, workstream overview, etc.)
-    if (this.deps.sessionContextServerPort !== null && sessionId && workspacePath) {
-      config['nimbalyst-session-context'] = {
-        type: 'sse',
-        transport: 'sse',
-        url: `http://127.0.0.1:${this.deps.sessionContextServerPort}/mcp?sessionId=${encodeURIComponent(sessionId)}&workspaceId=${encodeURIComponent(workspacePath)}`
-      };
-    }
-
-    if ((this.deps.metaAgentServerPort ?? null) !== null && sessionId && workspacePath) {
-      config['nimbalyst-meta-agent'] = {
-        type: 'sse',
-        transport: 'sse',
-        url: `http://127.0.0.1:${this.deps.metaAgentServerPort}/mcp?sessionId=${encodeURIComponent(sessionId)}&workspaceId=${encodeURIComponent(workspacePath)}`
-      };
-    }
-
-    // Meta-agent gets nimbalyst-mcp (for display_to_user, capture_editor_screenshot),
-    // user/workspace custom MCPs, but skips extension-dev server (guarded above).
 
     // Load user and workspace MCP servers using the injected loader (if available)
     // This merges user-level (global) servers with workspace-level servers

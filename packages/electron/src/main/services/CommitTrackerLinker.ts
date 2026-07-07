@@ -11,6 +11,7 @@
 
 import Store from 'electron-store';
 import { logger } from '../utils/logger';
+import { parseJsonObjectColumn } from '../utils/jsonColumn';
 import type { CommitDetectedEvent } from '../file/GitRefWatcher';
 import type { TrackerAutomationSettings } from '../utils/store';
 import { getEffectiveTrackerAutomation } from '../utils/store';
@@ -62,6 +63,18 @@ export function parseIssueKeys(commitMessage: string, prefix?: string): IssueKey
   return matches;
 }
 
+export function getIssueKeyPrefix(issueKey: string | null | undefined): string | undefined {
+  if (typeof issueKey !== 'string') return undefined;
+
+  const trimmed = issueKey.trim();
+  if (trimmed.length === 0) return undefined;
+
+  const separatorIndex = trimmed.indexOf('-');
+  if (separatorIndex <= 0) return undefined;
+
+  return trimmed.slice(0, separatorIndex).toUpperCase();
+}
+
 // ---------------------------------------------------------------------------
 // Service
 // ---------------------------------------------------------------------------
@@ -95,7 +108,7 @@ export class CommitTrackerLinker {
     const settings = this.getSettings(event.workspacePath);
     if (!settings.enabled) return;
 
-    logger.main.info(`[CommitTrackerLinker] Commit detected: ${event.commitHash.slice(0, 7)} in ${event.workspacePath}`);
+    // logger.main.info(`[CommitTrackerLinker] Commit detected: ${event.commitHash.slice(0, 7)} in ${event.workspacePath}`);
 
     // When enabled, always parse issue keys. Auto-close is gated separately.
     await this.linkByIssueKeys(event, settings);
@@ -128,8 +141,12 @@ export class CommitTrackerLinker {
 
       if (sessionResult.rows.length === 0) return;
 
-      const metadata = sessionResult.rows[0].metadata;
-      const linkedTrackerItemIds: string[] = metadata?.linkedTrackerItemIds ?? [];
+      // SQLite returns metadata as a raw JSON string (NIM-829); an unparsed
+      // read sees no linked items and session-based commit linking no-ops.
+      const metadata = parseJsonObjectColumn(sessionResult.rows[0].metadata);
+      const linkedTrackerItemIds: string[] = Array.isArray(metadata.linkedTrackerItemIds)
+        ? metadata.linkedTrackerItemIds
+        : [];
       if (linkedTrackerItemIds.length === 0) return;
 
       const commit: LinkedCommit = {
@@ -180,13 +197,16 @@ export class CommitTrackerLinker {
 
     // Get the workspace issue key prefix
     const prefixResult = await db.query(
-      `SELECT DISTINCT SPLIT_PART(issue_key, '-', 1) as prefix
+      `SELECT DISTINCT issue_key
        FROM tracker_items
        WHERE workspace = $1 AND issue_key IS NOT NULL
-       LIMIT 1`,
+       ORDER BY issue_key ASC
+       LIMIT 25`,
       [event.workspacePath]
     );
-    const prefix = prefixResult.rows[0]?.prefix;
+    const prefix = prefixResult.rows
+      .map((row: { issue_key?: string | null }) => getIssueKeyPrefix(row.issue_key))
+      .find((value: string | undefined): value is string => Boolean(value));
 
     const matches = parseIssueKeys(event.commitMessage, prefix);
     if (matches.length === 0) return;

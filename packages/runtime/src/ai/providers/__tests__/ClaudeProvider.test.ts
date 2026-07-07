@@ -9,13 +9,14 @@ import type { DocumentContext } from '../../server/types';
 
 describe('Claude SDK Provider - Tool Usage', () => {
   const apiKey = process.env.ANTHROPIC_API_KEY;
+  const runProviderTests = process.env.RUN_AI_PROVIDER_TESTS === 'true';
   const model = process.env.ANTHROPIC_TEST_MODEL || 'claude-sonnet-4-6';
 
   afterEach(() => {
     ProviderFactory.destroyAll();
   });
 
-  it.skipIf(!apiKey)('should use applyDiff tool to edit document', async () => {
+  it.skipIf(!apiKey || !runProviderTests)('should use applyDiff tool to edit document', async () => {
     // The document we're going to edit
     const testDocument: DocumentContext = {
       filePath: '/test/document.md',
@@ -81,7 +82,7 @@ describe('Claude SDK Provider - Tool Usage', () => {
     console.log('✅ Edit verification passed!');
   }, 10000); // 10 second timeout for API call
 
-  it.skipIf(!apiKey)('should use streamContent tool to insert content', async () => {
+  it.skipIf(!apiKey || !runProviderTests)('should use streamContent tool to insert content', async () => {
     // Document where we'll insert content
     const testDocument: DocumentContext = {
       filePath: '/test/document.md',

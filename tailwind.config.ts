@@ -13,6 +13,8 @@ import type { Config } from 'tailwindcss';
 const config: Config = {
   content: [
     './packages/*/src/**/*.{ts,tsx,js,jsx}',
+    './packages/extensions/*/src/**/*.{ts,tsx,js,jsx,html}',
+    './packages/extensions/*/samples/**/*.html',
     './packages/extension-sdk-docs/examples/*/src/**/*.{ts,tsx,js,jsx}',
   ],
   darkMode: ['variant', '&:is([data-theme="dark"] *, [data-theme="crystal-dark"] *)'],
@@ -46,6 +48,7 @@ const config: Config = {
           DEFAULT: 'var(--nim-primary)',
           hover: 'var(--nim-primary-hover)',
         },
+        'nim-on-primary': 'var(--nim-on-primary)',
         'nim-link': {
           // Links (use: text-nim-link)
           DEFAULT: 'var(--nim-link)',
@@ -77,6 +80,7 @@ const config: Config = {
         'nim-link': 'var(--nim-link)',
         'nim-link-hover': 'var(--nim-link-hover)',
         'nim-primary': 'var(--nim-primary)',
+        'nim-on-primary': 'var(--nim-on-primary)',
         'nim-success': 'var(--nim-success)',
         'nim-warning': 'var(--nim-warning)',
         'nim-error': 'var(--nim-error)',

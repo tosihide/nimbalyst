@@ -3,6 +3,7 @@ import { useLexicalComposerContext } from '@lexical/react/LexicalComposerContext
 import {
   $getSelection,
   $isRangeSelection,
+  $createParagraphNode,
   TextNode,
   $createTextNode,
   isDOMNode
@@ -13,6 +14,11 @@ import documentLinkStyles from './DocumentLinkPlugin.css?inline';
 import { TypeaheadMenuOption } from "../../editor";
 import { fuzzyFilterDocuments } from '../../utils/fuzzyMatch';
 import { MaterialSymbol } from "../../ui";
+import { $createEmbeddedFileNode } from '../../editor/plugins/EmbedPlugin/EmbeddedFileNode';
+import { isEmbeddableUrl } from '../../editor/plugins/EmbedPlugin/embeddableExtensions';
+import { useDocumentPath } from '../../DocumentPathContext';
+import { resolveDocumentLinkLookupPath } from './documentLinkPaths';
+import { isWorkspaceFileHref } from '../../editor/utils/workspaceLinkNavigation';
 
 const DOCUMENT_REFERENCE_STYLE_ID = 'document-reference-styles';
 
@@ -68,6 +74,29 @@ function getDocumentReferenceElement(target: Node): Element | null {
   return targetElement?.closest('.document-reference') ?? null;
 }
 
+/**
+ * Plain `<a>` links whose raw href is a file path (relative markdown links
+ * that were imported as LinkNodes rather than DocumentReferenceNodes, e.g.
+ * when the link text carries inline-code formatting). These must be opened
+ * through the document service like reference chips; letting them reach
+ * Lexical's ClickableLink handling ends in `window.open('./x')` and a blank
+ * Electron child window (NIM-1487).
+ */
+function getWorkspaceFileAnchor(target: Node): HTMLAnchorElement | null {
+  const targetElement =
+    typeof Element !== 'undefined' && target instanceof Element
+      ? target
+      : target.parentElement;
+
+  const anchor = targetElement?.closest('a[href]');
+  if (!(anchor instanceof HTMLAnchorElement)) {
+    return null;
+  }
+  // getAttribute keeps the authored href; anchor.href would be resolved
+  // against the renderer origin and always look external.
+  return isWorkspaceFileHref(anchor.getAttribute('href')) ? anchor : null;
+}
+
 interface DocumentLinkPluginProps {
   documentService: DocumentService;
   TypeaheadMenuPlugin: React.ComponentType<any>;
@@ -84,6 +113,7 @@ export function DocumentLinkPlugin({
   anchorElem,
 }: DocumentLinkPluginProps): JSX.Element {
   const [editor] = useLexicalComposerContext();
+  const { documentPath: currentDocumentPath } = useDocumentPath();
   const [queryString, setQueryString] = useState<string>('');
   const [documents, setDocuments] = useState<any[]>([]);
   const menuOpenRef = useRef(false);
@@ -101,14 +131,27 @@ export function DocumentLinkPlugin({
         return;
       }
 
+      let documentId: string | null = null;
+      let documentPath: string | undefined;
+      let documentName: string | undefined;
+
       const referenceElement = getDocumentReferenceElement(target);
-      if (!referenceElement) {
-        return;
+      if (referenceElement) {
+        documentId = referenceElement.getAttribute('data-document-id');
+        documentPath = referenceElement.getAttribute('data-path') || undefined;
+        documentName = referenceElement.getAttribute('data-name') || referenceElement.textContent || undefined;
+      } else {
+        const anchor = getWorkspaceFileAnchor(target);
+        if (!anchor) {
+          return;
+        }
+        documentPath = anchor.getAttribute('href') || undefined;
+        documentName = anchor.textContent || undefined;
+        // Keep the event away from ClickableLink / Lexical's CLICK_COMMAND —
+        // both end in window.open for LinkNodes.
+        event.stopPropagation();
       }
 
-      const documentId = referenceElement.getAttribute('data-document-id');
-      const documentPath = referenceElement.getAttribute('data-path') || undefined;
-      const documentName = referenceElement.getAttribute('data-name') || referenceElement.textContent || undefined;
       if (!documentId && !documentPath) {
         return;
       }
@@ -134,9 +177,28 @@ export function DocumentLinkPlugin({
         }
       } catch {}
 
-      void documentService
-        .openDocument(documentId ?? '', { path: documentPath, name: documentName })
-        .catch(error => {
+      const workspacePath = (window as unknown as { __workspacePath?: string }).__workspacePath ?? null;
+      const resolvedPath = documentPath
+        ? resolveDocumentLinkLookupPath(documentPath, currentDocumentPath, workspacePath)
+        : undefined;
+
+      void (async () => {
+        const resolvedDoc = resolvedPath
+          ? await documentService.getDocumentByPath(resolvedPath)
+          : null;
+
+        if (resolvedDoc) {
+          await documentService.openDocument(resolvedDoc.id, {
+            path: resolvedDoc.path,
+          });
+          return;
+        }
+
+        await documentService.openDocument(resolvedPath ? '' : (documentId ?? ''), {
+          path: resolvedPath ?? documentPath,
+          name: resolvedPath ? undefined : documentName,
+        });
+      })().catch(error => {
           console.error('Failed to open document reference', error);
         });
     };
@@ -159,7 +221,7 @@ export function DocumentLinkPlugin({
       }
       return undefined;
     });
-  }, [editor, documentService]);
+  }, [currentDocumentPath, editor, documentService]);
 
   // Load documents only when menu opens, with cache
   const loadDocuments = useCallback(async () => {
@@ -224,10 +286,38 @@ export function DocumentLinkPlugin({
       const doc = documents.find(d => d.id === docId);
       if (!doc) return;
 
+      // Markdown link paths always use forward slashes regardless of OS.
+      const linkPath = doc.path.replace(/\\/g, '/');
+
+      // Embeddable files (e.g. `.excalidraw`) get inserted as block-level
+      // EmbeddedFileNodes so they render inline immediately. Other files
+      // use the existing inline DocumentReferenceNode.
+      if (isEmbeddableUrl(linkPath)) {
+        const embedNode = $createEmbeddedFileNode({
+          src: linkPath,
+          label: doc.name,
+          attrs: {},
+        });
+        // EmbeddedFileNode is block-level. Insert as a sibling of the
+        // current top-level block, then add a trailing paragraph so the
+        // caret has somewhere to land. If the original block is now empty
+        // (typeahead stripped the trigger and the line had nothing else),
+        // drop it so we don't leave a blank line above the embed.
+        const block = selection.anchor.getNode().getTopLevelElementOrThrow();
+        block.insertAfter(embedNode);
+        const trailing = $createParagraphNode();
+        embedNode.insertAfter(trailing);
+        trailing.select();
+        if (block.getChildrenSize() === 0) {
+          block.remove();
+        }
+        return;
+      }
+
       const replacementNode = $createDocumentReferenceNode(
         doc.id,
         doc.name,
-        doc.path,
+        linkPath,
         doc.workspace
       );
 

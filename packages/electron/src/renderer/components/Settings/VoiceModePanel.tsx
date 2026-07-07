@@ -6,19 +6,28 @@
  */
 
 import React from 'react';
-import { useAtom, useAtomValue } from 'jotai';
+import { useAtom, useAtomValue, useSetAtom } from 'jotai';
 import { MaterialSymbol } from '@nimbalyst/runtime';
+import { ModelIdentifier } from '@nimbalyst/runtime/ai/server/types';
 import {
   voiceModeSettingsAtom,
   setVoiceModeSettingsAtom,
   apiKeysAtom,
   setApiKeyAtom,
+  defaultAgentModelAtom,
   type VoiceModeSettings,
   type VoiceId,
+  type RealtimeModel,
+  type RealtimeReasoningEffort,
   type TurnDetectionConfig,
   type SystemPromptConfig,
 } from '../../store/atoms/appSettings';
-import { AlphaBadge } from '../common/AlphaBadge';
+import { voiceModePreviewAudioAtom } from '../../store/atoms/voiceModeState';
+import { addSessionFullAtom, setSelectedWorkstreamAtom, setWindowModeAtom, navigateToSettingsAtom } from '../../store';
+import { useDialog } from '../../contexts/DialogContext';
+import { AlphaBadge, SETTINGS_ALPHA_TOOLTIP } from '../common/AlphaBadge';
+import { buildVoiceProjectSummaryPrompt, VOICE_PROJECT_SUMMARY_PATH } from './voiceModeSummaryPrompt';
+import type { SessionCreateResult } from '../../../shared/ipc/types';
 
 interface VoiceModePanelProps {
   /** Optional workspace path for project-specific features like summary generation */
@@ -65,6 +74,8 @@ const VOICE_GROUPS = [
   { label: 'Neutral', voices: VOICE_OPTIONS.filter(v => v.gender === 'neutral') },
 ];
 
+type MicAccessStatus = 'not-determined' | 'granted' | 'denied' | 'restricted' | 'unknown';
+
 export const VoiceModePanel: React.FC<VoiceModePanelProps> = ({
   workspacePath,
 }) => {
@@ -73,11 +84,20 @@ export const VoiceModePanel: React.FC<VoiceModePanelProps> = ({
   const [, updateVoiceModeSettings] = useAtom(setVoiceModeSettingsAtom);
   const apiKeys = useAtomValue(apiKeysAtom);
   const [, setApiKey] = useAtom(setApiKeyAtom);
+  const defaultAgentModel = useAtomValue(defaultAgentModelAtom);
+  const addSession = useSetAtom(addSessionFullAtom);
+  const setSelectedWorkstream = useSetAtom(setSelectedWorkstreamAtom);
+  const setWindowMode = useSetAtom(setWindowModeAtom);
+  const navigateToSettings = useSetAtom(navigateToSettingsAtom);
+  const dialog = useDialog();
+  const hasAgentConfigured = !!defaultAgentModel?.trim();
 
   // Extract values from atom
   const {
     enabled,
     voice,
+    model,
+    reasoningEffort,
     turnDetection,
     voiceAgentPrompt,
     codingAgentPrompt,
@@ -98,11 +118,44 @@ export const VoiceModePanel: React.FC<VoiceModePanelProps> = ({
   const [isPreviewPlaying, setIsPreviewPlaying] = React.useState(false);
   const audioRef = React.useRef<HTMLAudioElement | null>(null);
 
-  // Project summary state
+  // Project summary state. Generation now happens inside an agent session, so
+  // there's no in-panel spinner -- we only track whether the file exists on
+  // disk and surface failure messages from the launch path.
   const [projectSummaryExists, setProjectSummaryExists] = React.useState<boolean | null>(null);
-  const [isGeneratingSummary, setIsGeneratingSummary] = React.useState(false);
   const [summaryError, setSummaryError] = React.useState<string | null>(null);
   const [summaryPath, setSummaryPath] = React.useState<string | null>(null);
+
+  // Microphone access state. Only populated while voice mode is enabled --
+  // we don't probe the OS at all when voice is off, so a user who never opts
+  // in never has the mic permission concept surfaced.
+  const [micStatus, setMicStatus] = React.useState<MicAccessStatus | null>(null);
+  const [micPlatform, setMicPlatform] = React.useState<NodeJS.Platform | null>(null);
+
+  const checkMicStatus = React.useCallback(async () => {
+    try {
+      const result = await window.electronAPI?.invoke('voice-mode:get-mic-status') as
+        | { status: MicAccessStatus; platform: NodeJS.Platform }
+        | undefined;
+      if (result) {
+        setMicStatus(result.status);
+        setMicPlatform(result.platform);
+      }
+    } catch {
+      setMicStatus(null);
+    }
+  }, []);
+
+  React.useEffect(() => {
+    if (!enabled) {
+      setMicStatus(null);
+      return;
+    }
+    checkMicStatus();
+  }, [enabled, checkMicStatus]);
+
+  const handleOpenMicSettings = async () => {
+    await window.electronAPI?.invoke('voice-mode:open-mic-settings');
+  };
 
   // Check if project summary exists
   React.useEffect(() => {
@@ -113,7 +166,7 @@ export const VoiceModePanel: React.FC<VoiceModePanelProps> = ({
 
     const checkSummary = async () => {
       try {
-        const path = `${workspacePath}/nimbalyst-local/voice-project-summary.md`;
+        const path = `${workspacePath}/${VOICE_PROJECT_SUMMARY_PATH}`;
         const exists = await window.electronAPI?.invoke('file:exists', path);
         setProjectSummaryExists(exists);
         if (exists) {
@@ -127,25 +180,86 @@ export const VoiceModePanel: React.FC<VoiceModePanelProps> = ({
     checkSummary();
   }, [workspacePath]);
 
-  // Generate project summary
+  // Launch an agent session that generates the voice-mode project summary.
+  // The agent reads project files itself and writes the summary to
+  // nimbalyst-local/voice-project-summary.md via its Write tool. Voice mode
+  // picks up the file on next session start (see VoiceModeService.ts loadSessionContext).
   const handleGenerateSummary = async () => {
-    if (!workspacePath) return;
+    if (!workspacePath || !window.electronAPI) return;
+    if (!hasAgentConfigured) return;
 
-    setIsGeneratingSummary(true);
     setSummaryError(null);
 
+    const parsed = ModelIdentifier.tryParse(defaultAgentModel);
+    const provider = parsed?.provider || 'claude-code';
+
+    const confirmed = await dialog.confirm({
+      title: 'Generate project summary?',
+      message:
+        `This will launch a new AI session using ${defaultAgentModel}. ` +
+        `The session will read your project files and write a voice-friendly ` +
+        `summary to ${VOICE_PROJECT_SUMMARY_PATH}, which voice mode uses for ` +
+        `context. You'll be taken to the session so you can watch it run.`,
+      confirmLabel: 'Launch session',
+      cancelLabel: 'Cancel',
+    });
+    if (!confirmed) return;
+
     try {
-      const result = await window.electronAPI?.invoke('voice-mode:generate-project-summary', workspacePath);
-      if (result?.success) {
-        setProjectSummaryExists(true);
-        setSummaryPath(result.path);
-      } else {
-        setSummaryError(result?.message || 'Failed to generate summary');
+      const sessionId = crypto.randomUUID();
+      const title = 'Voice mode: project summary';
+      const result: SessionCreateResult = await window.electronAPI.invoke('sessions:create', {
+        session: {
+          id: sessionId,
+          provider,
+          model: defaultAgentModel,
+          title,
+        },
+        workspaceId: workspacePath,
+      });
+
+      if (!result?.success || !result.id) {
+        setSummaryError(result?.error || 'Failed to create agent session');
+        return;
       }
+
+      addSession({
+        id: result.id,
+        title,
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+        provider,
+        model: defaultAgentModel,
+        sessionType: 'session',
+        messageCount: 0,
+        workspaceId: workspacePath,
+        isArchived: false,
+        isPinned: false,
+        parentSessionId: null,
+        worktreeId: null,
+        childCount: 0,
+        uncommittedCount: 0,
+      });
+
+      // Send the first message -- this kicks off agent execution.
+      await window.electronAPI.invoke(
+        'ai:sendMessage',
+        buildVoiceProjectSummaryPrompt(),
+        undefined,
+        result.id,
+        workspacePath,
+      );
+
+      // Switch to Agent mode and select the new session so the user can watch it run.
+      // Switching modes implicitly unmounts the Settings view -- no explicit close needed.
+      setWindowMode('agent');
+      setSelectedWorkstream({
+        workspacePath,
+        selection: { type: 'session', id: result.id },
+      });
     } catch (error) {
-      setSummaryError(error instanceof Error ? error.message : 'Unknown error');
-    } finally {
-      setIsGeneratingSummary(false);
+      console.error('[VoiceModePanel] Failed to launch summary session:', error);
+      setSummaryError(error instanceof Error ? error.message : 'Failed to launch summary session');
     }
   };
 
@@ -156,50 +270,54 @@ export const VoiceModePanel: React.FC<VoiceModePanelProps> = ({
     }
   };
 
-  // Auto-generate summary when voice mode is first enabled
-  const handleEnabledChange = async (newEnabled: boolean) => {
+  // Toggle voice mode. We no longer auto-launch a summary session here --
+  // generating the summary spawns a visible agent session that costs tokens,
+  // so it must be an explicit user action.
+  const handleEnabledChange = (newEnabled: boolean) => {
     handleSettingChange({ enabled: newEnabled });
-
-    // If enabling voice mode and no summary exists, generate one
-    if (newEnabled && workspacePath && projectSummaryExists === false) {
-      handleGenerateSummary();
-    }
   };
 
   // Listen for preview audio from main process
+  // Stop any playing audio on unmount.
   React.useEffect(() => {
-    const handlePreviewAudio = (payload: { voiceId: string; audioBase64: string; format: string }) => {
-      // Create audio element and play
-      const audio = new Audio(`data:audio/${payload.format};base64,${payload.audioBase64}`);
-      audioRef.current = audio;
-      setIsPreviewPlaying(true);
-
-      audio.onended = () => {
-        setIsPreviewPlaying(false);
-        audioRef.current = null;
-      };
-
-      audio.onerror = () => {
-        setIsPreviewPlaying(false);
-        audioRef.current = null;
-      };
-
-      audio.play().catch(() => {
-        setIsPreviewPlaying(false);
-        audioRef.current = null;
-      });
-    };
-
-    window.electronAPI?.on('voice-mode:preview-audio', handlePreviewAudio);
-
     return () => {
-      // Stop any playing audio on unmount
       if (audioRef.current) {
         audioRef.current.pause();
         audioRef.current = null;
       }
     };
   }, []);
+
+  // Play preview audio when main process broadcasts a `voice-mode:preview-audio`
+  // event. The IPC event is handled centrally in
+  // store/listeners/voiceModeListeners.ts which writes voiceModePreviewAudioAtom;
+  // we play only on *new* bumps so any audio that was queued up before this
+  // panel mounted doesn't replay on open.
+  const previewAudio = useAtomValue(voiceModePreviewAudioAtom);
+  const initialPreviewAudioRef = React.useRef(previewAudio);
+  React.useEffect(() => {
+    if (previewAudio === initialPreviewAudioRef.current) return;
+    if (!previewAudio) return;
+    const { audioBase64, format } = previewAudio.payload;
+    const audio = new Audio(`data:audio/${format};base64,${audioBase64}`);
+    audioRef.current = audio;
+    setIsPreviewPlaying(true);
+
+    audio.onended = () => {
+      setIsPreviewPlaying(false);
+      audioRef.current = null;
+    };
+
+    audio.onerror = () => {
+      setIsPreviewPlaying(false);
+      audioRef.current = null;
+    };
+
+    audio.play().catch(() => {
+      setIsPreviewPlaying(false);
+      audioRef.current = null;
+    });
+  }, [previewAudio]);
 
   // Use defaults for turn detection
   const currentTurnDetection = { ...DEFAULT_TURN_DETECTION, ...turnDetection };
@@ -237,7 +355,7 @@ export const VoiceModePanel: React.FC<VoiceModePanelProps> = ({
       <div className="provider-panel-header mb-6 pb-4 border-b border-[var(--nim-border)]">
         <h3 className="provider-panel-title text-xl font-semibold leading-tight mb-2 text-[var(--nim-text)] flex items-center gap-2">
           Voice Mode
-          <AlphaBadge size="sm" />
+          <AlphaBadge size="sm" tooltip={SETTINGS_ALPHA_TOOLTIP} />
         </h3>
         <p className="provider-panel-description text-sm leading-relaxed text-[var(--nim-text-muted)]">
           Use OpenAI's Advanced Voice Mode to control Claude Code with your voice.
@@ -284,8 +402,92 @@ export const VoiceModePanel: React.FC<VoiceModePanelProps> = ({
         </div>
       </div>
 
+      {enabled && hasOpenAIKey && micStatus && micStatus !== 'granted' && (
+        <div
+          className="voice-mode-mic-permission-warning provider-panel-section mb-6 p-4 rounded border border-[var(--nim-warning)] bg-[var(--nim-bg-secondary)]"
+          data-testid="voice-mode-mic-permission-warning"
+        >
+          <div className="flex items-start gap-3">
+            <MaterialSymbol icon="mic_off" size={20} className="mt-0.5 text-[var(--nim-warning)]" />
+            <div className="flex-1">
+              <h4 className="text-sm font-medium text-[var(--nim-text)] mb-1">Microphone access not granted</h4>
+              <p className="text-xs text-[var(--nim-text-muted)] mb-3">
+                {micStatus === 'denied'
+                  ? 'Voice Mode needs microphone access. Enable it for Nimbalyst in System Settings, then re-check below.'
+                  : micStatus === 'restricted'
+                  ? 'Microphone access is restricted on this device (e.g. by parental controls or MDM). Voice Mode cannot capture audio.'
+                  : 'Voice Mode needs microphone access. Open System Settings to grant it for Nimbalyst.'}
+              </p>
+              <div className="flex items-center gap-2">
+                {micPlatform === 'darwin' && (
+                  <button
+                    onClick={handleOpenMicSettings}
+                    className="px-3 py-1.5 rounded border border-[var(--nim-border)] bg-[var(--nim-primary)] text-white cursor-pointer text-sm flex items-center gap-1.5"
+                    data-testid="voice-mode-open-mic-settings"
+                  >
+                    <MaterialSymbol icon="open_in_new" size={14} />
+                    Open System Settings
+                  </button>
+                )}
+                <button
+                  onClick={checkMicStatus}
+                  className="px-3 py-1.5 rounded border border-[var(--nim-border)] bg-[var(--nim-bg-secondary)] text-[var(--nim-text)] cursor-pointer text-sm flex items-center gap-1.5"
+                  data-testid="voice-mode-recheck-mic"
+                >
+                  <MaterialSymbol icon="refresh" size={14} />
+                  Re-check
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
       {enabled && hasOpenAIKey && (
         <>
+          <div className="provider-panel-section mb-6">
+            <h4 className="provider-panel-section-title text-base font-medium mb-4 text-[var(--nim-text)]">Model</h4>
+
+            <div className="setting-item py-3">
+              <div className="setting-text flex flex-col gap-0.5">
+                <span className="setting-name text-sm font-medium text-[var(--nim-text)]">Realtime Model</span>
+                <span className="setting-description text-xs text-[var(--nim-text-muted)]">
+                  gpt-realtime-2 is newer, with stronger reasoning, a larger context window, and more consistent voice rendering. gpt-realtime is the fallback for accounts without access (selected automatically if needed).
+                </span>
+              </div>
+              <select
+                value={model ?? 'gpt-realtime-2'}
+                onChange={(e) => handleSettingChange({ model: e.target.value as RealtimeModel })}
+                className="mt-2 px-3 py-1.5 rounded border border-[var(--nim-border)] bg-[var(--nim-bg-secondary)] text-[var(--nim-text)]"
+                data-testid="voice-mode-model-select"
+              >
+                <option value="gpt-realtime-2">gpt-realtime-2 (recommended)</option>
+                <option value="gpt-realtime">gpt-realtime</option>
+              </select>
+            </div>
+
+            <div className="setting-item py-3">
+              <div className="setting-text flex flex-col gap-0.5">
+                <span className="setting-name text-sm font-medium text-[var(--nim-text)]">Reasoning Effort</span>
+                <span className="setting-description text-xs text-[var(--nim-text-muted)]">
+                  Higher = smarter but slower and more expensive. Low is recommended for a responsive voice relay. Applies to gpt-realtime-2.
+                </span>
+              </div>
+              <select
+                value={reasoningEffort ?? 'low'}
+                onChange={(e) => handleSettingChange({ reasoningEffort: e.target.value as RealtimeReasoningEffort })}
+                className="mt-2 px-3 py-1.5 rounded border border-[var(--nim-border)] bg-[var(--nim-bg-secondary)] text-[var(--nim-text)]"
+                data-testid="voice-mode-reasoning-effort-select"
+              >
+                <option value="minimal">Minimal (fastest)</option>
+                <option value="low">Low (recommended)</option>
+                <option value="medium">Medium</option>
+                <option value="high">High</option>
+                <option value="xhigh">Extra high (slowest, smartest)</option>
+              </select>
+            </div>
+          </div>
+
           <div className="provider-panel-section mb-6">
             <h4 className="provider-panel-section-title text-base font-medium mb-4 text-[var(--nim-text)]">Voice Settings</h4>
 
@@ -450,13 +652,13 @@ export const VoiceModePanel: React.FC<VoiceModePanelProps> = ({
                   min="5000"
                   max="30000"
                   step="1000"
-                  value={listenWindowMs ?? 10000}
+                  value={listenWindowMs ?? 15000}
                   onChange={(e) => handleSettingChange({ listenWindowMs: parseInt(e.target.value) })}
                   className="flex-1"
                 />
                 <span className="text-xs text-[var(--nim-text-muted)]">30s</span>
                 <span className="text-xs text-[var(--nim-text)] min-w-[36px]">
-                  {Math.round((listenWindowMs ?? 10000) / 1000)}s
+                  {Math.round((listenWindowMs ?? 15000) / 1000)}s
                 </span>
               </div>
             </div>
@@ -494,19 +696,14 @@ export const VoiceModePanel: React.FC<VoiceModePanelProps> = ({
 
           {/* Project Summary Section */}
           {workspacePath && (
-            <div className="provider-panel-section mb-6">
+            <div className="voice-mode-project-summary provider-panel-section mb-6">
               <h4 className="provider-panel-section-title text-base font-medium mb-4 text-[var(--nim-text)]">Project Summary</h4>
               <p className="provider-panel-hint text-sm text-[var(--nim-text-muted)] mb-3">
                 The voice assistant uses an AI-generated summary of your project to understand context.
-                This summary is stored in <code className="text-xs bg-[var(--nim-bg-secondary)] px-1 py-0.5 rounded">nimbalyst-local/voice-project-summary.md</code>.
+                Stored in <code className="text-xs bg-[var(--nim-bg-secondary)] px-1 py-0.5 rounded">{VOICE_PROJECT_SUMMARY_PATH}</code>.
               </p>
 
-              {isGeneratingSummary ? (
-                <div className="flex items-center gap-2 text-[var(--nim-text-muted)]">
-                  <MaterialSymbol icon="sync" size={16} className="animate-spin" />
-                  Generating project summary using Claude...
-                </div>
-              ) : projectSummaryExists ? (
+              {projectSummaryExists ? (
                 <div className="flex items-center gap-2">
                   <MaterialSymbol icon="check_circle" size={16} className="text-[var(--nim-success)]" />
                   <span className="text-[var(--nim-text-muted)]">Summary exists</span>
@@ -514,14 +711,17 @@ export const VoiceModePanel: React.FC<VoiceModePanelProps> = ({
                     onClick={handleOpenSummary}
                     className="px-2 py-1 rounded border border-[var(--nim-border)] bg-[var(--nim-bg-secondary)] text-[var(--nim-text)] cursor-pointer text-xs flex items-center gap-1"
                     title="Open summary file"
+                    data-testid="voice-mode-summary-view"
                   >
                     <MaterialSymbol icon="open_in_new" size={14} />
                     View
                   </button>
                   <button
                     onClick={handleGenerateSummary}
-                    className="px-2 py-1 rounded border border-[var(--nim-border)] bg-[var(--nim-bg-secondary)] text-[var(--nim-text)] cursor-pointer text-xs flex items-center gap-1"
-                    title="Regenerate summary"
+                    disabled={!hasAgentConfigured}
+                    className="px-2 py-1 rounded border border-[var(--nim-border)] bg-[var(--nim-bg-secondary)] text-[var(--nim-text)] cursor-pointer text-xs flex items-center gap-1 disabled:opacity-50 disabled:cursor-not-allowed"
+                    title={hasAgentConfigured ? 'Regenerate summary' : 'Configure an agent to enable regeneration'}
+                    data-testid="voice-mode-summary-regenerate"
                   >
                     <MaterialSymbol icon="refresh" size={14} />
                     Regenerate
@@ -531,19 +731,36 @@ export const VoiceModePanel: React.FC<VoiceModePanelProps> = ({
                 <div>
                   <button
                     onClick={handleGenerateSummary}
-                    className="px-3 py-1.5 rounded border border-[var(--nim-border)] bg-[var(--nim-primary)] text-white cursor-pointer text-sm flex items-center gap-1.5"
+                    disabled={!hasAgentConfigured}
+                    className="px-3 py-1.5 rounded border border-[var(--nim-border)] bg-[var(--nim-primary)] text-white cursor-pointer text-sm flex items-center gap-1.5 disabled:opacity-50 disabled:cursor-not-allowed"
+                    data-testid="voice-mode-summary-generate"
                   >
                     <MaterialSymbol icon="auto_awesome" size={16} />
                     Generate Project Summary
                   </button>
                   <p className="provider-panel-hint mt-2 text-xs text-[var(--nim-text-muted)]">
-                    This will read your CLAUDE.md, README.md, and package.json to create a concise summary.
+                    Launches an agent session that reads your project and writes the summary file. You'll
+                    be taken to the session so you can watch it work.
                   </p>
                 </div>
               )}
 
+              {!hasAgentConfigured && (
+                <p className="mt-3 text-xs text-[var(--nim-text-muted)]" data-testid="voice-mode-summary-no-agent">
+                  No agent is configured.{' '}
+                  <button
+                    type="button"
+                    onClick={() => navigateToSettings({ category: 'claude-code' })}
+                    className="bg-transparent border-none p-0 cursor-pointer text-[var(--nim-primary)] underline"
+                  >
+                    Configure one in AI Models settings
+                  </button>{' '}
+                  to enable this.
+                </p>
+              )}
+
               {summaryError && (
-                <p className="mt-2 text-xs text-[var(--nim-error)]">
+                <p className="mt-2 text-xs text-[var(--nim-error)]" data-testid="voice-mode-summary-error">
                   {summaryError}
                 </p>
               )}

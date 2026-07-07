@@ -8,7 +8,7 @@
  */
 
 import React, { useState, useEffect, useCallback, useRef, useMemo } from 'react';
-import { useAtomValue } from 'jotai';
+import { useAtomValue, useSetAtom } from 'jotai';
 import { NimbalystEditor, MaterialSymbol, ProviderIcon } from '@nimbalyst/runtime';
 import type { EditorConfig } from '@nimbalyst/runtime/editor';
 import { $convertFromEnhancedMarkdownString, getEditorTransformers } from '@nimbalyst/runtime/editor';
@@ -16,13 +16,22 @@ import { $getRoot } from 'lexical';
 import type { TrackerRecord } from '@nimbalyst/runtime/core/TrackerRecord';
 import { globalRegistry } from '@nimbalyst/runtime/plugins/TrackerPlugin/models';
 import type { FieldDefinition } from '@nimbalyst/runtime/plugins/TrackerPlugin/models/TrackerDataModel';
-import { getRecordTitle, getRecordStatus, getRecordPriority, getRecordField } from '@nimbalyst/runtime/plugins/TrackerPlugin/trackerRecordAccessors';
+import { getRecordTitle, getRecordStatus, getRecordPriority, getRecordField, isSameIdentity, isItemSharedWithTeam } from '@nimbalyst/runtime/plugins/TrackerPlugin/trackerRecordAccessors';
+import type { TrackerIdentity } from '@nimbalyst/runtime';
 import { TrackerFieldEditor, type TeamMemberOption } from '@nimbalyst/runtime/plugins/TrackerPlugin/components/TrackerFieldEditor';
+import type { RelationshipCandidate } from '@nimbalyst/runtime/plugins/TrackerPlugin/components/RelationshipFieldEditor';
 import { UserAvatar } from '@nimbalyst/runtime/plugins/TrackerPlugin/components/UserAvatar';
-import { trackerItemByIdAtom } from '@nimbalyst/runtime/plugins/TrackerPlugin/trackerDataAtoms';
-import { sessionRegistryAtom, type SessionMeta } from '../../store/atoms/sessions';
+import { trackerItemByIdAtom, trackerItemsMapAtom } from '@nimbalyst/runtime/plugins/TrackerPlugin/trackerDataAtoms';
+import { resolveRelationshipType, isRelationshipField } from '@nimbalyst/runtime/plugins/TrackerPlugin/models';
+import { refreshSessionListAtom, sessionRegistryAtom, type SessionMeta } from '../../store/atoms/sessions';
+import { resolveLinkedSessions } from '../../utils/resolveLinkedSessions';
+import { prRemoteAtom, navigateToPullRequest } from '../../store/atoms/pullRequests';
+import { getRecordPrReferences } from '@nimbalyst/runtime/plugins/TrackerPlugin/prReferences';
+import { buildTrackerDeepLink } from '../../store/atoms/collabDocuments';
+import { errorNotificationService } from '../../services/ErrorNotificationService';
 import { getRelativeTimeString } from '../../utils/dateFormatting';
 import { useTrackerContentCollab } from '../../hooks/useTrackerContentCollab';
+import { reconcileExternalFieldChanges } from './trackerDetailFieldSync';
 
 interface TrackerItemDetailProps {
   itemId: string;
@@ -33,6 +42,8 @@ interface TrackerItemDetailProps {
   onLaunchSession?: (trackerItemId: string) => void;
   onArchive?: (itemId: string, archive: boolean) => void;
   onDelete?: (itemId: string) => void;
+  /** Open another tracker item (relationship pill / backlink click). */
+  onOpenItem?: (itemId: string) => void;
 }
 
 const STATUS_COLORS: Record<string, string> = {
@@ -177,107 +188,254 @@ export const TrackerItemDetail: React.FC<TrackerItemDetailProps> = ({
   onLaunchSession,
   onArchive,
   onDelete,
+  onOpenItem,
 }) => {
   // Read directly from per-item atom -- only re-renders when THIS item changes,
   // not when any other item in the workspace updates.
   const item = useAtomValue(trackerItemByIdAtom(itemId));
+  // Loaded items, used to build relationship-field typeahead candidates.
+  const itemsMap = useAtomValue(trackerItemsMapAtom);
   const sessionRegistry = useAtomValue(sessionRegistryAtom);
+  const refreshSessionList = useSetAtom(refreshSessionListAtom);
 
   const model = useMemo(() => globalRegistry.get(item?.primaryType ?? ''), [item?.primaryType]);
 
-  // Detect whether this workspace has a team. Result drives both the
-  // member-picker dropdown and the content editor mode (collab vs local).
-  // Tri-state: `undefined` = check pending, `{ orgId: null }` = confirmed
-  // no team, `{ orgId: '...' }` = team found.
-  const [teamInfo, setTeamInfo] = useState<{ orgId: string | null; members: TeamMemberOption[] } | undefined>(undefined);
+  // Detect whether this workspace has a team. The team check feeds the
+  // content editor mode (collab vs local); the member list feeds the
+  // assignee picker. NIM-638: these are split into two effects so a slow
+  // or hung `team:list-members` doesn't strand `teamOrgId === undefined`
+  // and keep the collab editor stuck on "Connecting..." forever -- the
+  // editor only needs the orgId, not the members.
+  //
+  // Tri-state `teamOrgId`:
+  //   undefined -- team lookup pending
+  //   null      -- confirmed no team for this workspace
+  //   string    -- orgId resolved
+  const [teamOrgId, setTeamOrgId] = useState<string | null | undefined>(undefined);
+  const [teamMembers, setTeamMembers] = useState<TeamMemberOption[]>([]);
+
+  const handleCopyLink = useCallback(async () => {
+    if (!item || !teamOrgId) return;
+    const url = buildTrackerDeepLink(item.id, teamOrgId);
+    try {
+      await navigator.clipboard.writeText(url);
+      errorNotificationService.showInfo(
+        'Link copied',
+        'Paste it anywhere to open this tracker in Nimbalyst.',
+        { duration: 3000 }
+      );
+    } catch (err) {
+      console.error('[TrackerItemDetail] Failed to copy link:', err);
+      errorNotificationService.showError(
+        'Copy failed',
+        'Could not write the link to the clipboard.'
+      );
+    }
+  }, [item, teamOrgId]);
+
   useEffect(() => {
     if (!workspacePath) {
-      setTeamInfo({ orgId: null, members: [] });
+      setTeamOrgId(null);
+      setTeamMembers([]);
       return;
     }
     let cancelled = false;
-    setTeamInfo(undefined);
+    setTeamOrgId(undefined);
+    setTeamMembers([]);
     (async () => {
       try {
-        const teamResult = await window.electronAPI.invoke('team:find-for-workspace', workspacePath);
+        // NIM-638: bound the team lookup with a client-side timeout. Without it,
+        // a hung `team:find-for-workspace` IPC leaves teamOrgId === undefined
+        // (pending) forever, so the content editor stays stuck on "Connecting...".
+        // On timeout, degrade to local mode (null) -- the body still paints from
+        // the cold cache instead of spinning indefinitely.
+        const TEAM_LOOKUP_TIMEOUT_MS = 12_000;
+        const teamResult = await Promise.race([
+          window.electronAPI.invoke('team:find-for-workspace', workspacePath),
+          new Promise<never>((_, reject) =>
+            setTimeout(() => reject(new Error('team:find-for-workspace timed out')), TEAM_LOOKUP_TIMEOUT_MS),
+          ),
+        ]);
         if (cancelled) return;
         const orgId: string | null = teamResult?.success && teamResult.team?.orgId
           ? teamResult.team.orgId
           : null;
-        if (!orgId) {
-          setTeamInfo({ orgId: null, members: [] });
-          return;
-        }
-        const membersResult = await window.electronAPI.invoke('team:list-members', orgId);
+        setTeamOrgId(orgId);
+      } catch {
+        if (!cancelled) setTeamOrgId(null);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [workspacePath]);
+  // Members load on a separate effect keyed on the resolved orgId so a
+  // slow members call cannot block the editor. The list-members IPC has
+  // its own server-side timeout (see fetchTeamApi); on failure the
+  // assignee picker degrades to an empty list, which is fine.
+  useEffect(() => {
+    if (typeof teamOrgId !== 'string') {
+      setTeamMembers([]);
+      return;
+    }
+    let cancelled = false;
+    (async () => {
+      try {
+        const membersResult = await window.electronAPI.invoke('team:list-members', teamOrgId);
         if (cancelled) return;
         const members: TeamMemberOption[] = membersResult?.success && membersResult.members
           ? membersResult.members
               .filter((m: any) => m.email)
               .map((m: any) => ({ email: m.email, name: m.name || undefined }))
           : [];
-        setTeamInfo({ orgId, members });
+        setTeamMembers(members);
       } catch {
-        if (!cancelled) setTeamInfo({ orgId: null, members: [] });
+        if (!cancelled) setTeamMembers([]);
       }
     })();
     return () => { cancelled = true; };
-  }, [workspacePath]);
-  const teamMembers = teamInfo?.members ?? [];
-  // `undefined` while pending, `null` when confirmed no team, string when found.
-  const teamOrgId: string | null | undefined = teamInfo === undefined ? undefined : teamInfo.orgId;
+  }, [teamOrgId]);
   const typeColor = TYPE_COLORS[item?.primaryType ?? ''] || '#6b7280';
   const icon = model?.icon || getTypeIcon(item?.primaryType ?? '');
 
-  // Resolve linked sessions from registry (silently filter deleted ones)
-  // Two sources: 1) tracker item's linkedSessions[] (forward link from DB items)
-  //              2) sessions whose linkedTrackerItemIds contains this item's ID or file path (reverse link)
-  const linkedSessions = useMemo(() => {
-    const sessionSet = new Set<string>();
+  // External-source provenance (source chip). origin lives in record system metadata.
+  const externalOrigin =
+    item?.system?.origin?.kind === 'external' ? item.system.origin.external : null;
+  const [importerSummaries, setImporterSummaries] = useState<
+    Array<{ id: string; displayName: string; icon: string }>
+  >([]);
+  const [resnapshotting, setResnapshotting] = useState(false);
+  const [bodyBusy, setBodyBusy] = useState(false);
+  const handleResnapshot = useCallback(async () => {
+    if (!externalOrigin || !workspacePath || resnapshotting) return;
+    setResnapshotting(true);
+    try {
+      await window.electronAPI.invoke('tracker:importer:resnapshot', {
+        workspacePath,
+        urn: externalOrigin.urn,
+      });
+    } catch (e) {
+      errorNotificationService.showError(
+        'Re-snapshot failed',
+        e instanceof Error ? e.message : String(e)
+      );
+    } finally {
+      setResnapshotting(false);
+    }
+  }, [externalOrigin, workspacePath, resnapshotting]);
+  const handleBodyAction = useCallback(
+    async (action: 'applyBody' | 'dismissBody') => {
+      if (!externalOrigin || !workspacePath || bodyBusy) return;
+      setBodyBusy(true);
+      try {
+        await window.electronAPI.invoke(`tracker:importer:${action}`, {
+          workspacePath,
+          urn: externalOrigin.urn,
+        });
+      } catch (e) {
+        errorNotificationService.showError(
+          'Update failed',
+          e instanceof Error ? e.message : String(e)
+        );
+      } finally {
+        setBodyBusy(false);
+      }
+    },
+    [externalOrigin, workspacePath, bodyBusy]
+  );
+  useEffect(() => {
+    if (!externalOrigin || !workspacePath) return;
+    let cancelled = false;
+    window.electronAPI
+      .invoke('tracker:importer:list', workspacePath)
+      .then((list: unknown) => {
+        if (!cancelled && Array.isArray(list)) setImporterSummaries(list as typeof importerSummaries);
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [externalOrigin?.providerId, workspacePath]);
 
-    // Forward: tracker record stores session IDs in system
-    const forwardIds: string[] = item?.system?.linkedSessions || [];
-    for (const id of forwardIds) sessionSet.add(id);
+  // Resolve linked sessions from registry via the shared resolver so this view
+  // and the PR view surface identical results (see resolveLinkedSessions.ts).
+  const linkedSessions = useMemo(
+    () => resolveLinkedSessions(item, sessionRegistry),
+    [item, sessionRegistry]
+  );
 
-    // Reverse: sessions that link to this item by ID or by file path
-    const trackerItemId = item?.id;
-    const filePath = item?.system?.documentPath;
-    const fileRef = filePath ? `file:${filePath}` : null;
-
-    // console.log('[TrackerItemDetail] reverse lookup:', { trackerItemId, filePath, fileRef });
-
-    sessionRegistry.forEach((session, sessionId) => {
-      const linked = session.linkedTrackerItemIds;
-      if (!linked) return;
-      if (trackerItemId && linked.includes(trackerItemId)) sessionSet.add(sessionId);
-      if (fileRef && linked.includes(fileRef)) sessionSet.add(sessionId);
-    });
-
-    if (sessionSet.size === 0) return [];
-    return Array.from(sessionSet)
-      .map(id => sessionRegistry.get(id))
-      .filter((s): s is SessionMeta => s != null)
+  // PR reference on the workspace's detected GitHub remote → "Open PR view"
+  // jump. Reference-based (url-field match or explicit link), any item type.
+  const prRemote = useAtomValue(prRemoteAtom);
+  const prReference = useMemo(() => {
+    if (!item || !prRemote || prRemote.workspacePath !== workspacePath) return null;
+    const wanted = prRemote.remote.toLowerCase();
+    return getRecordPrReferences(item).find((ref) => ref.remote === wanted) ?? null;
+  }, [item, prRemote, workspacePath]);
+  const linkedSessionIds = useMemo(() => new Set(linkedSessions.map((session) => session.id)), [linkedSessions]);
+  const canLinkExistingSession = Boolean(item && workspacePath);
+  const [isLinkingExistingSession, setIsLinkingExistingSession] = useState(false);
+  const [sessionSearchQuery, setSessionSearchQuery] = useState('');
+  const [linkingSessionId, setLinkingSessionId] = useState<string | null>(null);
+  const [linkSessionError, setLinkSessionError] = useState<string | null>(null);
+  const availableSessions = useMemo(() => {
+    if (!workspacePath) return [] as SessionMeta[];
+    return Array.from(sessionRegistry.values())
+      .filter((session) => {
+        if (session.workspaceId !== workspacePath) return false;
+        if (session.isArchived) return false;
+        return !linkedSessionIds.has(session.id);
+      })
       .sort((a, b) => b.updatedAt - a.updatedAt);
-  }, [item, sessionRegistry]);
+  }, [linkedSessionIds, sessionRegistry, workspacePath]);
+  const filteredAvailableSessions = useMemo(() => {
+    if (!sessionSearchQuery.trim()) {
+      return availableSessions.slice(0, 8);
+    }
+    const query = sessionSearchQuery.trim().toLowerCase();
+    return availableSessions
+      .filter((session) =>
+        session.title.toLowerCase().includes(query)
+        || session.provider.toLowerCase().includes(query)
+        || session.id.toLowerCase().includes(query)
+      )
+      .slice(0, 8);
+  }, [availableSessions, sessionSearchQuery]);
 
   // Local state for text fields (debounced save)
   const [localTitle, setLocalTitle] = useState(item ? getRecordTitle(item) : '');
   const [localDescription, setLocalDescription] = useState(item ? (item.fields.description as string ?? '') : '');
   const [localCustomFields, setLocalCustomFields] = useState<Record<string, any>>({});
-  const debounceTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Per-field debounce timers (not one shared timer) so editing one field never
+  // drops another field's pending save, and so reconciliation can tell which
+  // fields are mid-edit. `pendingFieldsRef` holds fields with an unflushed save;
+  // `externalFieldBaselineRef` is the last-reconciled snapshot of persisted
+  // values used to detect external writes (NIM-790).
+  const fieldSaveTimersRef = useRef<Map<string, ReturnType<typeof setTimeout>>>(new Map());
+  const pendingFieldsRef = useRef<Set<string>>(new Set());
+  const externalFieldBaselineRef = useRef<Record<string, unknown>>({});
   const editable = item ? isEditable(item) : false;
   const hasRichContent = item ? isNativeItem(item) : false; // Only native items have embedded Lexical content
 
   // Rich content editor state
   const [contentMarkdown, setContentMarkdown] = useState<string | null>(null);
   const [contentLoaded, setContentLoaded] = useState(false);
+  // Bumped when an external writer (MCP, sync) changes the body content
+  // out from under us, so the Lexical editor remounts with the new value.
+  // Lexical only consumes `initialContent` at mount, so a key change is
+  // the only way to surface fresh content without an in-place editor API.
+  const [externalContentEpoch, setExternalContentEpoch] = useState(0);
   const getContentFnRef = useRef<(() => string) | null>(null);
   const contentSaveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const contentSaveInFlightRef = useRef(false);
   // Baseline of what was last persisted to PGLite for THIS item. Used as a
   // safety rail: if the collab editor mounts empty (e.g., because Lexical's
   // `main` binding is empty while the server Y.Doc only has legacy bytes
   // under `root`), onDirtyChange would otherwise save "" and clobber the
   // real content in PGLite. We refuse any save that would shrink a
   // known-non-empty baseline to empty.
+  // Also acts as the comparator for detecting external content updates --
+  // if the atom's content diverges from this baseline, the change came
+  // from somewhere other than this panel's own save path.
   const loadedBaselineRef = useRef<string | null>(null);
 
   // Reset local editing state when navigating to a different item.
@@ -289,12 +447,42 @@ export const TrackerItemDetail: React.FC<TrackerItemDetailProps> = ({
     setLocalTitle(getRecordTitle(item));
     setLocalDescription(item.fields.description as string ?? '');
     setLocalCustomFields({});
-    // Clear any stale debounce timer from the previous item
-    if (debounceTimerRef.current) {
-      clearTimeout(debounceTimerRef.current);
-      debounceTimerRef.current = null;
-    }
+    // Clear any stale per-field debounce timers from the previous item and seed
+    // the reconciliation baseline with the new item's persisted fields.
+    for (const timer of fieldSaveTimersRef.current.values()) clearTimeout(timer);
+    fieldSaveTimersRef.current.clear();
+    pendingFieldsRef.current.clear();
+    externalFieldBaselineRef.current = { ...item.fields };
+    setIsLinkingExistingSession(false);
+    setSessionSearchQuery('');
+    setLinkingSessionId(null);
+    setLinkSessionError(null);
   }, [itemId]); // itemId only -- not item fields
+
+  // Reconcile in-progress field overrides against external writes (MCP, sync,
+  // another window). When a field the user is NOT actively editing changes
+  // underneath us, drop the stale local override so the panel shows -- and
+  // saves -- the fresh value instead of clobbering it (NIM-790).
+  const itemFields = item?.fields;
+  useEffect(() => {
+    if (!itemFields) return;
+    const baseline = externalFieldBaselineRef.current;
+    externalFieldBaselineRef.current = { ...itemFields };
+    setLocalCustomFields((prev) => {
+      const overriddenFields = Object.keys(prev);
+      if (overriddenFields.length === 0) return prev;
+      const { clearedFields } = reconcileExternalFieldChanges({
+        previousPersisted: baseline,
+        currentPersisted: itemFields,
+        overriddenFields,
+        pendingFields: pendingFieldsRef.current,
+      });
+      if (clearedFields.length === 0) return prev;
+      const next = { ...prev };
+      for (const f of clearedFields) delete next[f];
+      return next;
+    });
+  }, [itemFields]);
 
   // Load rich content from PGLite once when navigating to a new item.
   // After initial load, the Lexical editor owns the content and saves via debounced saveContent.
@@ -337,6 +525,42 @@ export const TrackerItemDetail: React.FC<TrackerItemDetailProps> = ({
     return () => { cancelled = true; };
   }, [item?.id, hasRichContent]);
 
+  // External content update detection.
+  // The atom's `content` is refreshed by trackerSyncListeners whenever a
+  // tracker-items-changed event arrives -- including MCP writes, sync
+  // pushes, comment additions, and our own field saves. Our own content
+  // saves are recognized because saveContent advances the baseline before
+  // the IPC round-trip, so when the broadcast echo arrives the atom value
+  // already matches. Any other divergence means an external writer changed
+  // the body, and Lexical can only adopt that by remounting -- bump the
+  // epoch in the editor key so it picks up the fresh initialContent.
+  const atomContentString = useMemo<string | null>(() => {
+    if (!hasRichContent) return null;
+    const c = item?.content;
+    if (c == null) return null;
+    return typeof c === 'string' ? c : (c as any)?.markdown ?? null;
+  }, [item?.content, hasRichContent]);
+
+  useEffect(() => {
+    if (!hasRichContent) return;
+    if (atomContentString == null) return;
+    const baseline = loadedBaselineRef.current;
+    // Initial load hasn't completed yet -- the load effect owns this state
+    if (baseline === null) return;
+    if (atomContentString === baseline) return;
+    // Local typing wins over a racing external write. If this panel already
+    // has a pending or in-flight body save, remounting Lexical here would
+    // discard the user's unsaved characters. Let the local save finish and
+    // intentionally keep the editor on the locally-authored content.
+    if (contentSaveTimerRef.current || contentSaveInFlightRef.current) {
+      return;
+    }
+    // External update detected: refresh the editor.
+    loadedBaselineRef.current = atomContentString;
+    setContentMarkdown(atomContentString);
+    setExternalContentEpoch((e) => e + 1);
+  }, [atomContentString, hasRichContent]);
+
   // Escape to close
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
@@ -351,9 +575,23 @@ export const TrackerItemDetail: React.FC<TrackerItemDetailProps> = ({
     return tracker?.sync?.mode || 'local';
   }, [item?.primaryType]);
 
+  // Whether THIS item is shared with the team. For `shared`-mode types every
+  // item is always shared; for `hybrid` it's per-item, driven by the `share`
+  // flag (surfaced under customFields by rowToTrackerItem). Legacy items that
+  // were pushed to the room before the explicit flag existed (sync_status
+  // 'synced'/'pending') count as shared so they keep collaborating.
+  const isItemShared = useMemo(() => {
+    if (!item) return false;
+    // Single source of truth shared with the tracker table's "Shared" column.
+    return isItemSharedWithTeam(item);
+  }, [item]);
+
   const contentMode = useMemo(() => {
     if (!item || !isNativeItem(item)) return 'file-backed' as const;
     if (syncMode === 'local') return 'local-pglite' as const;
+    // Hybrid trackers are per-item: an unshared hybrid item edits locally and
+    // never connects its body room. (Sharing flips this to collaborative.)
+    if (syncMode === 'hybrid' && !isItemShared) return 'local-pglite' as const;
     // Shared/hybrid trackers need a team for collaborative editing. Without
     // one, content is purely local. While the team check is still pending
     // (`teamOrgId === undefined`) stay in collaborative mode so the loading
@@ -361,7 +599,57 @@ export const TrackerItemDetail: React.FC<TrackerItemDetailProps> = ({
     // clobbered if a team is then discovered.
     if (teamOrgId === null) return 'local-pglite' as const;
     return 'collaborative' as const;
-  }, [item, syncMode, teamOrgId]);
+  }, [item, syncMode, teamOrgId, isItemShared]);
+
+  // The per-item "Share with team" toggle is offered only for hybrid native
+  // items in a workspace that has a team. `shared` types are always shared (no
+  // choice) and `local` types never sync.
+  // Native items + file-backed plans/decisions (frontmatter/import) can be
+  // shared. Inline trackers (#bug[...]) are always local -- promote them first.
+  const canToggleShare = Boolean(
+    item &&
+    editable &&
+    (isNativeItem(item) || item.source === 'frontmatter' || item.source === 'import') &&
+    syncMode === 'hybrid' &&
+    typeof teamOrgId === 'string'
+  );
+  // File-backed plans/decisions can be UNSHARED safely (the row re-projects from
+  // the file as local). Native items cannot yet: the sync engine's unshare path
+  // deletes the local row, so unsharing a native item would lose it. So a
+  // shared native item's toggle is locked (share is one-way until the engine
+  // gains a "remove from room, keep local" primitive).
+  const isFileBacked = Boolean(item && (item.source === 'frontmatter' || item.source === 'import'));
+  const unshareLocked = isItemShared && !isFileBacked;
+  const [sharePending, setSharePending] = useState(false);
+  const handleToggleShare = useCallback(async () => {
+    if (!item || sharePending) return;
+    const next = !isItemShared;
+    // Guard: never attempt to unshare a native item (would delete it).
+    if (!next && !(item.source === 'frontmatter' || item.source === 'import')) return;
+    setSharePending(true);
+    try {
+      const res = await window.electronAPI.documentService.setTrackerItemShared({
+        itemId: item.id,
+        shared: next,
+      });
+      if (!res?.success) throw new Error(res?.error || 'Share toggle failed');
+      errorNotificationService.showInfo(
+        next ? 'Shared with team' : 'Made local',
+        next
+          ? 'This item is now in your team’s shared tracker.'
+          : 'This item is now local-only and was removed from the team tracker.',
+        { duration: 3000 }
+      );
+    } catch (err) {
+      console.error('[TrackerItemDetail] Failed to toggle share:', err);
+      errorNotificationService.showError(
+        'Share failed',
+        err instanceof Error ? err.message : String(err)
+      );
+    } finally {
+      setSharePending(false);
+    }
+  }, [item, isItemShared, sharePending]);
 
   // Collaborative content editing for team-synced items. Dormant unless the
   // workspace actually has a team -- see useTrackerContentCollab for the
@@ -374,12 +662,14 @@ export const TrackerItemDetail: React.FC<TrackerItemDetailProps> = ({
     acceptRemoteChanges,
     rejectRemoteChanges,
     providerEpoch,
+    bodyCacheMarkdown,
   } = useTrackerContentCollab({
     itemId,
     workspacePath,
     syncMode,
     teamMemberCount: teamMembers.length,
     teamOrgId,
+    itemShared: isItemShared,
   });
 
   // Track whether the collab provider has ever reached 'connected' for this
@@ -395,6 +685,54 @@ export const TrackerItemDetail: React.FC<TrackerItemDetailProps> = ({
   useEffect(() => {
     if (collabStatus === 'connected') setHasSyncedOnce(true);
   }, [collabStatus]);
+
+  // Defensive cold-paint fallback for shared `fullDocument` trackers.
+  //
+  // The happy path: `useTrackerContentCollab` provides `initialEditorState`
+  // built from `tracker_body_cache`, CollaborationPlugin's `_xmlText._length`
+  // check fires bootstrap, the seed runs, content renders.
+  //
+  // The seam this catches: in prod we have seen the WebSocket reach
+  // `connected` for a shared tracker, the `tracker_body_cache` row has
+  // valid body bytes, AND no `initialEditorState fn CALLED` log fires --
+  // the editor stays empty. The most likely cause is that
+  // `@lexical/yjs` considers the shared XmlText non-empty after the
+  // server-sync response is applied (the binding writes a root element
+  // even when the room has never been seeded with real content), so
+  // bootstrap is suppressed and the seed never gets a chance.
+  //
+  // This effect: 600ms after status reaches `connected`, if we have
+  // cached body markdown AND the editor is visually empty, apply the
+  // cached markdown via `editor.update()`. Going through the editor
+  // (rather than `editor.parseEditorState`) means the change propagates
+  // through `@lexical/yjs` into the Y.Doc, so peers receive the body
+  // via the normal CRDT merge -- the empty server room finally gets
+  // populated.
+  const collabEditorInstanceRef = useRef<any>(null);
+  useEffect(() => {
+    if (collabStatus !== 'connected') return;
+    if (!bodyCacheMarkdown || bodyCacheMarkdown.trim().length === 0) return;
+    const t = setTimeout(() => {
+      const editor = collabEditorInstanceRef.current;
+      const getContent = getContentFnRef.current;
+      if (!editor || !getContent) return;
+      const current = getContent();
+      // The check must be `trim() === ''` -- a fresh Lexical doc renders
+      // as a single empty paragraph that serializes to '' after trim, so
+      // anything content-bearing returns a non-empty trimmed string.
+      if (current.trim() !== '') return;
+      console.warn(
+        '[TrackerItemDetail] Cold-paint fallback firing: editor is empty after sync(connected) but tracker_body_cache has bytes. Forcing paint.',
+        { itemId, mdLen: bodyCacheMarkdown.length, providerEpoch },
+      );
+      editor.update(() => {
+        const root = $getRoot();
+        root.clear();
+        $convertFromEnhancedMarkdownString(bodyCacheMarkdown, getEditorTransformers());
+      });
+    }, 600);
+    return () => clearTimeout(t);
+  }, [collabStatus, bodyCacheMarkdown, providerEpoch, itemId]);
 
   /** Save a field update -- routes to file-based save for file-backed items, DB for native */
   const saveField = useCallback(async (updates: Record<string, any>) => {
@@ -414,18 +752,33 @@ export const TrackerItemDetail: React.FC<TrackerItemDetailProps> = ({
           syncMode,
         });
       }
+      // Refresh the derived relationship index for this item (Epic C Phase 2) so
+      // backlinks stay current after a relationship field edit. Fire-and-forget,
+      // idempotent; harmless for non-relationship field saves.
+      window.electronAPI
+        .invoke('document-service:tracker-item-reindex-relationships', { itemId: item.id })
+        .catch(() => {});
     } catch (err) {
       console.error('[TrackerItemDetail] Failed to save field:', err);
     }
   }, [item?.id, item?.source, editable, syncMode]);
 
-  /** Debounced save for text fields */
-  const debouncedSave = useCallback((updates: Record<string, any>) => {
-    if (debounceTimerRef.current) clearTimeout(debounceTimerRef.current);
-    debounceTimerRef.current = setTimeout(() => {
-      debounceTimerRef.current = null;
-      saveField(updates);
-    }, 500);
+  /** Debounced save for a single text field. Per-field timers + pending-field
+   *  tracking let the reconciliation effect distinguish "user is editing this
+   *  field" from "external write landed" (NIM-790). */
+  const debouncedSaveField = useCallback((fieldName: string, value: any) => {
+    pendingFieldsRef.current.add(fieldName);
+    const timers = fieldSaveTimersRef.current;
+    const existing = timers.get(fieldName);
+    if (existing) clearTimeout(existing);
+    timers.set(fieldName, setTimeout(async () => {
+      timers.delete(fieldName);
+      try {
+        await saveField({ [fieldName]: value });
+      } finally {
+        pendingFieldsRef.current.delete(fieldName);
+      }
+    }, 500));
   }, [saveField]);
 
   /** Debounced save for rich content.
@@ -452,22 +805,36 @@ export const TrackerItemDetail: React.FC<TrackerItemDetailProps> = ({
     }
     if (contentSaveTimerRef.current) clearTimeout(contentSaveTimerRef.current);
     contentSaveTimerRef.current = setTimeout(async () => {
+      contentSaveTimerRef.current = null;
+      // Update the baseline before the IPC round-trip. The main-process
+      // updateTrackerItemContent path also broadcasts tracker-items-changed,
+      // which races with the invoke result -- if the broadcast arrives first
+      // and we haven't moved the baseline forward yet, the external-update
+      // detector below would mistake our own echo for a remote change and
+      // remount the editor mid-typing. On save failure the editor still
+      // owns the live value and the next dirty event will retry, so a
+      // briefly-optimistic baseline is safe.
+      loadedBaselineRef.current = markdown;
+      contentSaveInFlightRef.current = true;
       try {
         await window.electronAPI.documentService.updateTrackerItemContent({
           itemId: item!.id,
           content: markdown,
         });
-        loadedBaselineRef.current = markdown;
       } catch (err) {
         console.error('[TrackerItemDetail] Failed to save content:', err);
+      } finally {
+        contentSaveInFlightRef.current = false;
       }
     }, 800);
   }, [item?.id]);
 
   // Cleanup timers
   useEffect(() => {
+    const timers = fieldSaveTimersRef.current;
     return () => {
-      if (debounceTimerRef.current) clearTimeout(debounceTimerRef.current);
+      for (const timer of timers.values()) clearTimeout(timer);
+      timers.clear();
       if (contentSaveTimerRef.current) clearTimeout(contentSaveTimerRef.current);
     };
   }, []);
@@ -510,8 +877,8 @@ export const TrackerItemDetail: React.FC<TrackerItemDetailProps> = ({
     } else {
       setLocalCustomFields(prev => ({ ...prev, [fieldName]: value }));
     }
-    debouncedSave({ [fieldName]: value });
-  }, [debouncedSave]);
+    debouncedSaveField(fieldName, value);
+  }, [debouncedSaveField]);
 
   /** Open the source document in Files mode */
   const handleOpenDocument = useCallback(() => {
@@ -527,6 +894,31 @@ export const TrackerItemDetail: React.FC<TrackerItemDetailProps> = ({
       }
     });
   }, [item?.system.documentPath, onSwitchToFilesMode]);
+
+  const handleLinkExistingSession = useCallback(async (sessionId: string) => {
+    if (!item) return;
+    setLinkSessionError(null);
+    setLinkingSessionId(sessionId);
+    try {
+      const trackerId = item.system.documentPath
+        ? `file:${item.system.documentPath}`
+        : item.id;
+      const result = await window.electronAPI.invoke('tracker:link-session', {
+        trackerId,
+        sessionId,
+      });
+      if (!result?.success) {
+        throw new Error(result?.error || 'Failed to link session');
+      }
+      await refreshSessionList();
+      setIsLinkingExistingSession(false);
+      setSessionSearchQuery('');
+    } catch (err) {
+      setLinkSessionError(err instanceof Error ? err.message : 'Failed to link session');
+    } finally {
+      setLinkingSessionId(null);
+    }
+  }, [item, refreshSessionList]);
 
   // Separate fields into categories for layout
   const { primaryFields, customFields } = useMemo(() => {
@@ -559,6 +951,28 @@ export const TrackerItemDetail: React.FC<TrackerItemDetailProps> = ({
 
     return { primaryFields: primary, customFields: custom };
   }, [model]);
+
+  /**
+   * Candidate target items for a relationship field's typeahead: every loaded
+   * item except this one, narrowed to the field's allowed target tracker types.
+   */
+  const buildRelationshipCandidates = useCallback((field: FieldDefinition): RelationshipCandidate[] => {
+    const targets = field.targetTrackerTypes;
+    const candidates: RelationshipCandidate[] = [];
+    for (const rec of itemsMap.values()) {
+      if (rec.id === itemId) continue;
+      if (targets && targets !== '*' && !targets.includes(rec.primaryType)) continue;
+      candidates.push({
+        itemId: rec.id,
+        // Resolve the display title via the schema's title role -- custom types
+        // (e.g. customer-contact) store their title under a non-"title" field.
+        title: getRecordTitle(rec) || undefined,
+        issueKey: rec.issueKey || undefined,
+        trackerType: rec.primaryType,
+      });
+    }
+    return candidates;
+  }, [itemsMap, itemId]);
 
   /** Get field value -- use in-progress local state for text fields, atom for select/etc */
   const getFieldValue = useCallback((fieldName: string): any => {
@@ -609,8 +1023,17 @@ export const TrackerItemDetail: React.FC<TrackerItemDetailProps> = ({
     if (contentMode !== 'collaborative' || !collabConfig || collabLoading) return null;
     if (!contentLoaded) return null;
     const mdContent = contentMarkdown;
-    console.log('[TrackerItemDetail] Building collab editor config',
-      { itemId: item?.id, shouldBootstrap: collabConfig.shouldBootstrap, mdContentLen: mdContent?.length ?? 0 });
+    // Prefer the body-cache cold paint when the hook supplies it (the
+    // `tracker_body_cache` row matching the current body_version). Fall
+    // back to the per-item PGLite markdown for new items that have never
+    // been saved (no cache row yet).
+    const hookInitial = collabConfig.initialEditorState;
+    // electron-log's renderer transport serializes only the first arg
+    // as a string -- inline the diagnostic into the message itself so
+    // a future cold-paint failure is debuggable from the log file.
+    console.log(
+      `[TrackerItemDetail] Building collab editor config itemId=${item?.id} shouldBootstrap=${collabConfig.shouldBootstrap} mdContentLen=${mdContent?.length ?? 0} hasHookInitial=${!!hookInitial}`,
+    );
     return {
       isRichText: true,
       editable: true,
@@ -620,16 +1043,17 @@ export const TrackerItemDetail: React.FC<TrackerItemDetailProps> = ({
       markdownOnly: true,
       collaboration: {
         ...collabConfig,
-        initialEditorState: mdContent
-          ? () => {
-              console.log('[TrackerItemDetail] initialEditorState fn CALLED',
-                { itemId: item?.id, mdContentLen: mdContent.length });
-              const root = $getRoot();
-              root.clear();
-              $convertFromEnhancedMarkdownString(mdContent, getEditorTransformers());
-              console.log('[TrackerItemDetail] seeded editor root, children:', root.getChildrenSize());
-            }
-          : undefined,
+        initialEditorState: hookInitial
+          ?? (mdContent
+            ? () => {
+                console.log('[TrackerItemDetail] initialEditorState fn CALLED',
+                  { itemId: item?.id, mdContentLen: mdContent.length });
+                const root = $getRoot();
+                root.clear();
+                $convertFromEnhancedMarkdownString(mdContent, getEditorTransformers());
+                console.log('[TrackerItemDetail] seeded editor root, children:', root.getChildrenSize());
+              }
+            : undefined),
       },
       onGetContent: (getContentFn: () => string) => {
         getContentFnRef.current = getContentFn;
@@ -641,6 +1065,12 @@ export const TrackerItemDetail: React.FC<TrackerItemDetailProps> = ({
           // empty on mount before the Y.Doc sync has populated content.
           saveContent(markdown, true);
         }
+      },
+      onEditorReady: (editor: any) => {
+        // Captured for the cold-paint fallback effect above. Without an
+        // editor reference we cannot recover when CollaborationPlugin's
+        // bootstrap check declines to fire `initialEditorState`.
+        collabEditorInstanceRef.current = editor;
       },
     };
   }, [contentMode, collabConfig, collabLoading, contentLoaded, contentMarkdown, saveContent]);
@@ -732,8 +1162,111 @@ export const TrackerItemDetail: React.FC<TrackerItemDetailProps> = ({
               </span>
             )}
           </div>
+          {externalOrigin && (() => {
+            const summary = importerSummaries.find((s) => s.id === externalOrigin.providerId);
+            const installed = Boolean(summary);
+            const ref = externalOrigin.urn.includes('://')
+              ? externalOrigin.urn.split('://')[1]
+              : externalOrigin.externalId;
+            return (
+              <div
+                className="flex items-center gap-1.5 mt-1.5 text-[11px]"
+                data-testid="tracker-source-chip"
+                title={installed ? undefined : 'Install the importer to refresh this item'}
+              >
+                <span className={installed ? 'text-nim-muted' : 'text-nim-faint'}>
+                  <MaterialSymbol icon={summary?.icon || 'cloud_download'} size={13} />
+                </span>
+                <span className={installed ? 'text-nim-muted' : 'text-nim-faint'}>
+                  From {summary?.displayName || externalOrigin.providerId}
+                </span>
+                <span className="text-nim-faint">·</span>
+                <span className="font-mono text-nim-faint truncate max-w-[180px]">{ref}</span>
+                {installed && (
+                  <button
+                    type="button"
+                    className="ml-1 inline-flex items-center text-nim-muted hover:text-nim-accent disabled:opacity-50"
+                    title="Pull latest from source"
+                    data-testid="tracker-source-resnapshot"
+                    disabled={resnapshotting}
+                    onClick={handleResnapshot}
+                  >
+                    <MaterialSymbol icon={resnapshotting ? 'hourglass_empty' : 'sync'} size={12} />
+                  </button>
+                )}
+                <button
+                  type="button"
+                  className="ml-1 inline-flex items-center gap-0.5 text-nim-muted hover:text-nim-accent"
+                  title="Open original"
+                  data-testid="tracker-source-open"
+                  onClick={() => {
+                    window.electronAPI
+                      .invoke('tracker:importer:openExternal', {
+                        workspacePath,
+                        providerId: externalOrigin.providerId,
+                        externalId: externalOrigin.externalId,
+                        url: externalOrigin.url,
+                      })
+                      .catch(() => {
+                        if (externalOrigin.url) window.open(externalOrigin.url, '_blank');
+                      });
+                  }}
+                >
+                  Open
+                  <MaterialSymbol icon="open_in_new" size={11} />
+                </button>
+              </div>
+            );
+          })()}
         </div>
         <div className="flex items-center gap-1 shrink-0">
+          {prReference && (
+            <button
+              className="flex items-center gap-1 px-2 py-1 rounded text-[12px] font-medium text-nim-muted hover:bg-nim-tertiary"
+              onClick={() => navigateToPullRequest(prReference.remote, prReference.number)}
+              title={`Open #${prReference.number} in the PRs view`}
+              data-testid="tracker-open-pr-view"
+            >
+              <MaterialSymbol icon="merge" size={16} />
+              <span>PR #{prReference.number}</span>
+            </button>
+          )}
+          {canToggleShare && (
+            <button
+              className={`flex items-center gap-1 px-2 py-1 rounded text-[12px] font-medium ${
+                isItemShared
+                  ? 'bg-[var(--nim-primary)]/15 text-[var(--nim-primary)] hover:bg-[var(--nim-primary)]/25'
+                  : 'text-nim-muted hover:bg-nim-tertiary'
+              } disabled:opacity-50`}
+              onClick={handleToggleShare}
+              disabled={sharePending || unshareLocked}
+              title={
+                unshareLocked
+                  ? 'Shared with your team. Unsharing native items from the UI isn’t supported yet.'
+                  : isItemShared
+                    ? 'Shared with your team — click to make this item local-only'
+                    : 'Share this item with your team so they can review it'
+              }
+              data-testid="tracker-share-toggle"
+              aria-pressed={isItemShared}
+            >
+              <MaterialSymbol
+                icon={sharePending ? 'hourglass_empty' : isItemShared ? 'group' : 'group_add'}
+                size={16}
+              />
+              <span>{isItemShared ? 'Shared' : 'Share'}</span>
+            </button>
+          )}
+          {teamOrgId && (
+            <button
+              className="p-1 rounded hover:bg-nim-tertiary text-nim-muted"
+              onClick={handleCopyLink}
+              title="Copy shareable link"
+              data-testid="tracker-copy-link"
+            >
+              <MaterialSymbol icon="link" size={18} />
+            </button>
+          )}
           {onArchive && (
             <button
               className="p-1 rounded hover:bg-nim-tertiary text-nim-muted"
@@ -767,11 +1300,141 @@ export const TrackerItemDetail: React.FC<TrackerItemDetailProps> = ({
         </div>
       </div>
 
+      {/* Upstream body-change banner (re-snapshot detected an upstream edit) */}
+      {externalOrigin?.upstreamBodyChanged && (
+        <div
+          className="flex items-center gap-2 px-4 py-2 border-b border-nim bg-[var(--nim-warning)]/10 text-xs text-nim shrink-0"
+          data-testid="tracker-upstream-body-banner"
+        >
+          <MaterialSymbol icon="sync_problem" size={14} className="text-nim-warning" />
+          <span className="flex-1">The source body changed upstream. Update to overwrite the local body, or dismiss to keep yours.</span>
+          <button
+            type="button"
+            className="px-2 py-0.5 rounded text-white bg-[var(--nim-primary)] hover:opacity-90 disabled:opacity-50"
+            disabled={bodyBusy}
+            onClick={() => handleBodyAction('applyBody')}
+          >
+            Update body
+          </button>
+          <button
+            type="button"
+            className="px-2 py-0.5 rounded border border-nim text-nim-muted hover:bg-nim-tertiary disabled:opacity-50"
+            disabled={bodyBusy}
+            onClick={() => handleBodyAction('dismissBody')}
+          >
+            Dismiss
+          </button>
+        </div>
+      )}
+
       {/* Content */}
       <div className="flex-1 overflow-y-auto px-4 py-3 space-y-4">
+        {/* Linked Sessions -- kept at the top so they're visible without scrolling */}
+        {(linkedSessions.length > 0 || onLaunchSession || canLinkExistingSession || isLinkingExistingSession) && (
+          <div className="tracker-sessions-section">
+            <div className="flex items-center justify-between mb-1.5">
+              <label className="text-[11px] font-medium text-nim-muted uppercase tracking-[0.5px]">
+                Sessions{linkedSessions.length > 0 ? ` (${linkedSessions.length})` : ''}
+              </label>
+              <div className="flex items-center gap-1">
+                {canLinkExistingSession && (
+                  <button
+                    className="flex items-center gap-1 px-1.5 py-0.5 text-[11px] font-medium rounded text-nim-muted hover:text-nim hover:bg-nim-tertiary transition-colors"
+                    onClick={() => {
+                      setLinkSessionError(null);
+                      setSessionSearchQuery('');
+                      void refreshSessionList();
+                      setIsLinkingExistingSession((prev) => !prev);
+                    }}
+                    title="Link an existing AI session to this item"
+                  >
+                    <MaterialSymbol icon="link" size={14} />
+                    {isLinkingExistingSession ? 'Cancel' : 'Link Existing'}
+                  </button>
+                )}
+                {onLaunchSession && (
+                  <button
+                    className="flex items-center gap-1 px-1.5 py-0.5 text-[11px] font-medium rounded text-nim-muted hover:text-nim hover:bg-nim-tertiary transition-colors"
+                    onClick={() => onLaunchSession(item.id)}
+                    title="Launch a new AI session for this item"
+                  >
+                    <MaterialSymbol icon="add" size={14} />
+                    Launch Session
+                  </button>
+                )}
+              </div>
+            </div>
+            {isLinkingExistingSession && (
+              <div className="tracker-session-linker mb-2 rounded border border-nim bg-nim-tertiary p-2">
+                <input
+                  className="w-full rounded border border-nim bg-nim px-2 py-1.5 text-xs text-nim outline-none focus:border-nim-focus"
+                  type="text"
+                  value={sessionSearchQuery}
+                  onChange={(e) => setSessionSearchQuery(e.target.value)}
+                  placeholder={`Search ${availableSessions.length} existing session${availableSessions.length === 1 ? '' : 's'}`}
+                />
+                <div className="mt-2 space-y-1">
+                  {filteredAvailableSessions.length > 0 ? (
+                    filteredAvailableSessions.map((session) => (
+                      <button
+                        key={session.id}
+                        className="tracker-session-linker-option w-full rounded px-2 py-1.5 text-left hover:bg-nim-hover transition-colors disabled:opacity-60"
+                        onClick={() => handleLinkExistingSession(session.id)}
+                        disabled={linkingSessionId !== null}
+                        title={`Link session: ${session.title || 'Untitled session'}`}
+                      >
+                        <div className="flex items-center gap-2">
+                          <ProviderIcon provider={session.provider || 'claude'} size={14} />
+                          <span className="flex-1 truncate text-xs text-nim">
+                            {session.title || 'Untitled session'}
+                          </span>
+                          <span className="shrink-0 text-[10px] text-nim-faint">
+                            {linkingSessionId === session.id ? 'Linking...' : getRelativeTimeString(session.updatedAt)}
+                          </span>
+                        </div>
+                      </button>
+                    ))
+                  ) : (
+                    <p className="m-0 text-[11px] text-nim-faint">
+                      {availableSessions.length === 0
+                        ? 'No unlinked sessions available.'
+                        : 'No sessions match that search.'}
+                    </p>
+                  )}
+                </div>
+                {linkSessionError && (
+                  <p className="mt-2 mb-0 text-[11px] text-nim-error">{linkSessionError}</p>
+                )}
+              </div>
+            )}
+            {linkedSessions.length > 0 ? (
+              <div className="space-y-1">
+                {linkedSessions.map((session) => (
+                  <button
+                    key={session.id}
+                    className="w-full flex items-center gap-2 px-2 py-1.5 rounded text-left hover:bg-nim-tertiary transition-colors group"
+                    onClick={() => onSwitchToAgentMode?.(session.id)}
+                    title={`Open session: ${session.title}`}
+                  >
+                    <ProviderIcon provider={session.provider || 'claude'} size={14} />
+                    <span className="flex-1 text-xs text-nim truncate">
+                      {session.title || 'Untitled session'}
+                    </span>
+                    <span className="text-[10px] text-nim-faint shrink-0">
+                      {getRelativeTimeString(session.updatedAt)}
+                    </span>
+                  </button>
+                ))}
+              </div>
+            ) : (
+              <p className="text-[11px] text-nim-faint m-0">No linked sessions</p>
+            )}
+          </div>
+        )}
+
         {/* Primary fields grid (status, priority, owner) */}
         {primaryFields.length > 0 && (
-          <div className="grid grid-cols-2 gap-3">
+          <div className="grid grid-cols-2 gap-3 pt-1 border-t border-nim">
             {primaryFields.map((field) => (
               <div key={field.name}>
                 {editable ? (
@@ -780,6 +1443,8 @@ export const TrackerItemDetail: React.FC<TrackerItemDetailProps> = ({
                     value={getFieldValue(field.name)}
                     onChange={(value) => handleFieldChange(field, value)}
                     teamMembers={teamMembers}
+                    relationshipCandidates={isRelationshipField(field) ? buildRelationshipCandidates(field) : undefined}
+                    onOpenRelationship={onOpenItem}
                   />
                 ) : (
                   <ReadOnlyField
@@ -819,6 +1484,8 @@ export const TrackerItemDetail: React.FC<TrackerItemDetailProps> = ({
                     value={getFieldValue(field.name)}
                     onChange={(value) => handleFieldChange(field, value)}
                     teamMembers={teamMembers}
+                    relationshipCandidates={isRelationshipField(field) ? buildRelationshipCandidates(field) : undefined}
+                    onOpenRelationship={onOpenItem}
                   />
                 ) : (
                   <ReadOnlyField
@@ -841,7 +1508,7 @@ export const TrackerItemDetail: React.FC<TrackerItemDetailProps> = ({
               className="tracker-content-editor border border-nim rounded bg-nim min-h-[200px] overflow-hidden"
               data-testid="tracker-detail-content-editor"
             >
-              <NimbalystEditor key={item.id} config={localEditorConfig} />
+              <NimbalystEditor key={`${item.id}-${externalContentEpoch}`} config={localEditorConfig} />
             </div>
           ) : contentMode === 'collaborative' && collabEditorConfig ? (
             <div
@@ -906,49 +1573,6 @@ export const TrackerItemDetail: React.FC<TrackerItemDetailProps> = ({
           )}
         </div>
 
-        {/* Linked Sessions */}
-        {(linkedSessions.length > 0 || onLaunchSession) && (
-          <div className="pt-1 border-t border-nim">
-            <div className="flex items-center justify-between mb-1.5">
-              <label className="text-[11px] font-medium text-nim-muted uppercase tracking-[0.5px]">
-                Sessions{linkedSessions.length > 0 ? ` (${linkedSessions.length})` : ''}
-              </label>
-              {onLaunchSession && (
-                <button
-                  className="flex items-center gap-1 px-1.5 py-0.5 text-[11px] font-medium rounded text-nim-muted hover:text-nim hover:bg-nim-tertiary transition-colors"
-                  onClick={() => onLaunchSession(item.id)}
-                  title="Launch a new AI session for this item"
-                >
-                  <MaterialSymbol icon="add" size={14} />
-                  Launch Session
-                </button>
-              )}
-            </div>
-            {linkedSessions.length > 0 ? (
-              <div className="space-y-1">
-                {linkedSessions.map((session) => (
-                  <button
-                    key={session.id}
-                    className="w-full flex items-center gap-2 px-2 py-1.5 rounded text-left hover:bg-nim-tertiary transition-colors group"
-                    onClick={() => onSwitchToAgentMode?.(session.id)}
-                    title={`Open session: ${session.title}`}
-                  >
-                    <ProviderIcon provider={session.provider || 'claude'} size={14} />
-                    <span className="flex-1 text-xs text-nim truncate">
-                      {session.title || 'Untitled session'}
-                    </span>
-                    <span className="text-[10px] text-nim-faint shrink-0">
-                      {getRelativeTimeString(session.updatedAt)}
-                    </span>
-                  </button>
-                ))}
-              </div>
-            ) : (
-              <p className="text-[11px] text-nim-faint m-0">No linked sessions</p>
-            )}
-          </div>
-        )}
-
         {/* Linked Commits */}
         {item.system.linkedCommits && item.system.linkedCommits.length > 0 && (
           <div className="pt-1 border-t border-nim">
@@ -990,6 +1614,9 @@ export const TrackerItemDetail: React.FC<TrackerItemDetailProps> = ({
             </div>
           </div>
         )}
+
+        {/* Linked From (incoming relationships, Epic C Phase 2) */}
+        <BacklinksSection itemId={item.id} onOpenItem={onOpenItem} />
 
         {/* Comments section */}
         {item.source !== 'inline' && item.source !== 'frontmatter' && (
@@ -1146,12 +1773,110 @@ const ReadOnlyField: React.FC<{ field: FieldDefinition; value: any }> = ({ field
   );
 };
 
+/**
+ * "Linked From" — incoming relationships (Epic C Phase 2). Reads the derived
+ * tracker_relationship_index via IPC; resolves each source item's display from
+ * the loaded items map. Hidden when there are no backlinks.
+ */
+interface Backlink { sourceItemId: string; sourceFieldId: string; relationshipTypeKey?: string | null }
+
+const BacklinksSection: React.FC<{ itemId: string; onOpenItem?: (itemId: string) => void }> = ({ itemId, onOpenItem }) => {
+  const [backlinks, setBacklinks] = useState<Backlink[]>([]);
+  const itemsMap = useAtomValue(trackerItemsMapAtom);
+
+  useEffect(() => {
+    let cancelled = false;
+    window.electronAPI
+      .invoke('document-service:tracker-item-backlinks', { itemId })
+      .then((res: any) => {
+        if (cancelled) return;
+        setBacklinks(res?.success && Array.isArray(res.backlinks) ? res.backlinks : []);
+      })
+      .catch(() => { if (!cancelled) setBacklinks([]); });
+    return () => { cancelled = true; };
+  }, [itemId]);
+
+  if (backlinks.length === 0) return null;
+
+  return (
+    <div className="space-y-2 tracker-backlinks">
+      <h4 className="text-xs font-medium text-nim-muted uppercase tracking-wide">Linked from</h4>
+      <div className="flex flex-wrap gap-1">
+        {backlinks.map((b) => {
+          const src = itemsMap.get(b.sourceItemId);
+          const label = src?.issueKey || (src ? getRecordTitle(src) : undefined) || b.sourceItemId;
+          // Show the inverse direction: if the source links to us via "depends-on",
+          // we are what it "blocks". Falls back to the forward label.
+          const rel = resolveRelationshipType(b.relationshipTypeKey ?? undefined);
+          const relLabel = rel?.inverseDisplayName ?? rel?.displayName ?? b.relationshipTypeKey ?? 'links to';
+          return (
+            <button
+              key={`${b.sourceItemId}:${b.sourceFieldId}`}
+              type="button"
+              className="tracker-backlink-pill inline-flex items-center gap-1 rounded-full bg-nim-tertiary px-2 py-0.5 text-[11px] text-nim hover:bg-nim-hover disabled:cursor-default"
+              title={`${label} — ${relLabel}`}
+              disabled={!onOpenItem}
+              onClick={() => onOpenItem?.(b.sourceItemId)}
+            >
+              <span className="text-nim-faint">{relLabel}:</span>
+              {label}
+            </button>
+          );
+        })}
+      </div>
+    </div>
+  );
+};
+
 /** Inline comments section for tracker items */
 const CommentsSection: React.FC<{ itemId: string; comments?: any[] }> = ({ itemId, comments }) => {
   const [newComment, setNewComment] = useState('');
   const [submitting, setSubmitting] = useState(false);
   // Optimistic comments shown immediately on submit, before the atom round-trips
   const [optimisticComments, setOptimisticComments] = useState<any[]>([]);
+  // Current user identity, used to gate edit/delete to the comment author (NIM-360).
+  const [currentIdentity, setCurrentIdentity] = useState<TrackerIdentity | null>(null);
+  const [editingId, setEditingId] = useState<string | null>(null);
+  const [editBody, setEditBody] = useState('');
+
+  useEffect(() => {
+    let cancelled = false;
+    window.electronAPI
+      .invoke('document-service:get-current-identity')
+      .then((result: any) => {
+        if (cancelled) return;
+        if (result?.success && result.identity) setCurrentIdentity(result.identity);
+      })
+      .catch(() => {});
+    return () => { cancelled = true; };
+  }, []);
+
+  const handleEditSave = useCallback(async (commentId: string) => {
+    const body = editBody.trim();
+    if (!body) return;
+    setEditingId(null);
+    try {
+      await window.electronAPI.invoke('document-service:tracker-item-update-comment', {
+        itemId,
+        commentId,
+        body,
+      });
+    } catch (err) {
+      console.error('Failed to edit comment:', err);
+    }
+  }, [itemId, editBody]);
+
+  const handleDelete = useCallback(async (commentId: string) => {
+    try {
+      await window.electronAPI.invoke('document-service:tracker-item-update-comment', {
+        itemId,
+        commentId,
+        deleted: true,
+      });
+    } catch (err) {
+      console.error('Failed to delete comment:', err);
+    }
+  }, [itemId]);
 
   // When server-side comments arrive (atom update), clear optimistic entries
   // that are now present in the real data.
@@ -1200,16 +1925,68 @@ const CommentsSection: React.FC<{ itemId: string; comments?: any[] }> = ({ itemI
 
   return (
     <div className="space-y-2">
-      {visibleComments.map((comment: any) => (
-        <div key={comment.id} className={`rounded bg-nim-tertiary p-2 space-y-1${comment._optimistic ? ' opacity-70' : ''}`}>
-          <div className="flex items-center gap-2 text-[11px]">
-            <span className="font-medium text-nim-muted">{comment.authorIdentity?.displayName || 'You'}</span>
-            <span className="text-nim-faint">{getRelativeTimeString(comment.createdAt)}</span>
-            {comment.updatedAt && <span className="text-nim-faint">(edited)</span>}
+      {visibleComments.map((comment: any) => {
+        const isAuthor = !comment._optimistic
+          && isSameIdentity(comment.authorIdentity ?? null, currentIdentity);
+        const isEditing = editingId === comment.id;
+        return (
+          <div key={comment.id} className={`tracker-comment group rounded bg-nim-tertiary p-2 space-y-1${comment._optimistic ? ' opacity-70' : ''}`}>
+            <div className="flex items-center gap-2 text-[11px]">
+              <span className="font-medium text-nim-muted">{comment.authorIdentity?.displayName || 'You'}</span>
+              <span className="text-nim-faint">{getRelativeTimeString(comment.createdAt)}</span>
+              {comment.updatedAt && <span className="text-nim-faint">(edited)</span>}
+              {isAuthor && !isEditing && (
+                <span className="ml-auto flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
+                  <button
+                    className="tracker-comment-edit text-nim-faint hover:text-nim"
+                    title="Edit comment"
+                    onClick={() => { setEditingId(comment.id); setEditBody(comment.body); }}
+                  >
+                    <MaterialSymbol icon="edit" size={13} />
+                  </button>
+                  <button
+                    className="tracker-comment-delete text-nim-faint hover:text-nim-error"
+                    title="Delete comment"
+                    onClick={() => handleDelete(comment.id)}
+                  >
+                    <MaterialSymbol icon="delete" size={13} />
+                  </button>
+                </span>
+              )}
+            </div>
+            {isEditing ? (
+              <div className="flex gap-1">
+                <input
+                  type="text"
+                  value={editBody}
+                  autoFocus
+                  onChange={e => setEditBody(e.target.value)}
+                  onKeyDown={e => {
+                    if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); handleEditSave(comment.id); }
+                    if (e.key === 'Escape') { setEditingId(null); }
+                  }}
+                  className="flex-1 bg-nim-secondary border border-nim rounded px-2 py-1 text-xs text-nim outline-none focus:border-nim-primary"
+                />
+                <button
+                  onClick={() => handleEditSave(comment.id)}
+                  disabled={!editBody.trim()}
+                  className="px-2 py-1 rounded text-xs bg-nim-primary text-nim-on-primary disabled:opacity-40"
+                >
+                  Save
+                </button>
+                <button
+                  onClick={() => setEditingId(null)}
+                  className="px-2 py-1 rounded text-xs text-nim-muted hover:text-nim"
+                >
+                  Cancel
+                </button>
+              </div>
+            ) : (
+              <p className="text-xs text-nim m-0 whitespace-pre-wrap">{comment.body}</p>
+            )}
           </div>
-          <p className="text-xs text-nim m-0 whitespace-pre-wrap">{comment.body}</p>
-        </div>
-      ))}
+        );
+      })}
       <div className="flex gap-1">
         <input
           type="text"
@@ -1222,7 +1999,7 @@ const CommentsSection: React.FC<{ itemId: string; comments?: any[] }> = ({ itemI
         <button
           onClick={handleSubmit}
           disabled={!newComment.trim() || submitting}
-          className="px-2 py-1 rounded text-xs bg-nim-primary text-white disabled:opacity-40 hover:opacity-90 transition-opacity"
+          className="px-2 py-1 rounded text-xs bg-nim-primary text-nim-on-primary disabled:opacity-40 hover:opacity-90 transition-opacity"
         >
           Post
         </button>

@@ -38,6 +38,11 @@ import {
 import { $getDiffState, OriginalMarkdownState } from '../plugins/DiffPlugin/core/DiffState';
 import { $getState } from 'lexical';
 
+type UnclosedFormatTag = {
+  format: TextFormatType;
+  tag: string;
+};
+
 /**
  * Options for enhanced markdown export.
  */
@@ -68,12 +73,17 @@ export function $convertToEnhancedMarkdownString(
     rejectMode = false
   } = options;
 
-  // Get the markdown content
+  // Get the markdown content. We always go through the custom export path
+  // because exportTextFormat encodes literal `*`/`_` adjacent to emphasis as
+  // HTML numeric character references rather than backslash escapes; that
+  // form survives upstream's CommonMark emphasis scanner on re-import,
+  // whereas upstream's own escape-based exporter does not. Single-node
+  // export and rejectMode still need the custom path for unrelated reasons.
   const markdownContent = $convertNodeToEnhancedMarkdownString(
     transformers,
-    null,
+    $getRoot(),
     shouldPreserveNewLines,
-    rejectMode
+    rejectMode,
   );
 
   // Add frontmatter if requested and available
@@ -156,21 +166,18 @@ export function $convertSelectionToEnhancedMarkdownString(
   const exportMarkdown = createEnhancedMarkdownExport(
     transformers,
     shouldPreserveNewLines,
-    null, // No selection filtering - we're exporting specific nodes
+    null,
   );
 
-  // Export each selected node
   const output: string[] = [];
   const processedNodes = new Set<string>();
 
   for (const node of nodes) {
-    // Get the top-level element parent (paragraph, heading, etc.)
     let exportNode = node;
     while (exportNode.getParent() && !$isRootOrShadowRoot(exportNode.getParent()!)) {
       exportNode = exportNode.getParent()!;
     }
 
-    // Avoid duplicates
     const key = exportNode.getKey();
     if (processedNodes.has(key)) {
       continue;
@@ -183,7 +190,6 @@ export function $convertSelectionToEnhancedMarkdownString(
     }
   }
 
-  // Always join with single newline - preserves exact spacing including multiple blank lines
   return output.join('\n');
 }
 
@@ -350,9 +356,13 @@ function exportChildren(
   elementTransformers?: Array<ElementTransformer | MultilineElementTransformer>,
   selection: any = null,
   rejectMode: boolean = false,
+  unclosedTags?: Array<UnclosedFormatTag>,
+  unclosableTags?: Array<UnclosedFormatTag>,
 ): string {
   const output = [];
   const children = node.getChildren();
+  const activeUnclosedTags = unclosedTags ?? [];
+  const activeUnclosableTags = unclosableTags ?? [];
 
   mainLoop: for (const child of children) {
     const diffState = $getDiffState(child);
@@ -389,11 +399,13 @@ function exportChildren(
         let handled = false;
 
         if (hasFormatting) {
-          // Use a simplified version of Lexical's exportTextFormat
           const formattedText = exportTextFormat(
             child,
             textContentForTransform,
             textFormatTransformers,
+            activeUnclosedTags,
+            activeUnclosableTags,
+            shouldPreserveNewLines,
           );
           output.push(formattedText);
           handled = true;
@@ -415,8 +427,22 @@ function exportChildren(
                   shouldPreserveNewLines,
                   elementTransformers,
                   selection,
+                  rejectMode,
+                  activeUnclosedTags,
+                  [
+                    ...activeUnclosableTags,
+                    ...activeUnclosedTags,
+                  ],
                 ),
-              (node: TextNode, textContent: string) => textContent,
+              (node: TextNode, textContent: string) =>
+                exportTextFormat(
+                  node,
+                  textContent,
+                  textFormatTransformers,
+                  activeUnclosedTags,
+                  activeUnclosableTags,
+                  shouldPreserveNewLines,
+                ),
             );
 
             if (result != null) {
@@ -451,8 +477,21 @@ function exportChildren(
               elementTransformers,
               selection,
               rejectMode,
+              activeUnclosedTags,
+              [
+                ...activeUnclosableTags,
+                ...activeUnclosedTags,
+              ],
             ),
-          (node: TextNode, textContent: string) => textContent,
+          (node: TextNode, textContent: string) =>
+            exportTextFormat(
+              node,
+              textContent,
+              textFormatTransformers,
+              activeUnclosedTags,
+              activeUnclosableTags,
+              shouldPreserveNewLines,
+            ),
         );
 
         if (result != null) {
@@ -496,8 +535,22 @@ function exportChildren(
               shouldPreserveNewLines,
               elementTransformers,
               selection,
+              rejectMode,
+              activeUnclosedTags,
+              [
+                ...activeUnclosableTags,
+                ...activeUnclosedTags,
+              ],
             ),
-          (node: TextNode, textContent: string) => textContent,
+          (node: TextNode, textContent: string) =>
+            exportTextFormat(
+              node,
+              textContent,
+              textFormatTransformers,
+              activeUnclosedTags,
+              activeUnclosableTags,
+              shouldPreserveNewLines,
+            ),
         );
 
         if (result != null) {
@@ -533,45 +586,114 @@ function exportTextFormat(
   node: TextNode,
   textContent: string,
   textTransformers: Array<TextFormatTransformer>,
+  unclosedTags: Array<UnclosedFormatTag>,
+  unclosableTags: Array<UnclosedFormatTag>,
+  shouldPreserveNewLines: boolean = false,
 ): string {
-  // Simplified version of Lexical's exportTextFormat
-  // We don't track unclosed tags across siblings since we're exporting individual nodes
-
   let output = textContent;
 
-  // If node has no format, return original text
-  if (node.getFormat() === 0) {
-    return output;
-  }
-
-  // Don't escape markdown characters if this is code
   if (!node.hasFormat('code')) {
-    output = output.replace(/([*_`~\\])/g, '\\$1');
+    if (shouldPreserveNewLines) {
+      // Use HTML numeric character references for emphasis-relevant punctuation
+      // (`*` and `_`) rather than backslash escapes. Upstream Lexical's
+      // CommonMark emphasis scanner classifies `\` as non-punctuation, so a
+      // backslash escape next to a delimiter run breaks the flanking check
+      // and the surrounding emphasis fails to re-import. NCRs are inert to
+      // the delimiter scanner and are unescaped back to literal characters
+      // by unescapeText, so a literal `*` adjacent to bold/italic markers
+      // round-trips losslessly.
+      output = output
+        .replace(/\*/g, '&#42;')
+        .replace(/_/g, '&#95;')
+        .replace(/([`~])/g, '\\$1');
+    } else {
+      output = output.replace(/([*_`~\\])/g, '\\$1');
+    }
   }
 
-  // Collect applicable transformers
-  const applied: string[] = [];
+  const match = output.match(/^(\s*)(.*?)(\s*)$/s) || ['', '', output, ''];
+  const leadingSpace = match[1];
+  const trimmedOutput = match[2];
+  const trailingSpace = match[3];
+  const isWhitespaceOnly = trimmedOutput === '';
+
+  let openingTags = '';
+  let closingTagsBefore = '';
+  let closingTagsAfter = '';
+  const previousTextNode = getTextSibling(node, true);
+  const nextTextNode = getTextSibling(node, false);
   const appliedFormats = new Set<TextFormatType>();
 
   for (const transformer of textTransformers) {
-    // Only use single-format transformers for export
-    if (transformer.format.length !== 1) {
-      continue;
-    }
-
     const format = transformer.format[0];
-    // Only apply one transformer per format (e.g., either ** or __ for bold, not both)
-    if (node.hasFormat(format) && !appliedFormats.has(format)) {
+    const tag = transformer.tag;
+
+    if (hasTextFormat(node, format) && !appliedFormats.has(format)) {
       appliedFormats.add(format);
-      applied.push(transformer.tag);
+
+      // Continuity check: use the raw format bit on the previous sibling, not
+      // shouldTrackAsFormattedSibling. The latter treats whitespace-only
+      // siblings as "no format", which conflates two questions: "should we
+      // wrap THIS node in emphasis markers" (whitespace flanking rule), and
+      // "is the format already open going into this node" (continuity).
+      // Filtering whitespace-only siblings here caused duplicate `unclosedTags`
+      // entries when a triple-nested format span ran across a whitespace-only
+      // text node (e.g. `~~strike *italic **bold** text* inside~~`), which
+      // the close loop then popped as extra closing markers, corrupting
+      // emphasis output.
+      if (
+        !hasTextFormat(previousTextNode, format) ||
+        !unclosedTags.find((entry) => entry.tag === tag)
+      ) {
+        unclosedTags.push({ format, tag });
+        openingTags += tag;
+      }
     }
   }
 
-  // Apply tags in order (opening at start, closing at end in reverse)
-  const openingTags = applied.join('');
-  const closingTags = applied.slice().reverse().join('');
+  for (let i = 0; i < unclosedTags.length; i++) {
+    const currentTag = unclosedTags[i];
+    const nodeHasFormat = hasTextFormat(node, currentTag.format);
+    const nextNodeHasFormat = hasTextFormat(nextTextNode, currentTag.format);
 
-  return openingTags + output + closingTags;
+    if (nodeHasFormat && nextNodeHasFormat) {
+      continue;
+    }
+
+    const remainingTags = [...unclosedTags];
+    while (remainingTags.length > i) {
+      const tagToClose = remainingTags.pop();
+      if (
+        tagToClose &&
+        unclosableTags.find((entry) => entry.tag === tagToClose.tag)
+      ) {
+        continue;
+      }
+
+      if (tagToClose) {
+        if (!nodeHasFormat) {
+          closingTagsBefore += tagToClose.tag;
+        } else if (!nextNodeHasFormat) {
+          closingTagsAfter += tagToClose.tag;
+        }
+      }
+      unclosedTags.pop();
+    }
+    break;
+  }
+
+  if (isWhitespaceOnly && !node.hasFormat('code')) {
+    return closingTagsBefore + output;
+  }
+
+  return (
+    closingTagsBefore +
+    leadingSpace +
+    openingTags +
+    trimmedOutput +
+    closingTagsAfter +
+    trailingSpace
+  );
 }
 
 function isEmptyParagraph(node: LexicalNode): boolean {
@@ -621,4 +743,48 @@ function transformersByType(transformers: Array<Transformer>) {
   }
 
   return byType;
+}
+
+function getTextSibling(node: TextNode, backward: boolean): TextNode | null {
+  let sibling = backward ? node.getPreviousSibling() : node.getNextSibling();
+
+  if (!sibling) {
+    const parent = node.getParent();
+    if (parent?.isInline()) {
+      sibling = backward ? parent.getPreviousSibling() : parent.getNextSibling();
+    }
+  }
+
+  while (sibling) {
+    if ($isElementNode(sibling)) {
+      if (!sibling.isInline()) {
+        break;
+      }
+
+      const descendant = backward
+        ? sibling.getLastDescendant()
+        : sibling.getFirstDescendant();
+      if ($isTextNode(descendant)) {
+        return descendant;
+      }
+
+      sibling = backward ? sibling.getPreviousSibling() : sibling.getNextSibling();
+      continue;
+    }
+
+    if ($isTextNode(sibling)) {
+      return sibling;
+    }
+
+    break;
+  }
+
+  return null;
+}
+
+function hasTextFormat(
+  node: LexicalNode | null | undefined,
+  format: TextFormatType,
+): boolean {
+  return $isTextNode(node) && node.hasFormat(format);
 }

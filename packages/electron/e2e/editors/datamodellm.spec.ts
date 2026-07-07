@@ -315,7 +315,7 @@ test('should recognize datamodellm extension and show command in UI suggestions'
   }
 
   // 4. Type "/" in the chat input to trigger the slash command menu
-  const chatInput = page.locator('.ai-chat-input textarea, .chat-input textarea, [data-testid="chat-input"]');
+  const chatInput = page.locator('[data-testid="agent-mode-chat-input"]');
   await chatInput.waitFor({ state: 'visible', timeout: 5000 });
   await chatInput.click();
   await chatInput.fill('/da');

@@ -20,7 +20,13 @@ import { atomFamily } from '../debug/atomFamilyRegistry';
  * Set when ai:error event fires for this session.
  */
 export const sessionErrorAtom = atomFamily((_sessionId: string) =>
-  atom<{ message: string; isAuthError?: boolean; isBedrockToolError?: boolean; isServerError?: boolean } | null>(null)
+  atom<{
+    message: string;
+    isAuthError?: boolean;
+    isBedrockToolError?: boolean;
+    isServerError?: boolean;
+    isCodexAuthRequired?: boolean;
+  } | null>(null)
 );
 
 // Note: ExitPlanMode uses inline widget rendering from tool call data via ExitPlanModeWidget
@@ -49,6 +55,17 @@ export const sessionQueuedPromptsAtom = atomFamily((_sessionId: string) =>
  * Used by code that needs to await stream completion without subscribing to IPC.
  */
 export const streamCompletionSignalAtom = atomFamily((_sessionId: string) =>
+  atom<number>(0)
+);
+
+/**
+ * Per-session transcript-event signal.
+ * Incremented whenever a `transcript:event` IPC event fires for this session.
+ * Components that want to react to transcript activity (e.g. the kanban
+ * transcript peek refetching on new turns) subscribe via useAtomValue rather
+ * than calling window.electronAPI.on directly.
+ */
+export const transcriptEventSignalAtom = atomFamily((_sessionId: string) =>
   atom<number>(0)
 );
 

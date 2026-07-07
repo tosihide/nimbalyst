@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   useFloating, offset, flip, shift, FloatingPortal,
   useDismiss, useInteractions, autoUpdate,
@@ -10,9 +10,9 @@ import { CommitDetailContent, type CommitDetail } from './CommitDetailContent';
 import { BranchPicker } from './BranchPicker';
 import { ChangesTab } from './ChangesTab';
 import { OutputTab } from './OutputTab';
+import { GitStatusBar } from './GitStatusBar';
 import { useOperationLog, getSuggestionForError } from '../hooks/useOperationLog';
-
-type GitTab = 'log' | 'changes' | 'output';
+import { usePanelState, readSelectedHash } from '../hooks/usePanelState';
 
 interface GitCommit {
   hash: string;
@@ -107,6 +107,7 @@ export function GitLogPanel({ host }: PanelHostProps) {
   const [pullMenuOpen, setPullMenuOpen] = useState(false);
   const [actionMessage, setActionMessage] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
+  const [actionErrorCommand, setActionErrorCommand] = useState<string | undefined>(undefined);
   const [isResizing, setIsResizing] = useState(false);
   const [panelHeight, setPanelHeight] = useState(300);
   const resizeStartY = useRef<number>(0);
@@ -125,8 +126,9 @@ export function GitLogPanel({ host }: PanelHostProps) {
   // Context menu state
   const [contextMenu, setContextMenu] = useState<{ commit: GitCommit; x: number; y: number } | null>(null);
 
-  // Selection state
-  const [selectedIndex, setSelectedIndex] = useState<number | null>(null);
+  // Selection state - selected commit is persisted by hash via usePanelState;
+  // selectedIndex is derived from the current commits list so it stays in sync
+  // when commits load, are filtered, or new commits are pulled in.
   const [selectedDetail, setSelectedDetail] = useState<CommitDetail | null>(null);
   const [selectedLoading, setSelectedLoading] = useState(false);
   const tbodyRef = useRef<HTMLTableSectionElement>(null);
@@ -135,8 +137,30 @@ export function GitLogPanel({ host }: PanelHostProps) {
   const [detailWidth, setDetailWidth] = useState(() => host.storage.getGlobal<number>('detailWidth') ?? 340);
   const detailResizeRef = useRef<{ startX: number; startWidth: number } | null>(null);
 
-  // Tab state
-  const [activeTab, setActiveTab] = useState<GitTab>('log');
+  // Tab + selection state (persisted across panel close/open per workspace)
+  const { activeTab, selectedHash, setActiveTab, setSelectedHash } = usePanelState(workspacePath);
+  const selectedIndex = useMemo(() => {
+    if (!selectedHash) return null;
+    const idx = commits.findIndex(c => c.hash === selectedHash);
+    return idx >= 0 ? idx : null;
+  }, [selectedHash, commits]);
+  // Reads the live hash from the module store inside the updater so functional
+  // updates always see the current selection, even when called from handlers
+  // whose closures are otherwise stale.
+  const setSelectedIndex = useCallback(
+    (next: number | null | ((prev: number | null) => number | null)) => {
+      const liveHash = readSelectedHash(workspacePath);
+      const liveIndex = liveHash ? commits.findIndex(c => c.hash === liveHash) : -1;
+      const prev = liveIndex >= 0 ? liveIndex : null;
+      const resolved = typeof next === 'function' ? next(prev) : next;
+      if (resolved === null || !commits[resolved]) {
+        setSelectedHash(null);
+      } else {
+        setSelectedHash(commits[resolved].hash);
+      }
+    },
+    [workspacePath, commits, setSelectedHash],
+  );
   const { entries: logEntries, clearLog, withLog } = useOperationLog();
 
   // Changes tab: file mask filter (active value per-workspace, history shared globally)
@@ -195,19 +219,26 @@ export function GitLogPanel({ host }: PanelHostProps) {
     window.addEventListener('mouseup', onUp);
   }, [detailWidth, host.storage]);
 
-  const showMessage = useCallback((msg: string, isError = false) => {
+  const showMessage = useCallback((msg: string, isError = false, command?: string) => {
     if (isError) {
       setActionError(msg);
+      setActionErrorCommand(command);
       setActionMessage(null);
       // Errors persist until dismissed - do NOT auto-clear
     } else {
       setActionMessage(msg);
       setActionError(null);
+      setActionErrorCommand(undefined);
       // Success messages auto-clear after 4s
       setTimeout(() => {
         setActionMessage(null);
       }, 4000);
     }
+  }, []);
+
+  const dismissError = useCallback(() => {
+    setActionError(null);
+    setActionErrorCommand(undefined);
   }, []);
 
   const loadBranches = useCallback(async () => {
@@ -330,10 +361,10 @@ export function GitLogPanel({ host }: PanelHostProps) {
         loadStatus();
         loadCommits();
       } else {
-        showMessage(result.error || 'Push failed', true);
+        showMessage(result.error || 'Push failed', true, 'git push origin');
       }
     } catch (err) {
-      showMessage(err instanceof Error ? err.message : 'Push failed', true);
+      showMessage(err instanceof Error ? err.message : 'Push failed', true, 'git push origin');
     } finally {
       setActionLoading(null);
     }
@@ -341,9 +372,9 @@ export function GitLogPanel({ host }: PanelHostProps) {
 
   const handlePull = useCallback(async () => {
     setActionLoading('pull');
+    const strategyLabel = pullStrategy === 'rebase' ? ' --rebase' : pullStrategy === 'ff-only' ? ' --ff-only' : '';
     try {
       const opts = pullStrategy === 'rebase' ? { rebase: true } : pullStrategy === 'ff-only' ? { ffOnly: true } : {};
-      const strategyLabel = pullStrategy === 'rebase' ? ' --rebase' : pullStrategy === 'ff-only' ? ' --ff-only' : '';
       const result = await withLog(
         `git pull${strategyLabel} origin`,
         () => ipc.invoke('git:pull', workspacePath, opts) as Promise<PullResult>,
@@ -359,10 +390,10 @@ export function GitLogPanel({ host }: PanelHostProps) {
         loadStatus();
         loadCommits();
       } else {
-        showMessage(result.error || 'Pull failed', true);
+        showMessage(result.error || 'Pull failed', true, `git pull${strategyLabel} origin`);
       }
     } catch (err) {
-      showMessage(err instanceof Error ? err.message : 'Pull failed', true);
+      showMessage(err instanceof Error ? err.message : 'Pull failed', true, `git pull${strategyLabel} origin`);
     } finally {
       setActionLoading(null);
     }
@@ -391,10 +422,10 @@ export function GitLogPanel({ host }: PanelHostProps) {
         showMessage('Fetched successfully');
         loadStatus();
       } else {
-        showMessage(result.error || 'Fetch failed', true);
+        showMessage(result.error || 'Fetch failed', true, 'git fetch origin');
       }
     } catch (err) {
-      showMessage(err instanceof Error ? err.message : 'Fetch failed', true);
+      showMessage(err instanceof Error ? err.message : 'Fetch failed', true, 'git fetch origin');
     } finally {
       setActionLoading(null);
     }
@@ -493,14 +524,14 @@ export function GitLogPanel({ host }: PanelHostProps) {
     } else if (e.key === 'Escape') {
       setSelectedIndex(null);
     }
-  }, [commits.length]);
+  }, [commits.length, setSelectedIndex]);
 
   const handleRowClick = useCallback((index: number) => {
     setSelectedIndex(i => i === index ? null : index);
     // Dismiss hover card on click
     if (showTimerRef.current) { clearTimeout(showTimerRef.current); showTimerRef.current = null; }
     setHoveredHash(null);
-  }, []);
+  }, [setSelectedIndex]);
 
   const remoteStatus = status ? (
     status.ahead > 0 || status.behind > 0
@@ -509,6 +540,8 @@ export function GitLogPanel({ host }: PanelHostProps) {
   ) : '';
 
   const hasChanges = status?.hasUncommitted ?? false;
+  const isDetachedHead = status?.branch === 'HEAD';
+  const detachedHeadMessage = 'Detached HEAD: checkout a branch before pulling or pushing.';
 
   return (
     <div
@@ -560,6 +593,11 @@ export function GitLogPanel({ host }: PanelHostProps) {
               {remoteStatus}
             </span>
           )}
+          {isDetachedHead && (
+            <span className="git-log-remote-status diverged" title={detachedHeadMessage}>
+              detached HEAD
+            </span>
+          )}
         </div>
 
         <div className="git-log-toolbar-actions">
@@ -567,8 +605,8 @@ export function GitLogPanel({ host }: PanelHostProps) {
           <button
             className="git-log-action-btn"
             onClick={handlePush}
-            disabled={!!actionLoading}
-            title="Push"
+            disabled={!!actionLoading || isDetachedHead}
+            title={isDetachedHead ? detachedHeadMessage : 'Push'}
           >
             {actionLoading === 'push' ? '...' : '\u2191 Push'}
           </button>
@@ -576,16 +614,16 @@ export function GitLogPanel({ host }: PanelHostProps) {
             <button
               className="git-log-action-btn git-log-split-btn-main"
               onClick={handlePull}
-              disabled={!!actionLoading}
-              title={`Pull (${pullStrategy})`}
+              disabled={!!actionLoading || isDetachedHead}
+              title={isDetachedHead ? detachedHeadMessage : `Pull (${pullStrategy})`}
             >
               {actionLoading === 'pull' ? '...' : '\u2193 Pull'}
             </button>
             <button
               className="git-log-action-btn git-log-split-btn-arrow"
               onClick={() => setPullMenuOpen(v => !v)}
-              disabled={!!actionLoading}
-              title="Pull strategy"
+              disabled={!!actionLoading || isDetachedHead}
+              title={isDetachedHead ? detachedHeadMessage : 'Pull strategy'}
             >
               {'\u25BE'}
             </button>
@@ -675,28 +713,13 @@ export function GitLogPanel({ host }: PanelHostProps) {
       </div>
 
       {/* Status message (visible on all tabs) */}
-      {(actionMessage || actionError) && (
-        <div className={`git-log-status-bar ${actionError ? 'error' : 'success'}`}>
-          {actionMessage || actionError}
-          {actionError && (
-            <>
-              <button
-                className="git-log-status-details-btn"
-                onClick={() => setActiveTab('output')}
-              >
-                Show Details
-              </button>
-              <button
-                className="git-changes-dismiss-btn"
-                onClick={() => setActionError(null)}
-                title="Dismiss"
-              >
-                &#10005;
-              </button>
-            </>
-          )}
-        </div>
-      )}
+      <GitStatusBar
+        message={actionMessage}
+        error={actionError}
+        errorCommand={actionErrorCommand}
+        onDismissError={dismissError}
+        onShowDetails={() => setActiveTab('output')}
+      />
 
       {/* Context menu (log tab only) */}
       {contextMenu && (
@@ -804,6 +827,8 @@ export function GitLogPanel({ host }: PanelHostProps) {
                 author={commits[selectedIndex].author}
                 date={commits[selectedIndex].date}
                 layout="vertical"
+                workspacePath={workspacePath}
+                commitHash={commits[selectedIndex].hash}
               />
             </div>
           )}

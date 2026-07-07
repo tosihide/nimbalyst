@@ -11,7 +11,7 @@
  */
 
 import type { RawMessage } from '../TranscriptTransformer';
-import type { TranscriptEvent, InteractivePromptPayload, TurnEndedPayload, UserMessagePayload } from '../types';
+import type { TranscriptEvent, InteractivePromptPayload, TurnEndedPayload, UserMessagePayload, PermissionDeniedReasonType } from '../types';
 
 // ---------------------------------------------------------------------------
 // Parse context (provided by the transformer to parsers)
@@ -29,6 +29,16 @@ export interface ParseContext {
    * (e.g. Codex `item_1`) don't collide with events from other sessions.
    */
   findByProviderToolCallId(id: string): Promise<TranscriptEvent | null>;
+  /**
+   * Find the most recent active (running/pending) tool_call event whose
+   * canonical providerToolCallId is either the raw id directly or a Codex
+   * synthetic edit-group ID derived from it (`nimtc|<encoded>|<ts>|<idx>`).
+   *
+   * Used by the Codex parser so a `tool_call_completed` raw message can map
+   * back to the synthetic ID minted when the matching `tool_call_started` was
+   * processed in an earlier batch.
+   */
+  findActiveToolCallByRawProviderId(rawId: string): Promise<TranscriptEvent | null>;
 }
 
 // ---------------------------------------------------------------------------
@@ -38,7 +48,7 @@ export interface ParseContext {
 export interface UserMessageDescriptor {
   type: 'user_message';
   text: string;
-  mode?: 'agent' | 'planning';
+  mode?: 'agent' | 'planning' | 'auto';
   inputType?: 'user' | 'system_message';
   attachments?: UserMessagePayload['attachments'];
   createdAt?: Date;
@@ -47,7 +57,7 @@ export interface UserMessageDescriptor {
 export interface AssistantMessageDescriptor {
   type: 'assistant_message';
   text: string;
-  mode?: 'agent' | 'planning';
+  mode?: 'agent' | 'planning' | 'auto';
   createdAt?: Date;
   /**
    * Extended-thinking output emitted by Claude Code (and other providers)
@@ -66,13 +76,24 @@ export interface AssistantMessageDescriptor {
 export interface SystemMessageDescriptor {
   type: 'system_message';
   text: string;
-  systemType?: 'status' | 'slash_command' | 'error' | 'init';
+  systemType?: 'status' | 'slash_command' | 'error' | 'init' | 'permission_denied';
   searchable?: boolean;
   createdAt?: Date;
   /** Marks an authentication failure so the UI can render the login widget. */
   isAuthError?: boolean;
   /** Classification for system-reminder messages (e.g. `session_naming`). */
   reminderKind?: string;
+  /**
+   * Permission-denied fields. Populated when systemType === 'permission_denied'.
+   * Mirrors `SystemMessagePayload` denied fields. Emitted for the SDK's deny
+   * short-circuit only (deny rules, dontAsk, headless auto-deny, rare
+   * classifier denies) -- the common auto-mode path for destructive tools
+   * escalates to the normal permission prompt, not this event.
+   */
+  deniedToolName?: string;
+  deniedReason?: string;
+  deniedReasonType?: PermissionDeniedReasonType | (string & {});
+  deniedInput?: Record<string, unknown>;
 }
 
 export interface ToolCallStartedDescriptor {

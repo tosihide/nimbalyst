@@ -3,6 +3,7 @@ import type { ReactNode } from 'react';
 import type { NodeKey } from 'lexical';
 import type { Provider } from '@lexical/yjs';
 import type { Doc } from 'yjs';
+import type { CommentsConfig } from './commenting/types';
 
 /**
  * Configuration interface for the Nimbalyst component.
@@ -136,7 +137,15 @@ export interface EditorConfig {
   onImageDragStart?: (src: string, event: DragEvent) => void;
   onUploadAsset?: (file: File) => Promise<UploadedEditorAsset>;
   resolveImageSrc?: (src: string) => Promise<string | null>;
-  onOpenAssetLink?: (href: string) => Promise<void> | void;
+  /**
+   * Fired (debounced) with the list of `collab-asset://` URIs that have
+   * disappeared from the live editor state since the previous scan. Used
+   * by the collab editor to garbage-collect orphaned attachments. The
+   * callback receives only what was *removed*, never the full referenced
+   * set, so it cannot delete still-live attachments referenced only by
+   * other peers.
+   */
+  onAssetReferencesRemoved?: (removedUris: string[]) => void;
 
   // Document header - renders at the top of the editor scroll pane
   documentHeader?: ReactNode;
@@ -164,6 +173,15 @@ export interface EditorConfig {
      */
     initialEditorState?: (() => void) | string;
   };
+
+  /**
+   * When set, enables document comments (text-selection comments via MarkNode
+   * with an `@`-mention picker and a thread side-panel). Only meaningful for a
+   * collaborative document; the host supplies the shared Y.Doc, the current
+   * user, team members, document metadata, and the inbox-fanout callback. See
+   * `commenting/types.ts`.
+   */
+  comments?: CommentsConfig;
 }
 
 export const DEFAULT_EDITOR_CONFIG: EditorConfig = {

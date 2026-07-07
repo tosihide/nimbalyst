@@ -4,6 +4,7 @@ import { MaterialSymbol, createExtensionStorage } from '@nimbalyst/runtime';
 import type { ExtensionManifest, SettingsPanelProps } from '@nimbalyst/runtime';
 import { getExtensionLoader } from '@nimbalyst/runtime';
 import { ExtensionConfigPanel } from './ExtensionConfigPanel';
+import { ExtensionBackendModulesSection } from '../../ExtensionPermissions/ExtensionBackendModulesSection';
 import { useTheme } from '../../../hooks/useTheme';
 import { ToggleSwitch } from '../../GlobalSettings/SettingsToggle';
 
@@ -17,6 +18,7 @@ interface InstalledExtension {
 interface ExtensionSettings {
   enabled: boolean;
   claudePluginEnabled?: boolean;
+  agentWorkflowsEnabled?: boolean;
 }
 
 interface MarketplaceInstallRecord {
@@ -41,6 +43,7 @@ type ExtensionSource = 'marketplace' | 'github' | 'local' | 'built-in';
 interface ExtensionWithState extends InstalledExtension {
   enabled: boolean;
   claudePluginEnabled?: boolean;
+  agentWorkflowsEnabled?: boolean;
   source: ExtensionSource;
   installedAt?: string;
   installRecord?: MarketplaceInstallRecord;
@@ -49,7 +52,7 @@ interface ExtensionWithState extends InstalledExtension {
 }
 
 interface InstalledExtensionsPanelProps {
-  scope: 'user' | 'project';
+  scope: 'user' | 'organization' | 'project';
   workspacePath?: string;
 }
 
@@ -65,11 +68,7 @@ export const InstalledExtensionsPanel: React.FC<InstalledExtensionsPanelProps> =
   const [error, setError] = useState<string | null>(null);
   const [processingId, setProcessingId] = useState<string | null>(null);
   const [selectedId, setSelectedId] = useState<string | null>(null);
-
-  // Claude Code command settings
-  const [projectCommandsEnabled, setProjectCommandsEnabled] = useState(true);
-  const [userCommandsEnabled, setUserCommandsEnabled] = useState(true);
-  const [commandsLoading, setCommandsLoading] = useState(false);
+  const [searchQuery, setSearchQuery] = useState('');
 
   // Get extension settings panels from the loader
   const extensionSettingsPanels = useMemo(() => {
@@ -91,7 +90,6 @@ export const InstalledExtensionsPanel: React.FC<InstalledExtensionsPanelProps> =
   // Load extensions and their enabled state
   useEffect(() => {
     loadExtensions();
-    loadClaudeCodeSettings();
   }, []);
 
   // Auto-select first extension when loaded
@@ -100,48 +98,6 @@ export const InstalledExtensionsPanel: React.FC<InstalledExtensionsPanelProps> =
       setSelectedId(extensions[0].id);
     }
   }, [extensions, selectedId]);
-
-  const loadClaudeCodeSettings = async () => {
-    try {
-      const settings = await window.electronAPI.claudeCode.getSettings();
-      setProjectCommandsEnabled(settings.projectCommandsEnabled);
-      setUserCommandsEnabled(settings.userCommandsEnabled);
-    } catch (err) {
-      console.error('Failed to load Claude Code settings:', err);
-    }
-  };
-
-  const handleProjectCommandsToggle = useCallback(async (enabled: boolean) => {
-    setCommandsLoading(true);
-    try {
-      await window.electronAPI.claudeCode.setProjectCommandsEnabled(enabled);
-      setProjectCommandsEnabled(enabled);
-      posthog?.capture('claude_code_project_commands_toggled', {
-        action: enabled ? 'enabled' : 'disabled',
-      });
-    } catch (err) {
-      console.error('Failed to toggle project commands:', err);
-      setError('Failed to update setting');
-    } finally {
-      setCommandsLoading(false);
-    }
-  }, [posthog]);
-
-  const handleUserCommandsToggle = useCallback(async (enabled: boolean) => {
-    setCommandsLoading(true);
-    try {
-      await window.electronAPI.claudeCode.setUserCommandsEnabled(enabled);
-      setUserCommandsEnabled(enabled);
-      posthog?.capture('claude_code_user_commands_toggled', {
-        action: enabled ? 'enabled' : 'disabled',
-      });
-    } catch (err) {
-      console.error('Failed to toggle user commands:', err);
-      setError('Failed to update setting');
-    } finally {
-      setCommandsLoading(false);
-    }
-  }, [posthog]);
 
   const loadExtensions = async () => {
     try {
@@ -183,6 +139,7 @@ export const InstalledExtensionsPanel: React.FC<InstalledExtensionsPanelProps> =
       const extensionsWithState: ExtensionWithState[] = installed.map(ext => {
         const extSettings = settings[ext.id];
         const claudePlugin = ext.manifest.contributions?.claudePlugin;
+        const agentWorkflows = ext.manifest.contributions?.agentWorkflows;
         const installRecord = installRecords[ext.id];
         const source: ExtensionSource = ext.isBuiltin
           ? 'built-in'
@@ -193,8 +150,9 @@ export const InstalledExtensionsPanel: React.FC<InstalledExtensionsPanelProps> =
               : 'local';
         return {
           ...ext,
-          enabled: extSettings?.enabled ?? true,
+          enabled: extSettings?.enabled ?? (ext.manifest.defaultEnabled !== false),
           claudePluginEnabled: extSettings?.claudePluginEnabled ?? claudePlugin?.enabledByDefault ?? true,
+          agentWorkflowsEnabled: extSettings?.agentWorkflowsEnabled ?? agentWorkflows?.enabledByDefault ?? true,
           source,
           installedAt: installRecord?.installedAt,
           installRecord,
@@ -216,7 +174,7 @@ export const InstalledExtensionsPanel: React.FC<InstalledExtensionsPanelProps> =
     }
   };
 
-  const handleToggle = useCallback(async (extensionId: string, enabled: boolean) => {
+  const handleToggle = useCallback(async (extensionId: string, enabled: boolean, extensionPath?: string) => {
     setProcessingId(extensionId);
     setError(null);
 
@@ -227,7 +185,17 @@ export const InstalledExtensionsPanel: React.FC<InstalledExtensionsPanelProps> =
       // Update runtime state in ExtensionLoader
       const loader = getExtensionLoader();
       if (enabled) {
-        loader.enableExtension(extensionId);
+        // enableExtension only flips a flag on an already-loaded extension.
+        // If it was skipped at startup (e.g. defaultEnabled: false), it isn't
+        // loaded yet, so load it from disk now to register its panels/editors.
+        if (loader.getExtension(extensionId) || !extensionPath) {
+          loader.enableExtension(extensionId);
+        } else {
+          const result = await loader.loadExtensionFromPath(extensionPath);
+          if (!result.success) {
+            throw new Error(result.error || `Failed to load extension ${extensionId}`);
+          }
+        }
       } else {
         loader.disableExtension(extensionId);
       }
@@ -274,6 +242,23 @@ export const InstalledExtensionsPanel: React.FC<InstalledExtensionsPanelProps> =
       setProcessingId(null);
     }
   }, [posthog]);
+
+  const handleAgentWorkflowsToggle = useCallback(async (extensionId: string, enabled: boolean) => {
+    setProcessingId(extensionId);
+    setError(null);
+
+    try {
+      await window.electronAPI.extensions.setAgentWorkflowsEnabled(extensionId, enabled);
+      setExtensions(prev => prev.map(ext =>
+        ext.id === extensionId ? { ...ext, agentWorkflowsEnabled: enabled } : ext
+      ));
+    } catch (err) {
+      console.error(`Failed to ${enabled ? 'enable' : 'disable'} agent workflows:`, err);
+      setError(err instanceof Error ? err.message : `Failed to ${enabled ? 'enable' : 'disable'} agent workflows`);
+    } finally {
+      setProcessingId(null);
+    }
+  }, []);
 
   const handleUpdate = useCallback(async (ext: ExtensionWithState) => {
     if (!ext.registryEntry || !ext.availableUpdate) return;
@@ -334,6 +319,18 @@ export const InstalledExtensionsPanel: React.FC<InstalledExtensionsPanelProps> =
   const totalCount = extensions.length;
   const updateCount = extensions.filter(ext => ext.availableUpdate && ext.registryEntry).length;
 
+  const filteredExtensions = useMemo(() => {
+    const q = searchQuery.trim().toLowerCase();
+    if (!q) return extensions;
+    return extensions.filter((ext) => {
+      const name = ext.manifest.name?.toLowerCase() ?? '';
+      const author = ext.manifest.author?.toLowerCase() ?? '';
+      const description = ext.manifest.description?.toLowerCase() ?? '';
+      const id = ext.id.toLowerCase();
+      return name.includes(q) || author.includes(q) || description.includes(q) || id.includes(q);
+    });
+  }, [extensions, searchQuery]);
+
   const sourceLabel = (s: ExtensionSource) => {
     switch (s) {
       case 'marketplace': return 'Marketplace';
@@ -354,7 +351,11 @@ export const InstalledExtensionsPanel: React.FC<InstalledExtensionsPanelProps> =
 
   if (loading) {
     return (
-      <div className="provider-panel">
+      <div
+        className="installed-extensions-panel provider-panel"
+        data-testid="installed-extensions-panel"
+        data-component="InstalledExtensionsPanel"
+      >
         <div className="flex items-center justify-center py-12 text-[var(--nim-text-muted)]">
           <p>Loading extensions...</p>
         </div>
@@ -363,7 +364,12 @@ export const InstalledExtensionsPanel: React.FC<InstalledExtensionsPanelProps> =
   }
 
   return (
-    <div className="provider-panel flex flex-col absolute inset-0 p-6">
+    <div
+      className="installed-extensions-panel provider-panel flex flex-col absolute inset-0 p-6"
+      data-testid="installed-extensions-panel"
+      data-component="InstalledExtensionsPanel"
+      data-source="packages/electron/src/renderer/components/Settings/panels/InstalledExtensionsPanel.tsx"
+    >
       {/* Header */}
       <div className="provider-panel-header mb-5 pb-4 border-b border-[var(--nim-border)] flex-shrink-0">
         <h3 className="provider-panel-title text-xl font-semibold leading-tight mb-2 text-[var(--nim-text)]">Installed Extensions</h3>
@@ -376,43 +382,6 @@ export const InstalledExtensionsPanel: React.FC<InstalledExtensionsPanelProps> =
           <span>{error}</span>
         </div>
       )}
-
-      {/* Claude Code Commands Section - Compact horizontal layout */}
-      {/*<div className="mb-5 pb-4 border-b border-[var(--nim-border)]">*/}
-      {/*  <h4 className="text-sm font-semibold mb-3 text-[var(--nim-text)]">Claude Code Commands</h4>*/}
-      {/*  <div className="flex gap-3">*/}
-      {/*    <div className="flex-1 flex items-center justify-between p-3 rounded-lg bg-[var(--nim-bg-secondary)] border border-[var(--nim-border)]">*/}
-      {/*      <div className="flex items-center gap-2">*/}
-      {/*        <span className="material-symbols-outlined text-base text-[var(--nim-text-muted)]">folder</span>*/}
-      {/*        <span className="text-sm font-medium text-[var(--nim-text)]">Project Commands</span>*/}
-      {/*      </div>*/}
-      {/*      <label className="provider-toggle">*/}
-      {/*        <input*/}
-      {/*          type="checkbox"*/}
-      {/*          checked={projectCommandsEnabled}*/}
-      {/*          onChange={(e) => handleProjectCommandsToggle(e.target.checked)}*/}
-      {/*          disabled={commandsLoading}*/}
-      {/*        />*/}
-      {/*        <span className="provider-toggle-slider"></span>*/}
-      {/*      </label>*/}
-      {/*    </div>*/}
-      {/*    <div className="flex-1 flex items-center justify-between p-3 rounded-lg bg-[var(--nim-bg-secondary)] border border-[var(--nim-border)]">*/}
-      {/*      <div className="flex items-center gap-2">*/}
-      {/*        <span className="material-symbols-outlined text-base text-[var(--nim-text-muted)]">person</span>*/}
-      {/*        <span className="text-sm font-medium text-[var(--nim-text)]">User Commands</span>*/}
-      {/*      </div>*/}
-      {/*      <label className="provider-toggle">*/}
-      {/*        <input*/}
-      {/*          type="checkbox"*/}
-      {/*          checked={userCommandsEnabled}*/}
-      {/*          onChange={(e) => handleUserCommandsToggle(e.target.checked)}*/}
-      {/*          disabled={commandsLoading}*/}
-      {/*        />*/}
-      {/*        <span className="provider-toggle-slider"></span>*/}
-      {/*      </label>*/}
-      {/*    </div>*/}
-      {/*  </div>*/}
-      {/*</div>*/}
 
       {totalCount === 0 ? (
         <div className="flex flex-col items-center justify-center py-12 text-center text-[var(--nim-text-muted)]">
@@ -437,8 +406,41 @@ export const InstalledExtensionsPanel: React.FC<InstalledExtensionsPanelProps> =
                 )}
               </span>
             </div>
+            <div className="px-2 py-2 border-b border-[var(--nim-border)] flex-shrink-0">
+              <div className="relative" role="search">
+                <MaterialSymbol
+                  icon="search"
+                  size={16}
+                  className="absolute left-2.5 top-1/2 -translate-y-1/2 text-[var(--nim-text-faint)] pointer-events-none"
+                />
+                <input
+                  type="text"
+                  value={searchQuery}
+                  onChange={(e) => setSearchQuery(e.target.value)}
+                  placeholder="Search extensions..."
+                  aria-label="Search installed extensions"
+                  data-testid="installed-extensions-search"
+                  className="w-full py-1.5 pl-8 pr-7 rounded border border-[var(--nim-border)] bg-[var(--nim-bg)] text-[var(--nim-text)] text-sm outline-none focus:border-[var(--nim-primary)] placeholder:text-[var(--nim-text-faint)]"
+                />
+                {searchQuery && (
+                  <button
+                    type="button"
+                    aria-label="Clear search"
+                    data-testid="installed-extensions-search-clear"
+                    className="absolute right-2 top-1/2 -translate-y-1/2 flex items-center justify-center text-[var(--nim-text-muted)] hover:text-[var(--nim-text)]"
+                    onClick={() => setSearchQuery('')}
+                  >
+                    <MaterialSymbol icon="close" size={16} />
+                  </button>
+                )}
+              </div>
+            </div>
             <div className="flex-1 overflow-y-auto min-h-0">
-              {extensions.map((ext) => (
+              {filteredExtensions.length === 0 ? (
+                <div className="px-3 py-6 text-center text-xs text-[var(--nim-text-faint)]">
+                  No extensions match &ldquo;{searchQuery}&rdquo;
+                </div>
+              ) : filteredExtensions.map((ext) => (
                 <div
                   key={ext.id}
                   className={`flex items-center gap-2.5 px-3 py-2.5 cursor-pointer border-b border-[var(--nim-border)] transition-colors ${
@@ -465,7 +467,7 @@ export const InstalledExtensionsPanel: React.FC<InstalledExtensionsPanelProps> =
                   <span className="flex-shrink-0" onClick={(e) => e.stopPropagation()}>
                     <ToggleSwitch
                       checked={ext.enabled}
-                      onChange={(checked) => handleToggle(ext.id, checked)}
+                      onChange={(checked) => handleToggle(ext.id, checked, ext.path)}
                       disabled={processingId === ext.id}
                     />
                   </span>
@@ -561,6 +563,16 @@ export const InstalledExtensionsPanel: React.FC<InstalledExtensionsPanelProps> =
                       </div>
                   )}
 
+                  {/* Privileged backend modules (Phase 4) */}
+                  {Array.isArray(selectedExtension.manifest.contributions?.backendModules) &&
+                    selectedExtension.manifest.contributions!.backendModules!.length > 0 && (
+                      <ExtensionBackendModulesSection
+                        extensionId={selectedExtension.id}
+                        modules={selectedExtension.manifest.contributions!.backendModules!}
+                        workspacePath={workspacePath}
+                      />
+                    )}
+
                   {/* Claude Plugin */}
                   {selectedExtension.manifest.contributions?.claudePlugin && (
                     <div className="mb-5">
@@ -592,6 +604,33 @@ export const InstalledExtensionsPanel: React.FC<InstalledExtensionsPanelProps> =
                         {!selectedExtension.enabled && (
                           <div className="mt-2 text-xs text-[var(--nim-text-faint)] italic">
                             Enable the extension to use this plugin
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                  )}
+
+                  {selectedExtension.manifest.contributions?.agentWorkflows && (
+                    <div className="mb-5">
+                      <div className="text-xs font-semibold text-[var(--nim-text-muted)] uppercase tracking-wide mb-2.5">Agent Workflows</div>
+                      <div className="bg-[var(--nim-bg)] border border-[var(--nim-border)] rounded-md p-3">
+                        <div className="flex items-center justify-between mb-2">
+                          <div className="flex items-center gap-1.5 text-xs font-medium text-[var(--nim-text)]">
+                            <span className="material-symbols-outlined text-base text-[var(--nim-primary)]">hub</span>
+                            {selectedExtension.manifest.contributions.agentWorkflows.displayName || 'Agent Workflows'}
+                          </div>
+                          <ToggleSwitch
+                            checked={selectedExtension.agentWorkflowsEnabled ?? true}
+                            onChange={(checked) => handleAgentWorkflowsToggle(selectedExtension.id, checked)}
+                            disabled={processingId === selectedExtension.id || !selectedExtension.enabled}
+                          />
+                        </div>
+                        <div className="text-xs text-[var(--nim-text-muted)]">
+                          {selectedExtension.manifest.contributions.agentWorkflows.description || 'Provider-neutral workflows exported to Claude Code and Codex.'}
+                        </div>
+                        {!selectedExtension.enabled && (
+                          <div className="mt-2 text-xs text-[var(--nim-text-faint)] italic">
+                            Enable the extension to use these workflows
                           </div>
                         )}
                       </div>
@@ -640,6 +679,12 @@ export const InstalledExtensionsPanel: React.FC<InstalledExtensionsPanelProps> =
                             /{cmd.title}
                           </span>
                         ))}
+                        {selectedExtension.manifest.contributions.agentWorkflows && (
+                          <span className="inline-flex items-center gap-1 px-2 py-1 rounded text-xs bg-[var(--nim-bg-tertiary)] text-[var(--nim-text-muted)]">
+                            <span className="material-symbols-outlined text-sm">hub</span>
+                            {selectedExtension.manifest.contributions.agentWorkflows.displayName}
+                          </span>
+                        )}
                         {selectedExtension.manifest.contributions.nodes?.map((node, idx) => (
                           <span key={`node-${idx}`} className="inline-flex items-center gap-1 px-2 py-1 rounded text-xs bg-[var(--nim-bg-tertiary)] text-[var(--nim-text-muted)]">
                             <span className="material-symbols-outlined text-sm">widgets</span>
@@ -681,9 +726,20 @@ export const InstalledExtensionsPanel: React.FC<InstalledExtensionsPanelProps> =
                   {selectedExtension.enabled && extensionSettingsPanels.has(selectedExtension.id) && (() => {
                     const SettingsComponent = extensionSettingsPanels.get(selectedExtension.id)!;
                     const storage = createExtensionStorage(selectedExtension.id);
+                    // READ bridge to the extension's backend-module MCP tools
+                    // (e.g. live index status, facts list). The IPC handler
+                    // resolves the active workspace from this window.
+                    const callBackendTool = (toolName: string, args?: Record<string, unknown>) =>
+                      window.electronAPI.invoke('extensions:ai-call-backend-tool', {
+                        toolName,
+                        args: args ?? {},
+                        // Host-injected caller identity (not from extension code)
+                        // so main can enforce the tool belongs to THIS extension.
+                        callerExtensionId: selectedExtension.id,
+                      });
                     return (
                       <div className="pt-4 border-t border-[var(--nim-border)]">
-                        <SettingsComponent storage={storage} theme={theme} />
+                        <SettingsComponent storage={storage} theme={theme} callBackendTool={callBackendTool} />
                       </div>
                     );
                   })()}

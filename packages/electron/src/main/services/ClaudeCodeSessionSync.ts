@@ -8,10 +8,11 @@
 import * as fs from 'fs/promises';
 import * as path from 'path';
 import { homedir } from 'os';
-import type { SessionStore } from '@nimbalyst/runtime';
+import { type SessionStore, slimClaudeCodeChunkForStorage } from '@nimbalyst/runtime';
 import type { AgentMessagesStore } from '@nimbalyst/runtime/storage/repositories/AgentMessagesRepository';
+import { DEFAULT_MODELS } from '@nimbalyst/runtime/ai/modelConstants';
 import { logger } from '../utils/logger';
-import { extractSessionMetadata, type ClaudeCodeEntry, type SessionMetadata } from './ClaudeCodeSessionScanner';
+import { encodeWorkspaceDir, extractSessionMetadata, type ClaudeCodeEntry, type SessionMetadata } from './ClaudeCodeSessionScanner';
 
 const log = logger.aiSession;
 
@@ -35,11 +36,12 @@ function projectsDir(): string {
 }
 
 /**
- * Get the full path to a session JSONL file
+ * Get the full path to a session JSONL file. Must use the same encoder as
+ * the scanner -- otherwise the importer reads from a different directory
+ * than the one the scanner found and every sync fails with ENOENT.
  */
 function getSessionFilePath(workspacePath: string, sessionId: string): string {
-  const escapedPath = workspacePath.replace(/\//g, '-');
-  return path.join(projectsDir(), escapedPath, `${sessionId}.jsonl`);
+  return path.join(projectsDir(), encodeWorkspaceDir(workspacePath), `${sessionId}.jsonl`);
 }
 
 /**
@@ -47,8 +49,7 @@ function getSessionFilePath(workspacePath: string, sessionId: string): string {
  * tool results. Lives next to the main `<sessionId>.jsonl`.
  */
 function getSessionSidecarDir(workspacePath: string, sessionId: string): string {
-  const escapedPath = workspacePath.replace(/\//g, '-');
-  return path.join(projectsDir(), escapedPath, sessionId);
+  return path.join(projectsDir(), encodeWorkspaceDir(workspacePath), sessionId);
 }
 
 interface SubagentSidecar {
@@ -214,6 +215,28 @@ async function loadPersistedOutput(text: string): Promise<string | null> {
 }
 
 /**
+ * Map a Claude Code session's per-turn model id to a claude-code variant.
+ *
+ * Claude Code JSONL records the model on each assistant entry (e.g.
+ * "claude-opus-4-7", new in 2.1.x). Imports previously stored no model at all,
+ * so the renderer fell back to a hardcoded `claude-code:sonnet` and every
+ * imported session showed Sonnet regardless of the model actually used (#394).
+ * Walk the entries newest-first and return the most recent recognisable model
+ * as a `claude-code:<variant>` string; undefined when none carry a model.
+ */
+export function importedClaudeCodeModel(entries: ClaudeCodeEntry[]): string | undefined {
+  for (let i = entries.length - 1; i >= 0; i--) {
+    const raw = entries[i]?.message?.model;
+    if (typeof raw !== 'string' || raw.length === 0) continue;
+    const id = raw.toLowerCase();
+    if (id.includes('opus')) return 'claude-code:opus';
+    if (id.includes('sonnet')) return 'claude-code:sonnet';
+    if (id.includes('haiku')) return 'claude-code:haiku';
+  }
+  return undefined;
+}
+
+/**
  * Convert Claude Code JSONL entry to Nimbalyst message format
  *
  * IMPORTANT: This must produce the SAME format as ClaudeCodeProvider.logAgentMessage()
@@ -317,16 +340,19 @@ function entryToMessage(entry: ClaudeCodeEntry): { direction: 'input' | 'output'
       entry.message.content.some((p: any) => p.type === 'tool_result');
 
     if (hasToolResults) {
-      // Tool result - store in the standard agent message format
+      // Tool result - store in the standard agent message format. Slim the
+      // tool_use_result sidecar (originalFile / patch / redundant old/new strings)
+      // the same way the live persistence path does -- nothing reads it and it's
+      // the bulk of claude-code raw-log bloat.
       return {
         direction: 'output',
-        content: JSON.stringify({
+        content: JSON.stringify(slimClaudeCodeChunkForStorage({
           type: 'user',
           message: entry.message,
           session_id: entry.sessionId,
           uuid: entry.uuid,
           tool_use_result: (entry as any).toolUseResult,
-        }),
+        })),
         timestamp,
         metadata: null,
       };
@@ -597,6 +623,10 @@ export async function syncSession(
         id: metadata.sessionId,
         workspaceId: metadata.workspacePath,
         provider: 'claude-code',
+        // Label the imported session with the model actually used (read from the
+        // per-turn model on the JSONL assistant entries), falling back to the
+        // real claude-code default rather than the renderer's hardcoded Sonnet (#394).
+        model: importedClaudeCodeModel(entries) ?? DEFAULT_MODELS['claude-code'],
         title: metadata.title || 'Imported Session',
         sessionType: 'session',
         providerSessionId: metadata.sessionId, // CRITICAL: Pass the Claude Code session ID so SDK can resume

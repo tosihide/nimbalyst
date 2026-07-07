@@ -10,8 +10,34 @@ import { useEffect, useRef, useCallback, useState, forwardRef } from 'react';
 import { Excalidraw, exportToBlob } from '@excalidraw/excalidraw';
 import type { ExcalidrawElement } from '@excalidraw/excalidraw/types/element/types';
 import type { ExcalidrawImperativeAPI, AppState, BinaryFiles } from '@excalidraw/excalidraw/types/types';
-import { useEditorLifecycle, type EditorHostProps } from '@nimbalyst/extension-sdk';
+import {
+  useEditorLifecycle,
+  useCollaborativeEditor,
+  type EditorHostProps,
+} from '@nimbalyst/extension-sdk';
+import * as Y from 'yjs';
+import { ExcalidrawBinding } from '../collab/excalidrawBindings';
+import { isExcalidrawYDocEmpty, seedExcalidrawYDoc } from '../collab/seed';
 import type { ExcalidrawFile } from '../types';
+
+// Excalidraw renders `theme='dark'` by applying an invert/hue-rotate FILTER
+// (`--theme-filter: invert(93%) hue-rotate(180deg)`) over the ENTIRE canvas,
+// including `viewBackgroundColor`. The persisted background must therefore
+// always be the LIGHT-SPACE color (#ffffff); the dark canvas is produced by
+// the filter at render time. Persisting a pre-darkened color like #1e1e1e
+// double-inverts in dark theme -> a washed-out light/grey canvas (the bug).
+const LIGHT_SPACE_DEFAULT_BG = '#ffffff';
+
+// Coerce a stored background to light-space. Legacy/pre-darkened defaults we
+// used to wrongly persist are mapped back to the canonical white so old docs
+// render correctly and self-heal on the next save. Genuine user-chosen colors
+// pass through untouched (Excalidraw's own theme filter handles those).
+function normalizeViewBackground(color: string | undefined | null): string {
+  if (!color) return LIGHT_SPACE_DEFAULT_BG;
+  const c = color.toLowerCase();
+  if (c === '#1e1e1e' || c === '#121212') return LIGHT_SPACE_DEFAULT_BG;
+  return color;
+}
 
 // Default empty Excalidraw file
 function createEmptyFile(bgColor: string): ExcalidrawFile {
@@ -31,10 +57,23 @@ function createEmptyFile(bgColor: string): ExcalidrawFile {
 export const ExcalidrawEditor = forwardRef<any, EditorHostProps>(function ExcalidrawEditor({ host }, ref) {
   const { filePath } = host;
 
-  // Excalidraw only supports 'light' or 'dark'
-  const hostThemeInitial = host.theme;
-  const themeInitial = (hostThemeInitial === 'dark' || hostThemeInitial === 'crystal-dark') ? 'dark' : 'light';
-  const defaultBgRef = useRef(themeInitial === 'dark' ? '#1e1e1e' : '#ffffff');
+  // The persisted background is always light-space; the app theme drives the
+  // dark canvas via Excalidraw's `theme` prop (invert filter). So the default
+  // is theme-independent -- never store a pre-darkened color.
+  const defaultBgRef = useRef(LIGHT_SPACE_DEFAULT_BG);
+
+  // Honor host.readOnly via Excalidraw's `viewModeEnabled` (hides toolbars
+  // and disables editing while keeping pan/zoom). Reactive: subscribe to
+  // host.onReadOnlyChanged so the embed's View/Edit chrome toggle flips
+  // the canvas in place without forcing a remount.
+  const [readOnly, setReadOnly] = useState<boolean>(host.readOnly ?? false);
+  useEffect(() => {
+    setReadOnly(host.readOnly ?? false);
+    const unsub = host.onReadOnlyChanged?.((next) => {
+      setReadOnly(next);
+    });
+    return unsub;
+  }, [host]);
 
   // Excalidraw API reference (imperative -- the library owns all state)
   const excalidrawAPIRef = useRef<ExcalidrawImperativeAPI | null>(null);
@@ -76,7 +115,9 @@ export const ExcalidrawEditor = forwardRef<any, EditorHostProps>(function Excali
       scrollX: data.appState?.scrollX ?? 0,
       scrollY: data.appState?.scrollY ?? 0,
       zoom: typeof data.appState?.zoom === 'object' ? data.appState.zoom.value : (data.appState?.zoom ?? 1),
-      viewBackgroundColor: data.appState?.viewBackgroundColor ?? bgColor,
+      // Match the normalized value actually applied to the canvas so the first
+      // onChange tick doesn't spuriously mark the doc dirty on open.
+      viewBackgroundColor: normalizeViewBackground(data.appState?.viewBackgroundColor),
     };
   }, []);
 
@@ -100,6 +141,22 @@ export const ExcalidrawEditor = forwardRef<any, EditorHostProps>(function Excali
       const bgColor = defaultBgRef.current;
       const elements = data.elements as ExcalidrawElement[];
       const files = data.files || {};
+      // Coerce any pre-darkened stored background back to light-space so the
+      // theme filter (not a double-baked color) produces the dark canvas.
+      const bg = normalizeViewBackground(data.appState?.viewBackgroundColor);
+
+      // COLLAB: the Y.Doc binding is the SOLE source of truth for canvas
+      // content (it seeds from file content via useCollaborativeEditor and
+      // paints from the shared doc). In collab mode host.loadContent() returns
+      // '' so `data` here is an EMPTY scene -- pushing it would clear the
+      // canvas, race the binding, and (because the binding's onChange has no
+      // programmatic-clear guard) propagate the deletion up to the server,
+      // wiping the shared doc. Never let lifecycle content writes touch a
+      // collaborative canvas; just keep the change-tracking baseline in sync.
+      if (host.collaboration) {
+        updateTrackingRefs(data, bgColor);
+        return;
+      }
 
       const api = excalidrawAPIRef.current;
       if (api) {
@@ -108,7 +165,10 @@ export const ExcalidrawEditor = forwardRef<any, EditorHostProps>(function Excali
         try {
           api.updateScene({
             elements,
-            appState: data.appState as any,
+            appState: {
+              ...(data.appState as any),
+              viewBackgroundColor: bg,
+            },
           });
         } finally {
           queueMicrotask(() => {
@@ -120,9 +180,9 @@ export const ExcalidrawEditor = forwardRef<any, EditorHostProps>(function Excali
         setInitialData({
           elements,
           appState: {
-            viewBackgroundColor: bgColor,
             collaborators: new Map(),
             ...data.appState,
+            viewBackgroundColor: bg,
           },
           files,
         });
@@ -146,7 +206,9 @@ export const ExcalidrawEditor = forwardRef<any, EditorHostProps>(function Excali
         source: 'https://excalidraw.com',
         elements: api.getSceneElements(),
         appState: {
-          viewBackgroundColor: appState.viewBackgroundColor,
+          // Persist light-space so a dark-theme session never writes a
+          // pre-inverted color that would double-darken on reload.
+          viewBackgroundColor: normalizeViewBackground(appState.viewBackgroundColor),
           scrollX: appState.scrollX,
           scrollY: appState.scrollY,
           zoom: appState.zoom,
@@ -156,9 +218,9 @@ export const ExcalidrawEditor = forwardRef<any, EditorHostProps>(function Excali
     },
   });
 
-  // Excalidraw only supports 'light' or 'dark'
+  // Excalidraw only supports 'light' or 'dark'. The canvas is darkened by the
+  // theme filter, NOT by the stored color, so defaultBgRef stays light-space.
   const theme = (hostTheme === 'dark' || hostTheme === 'crystal-dark') ? 'dark' : 'light';
-  defaultBgRef.current = theme === 'dark' ? '#1e1e1e' : '#ffffff';
 
   // Mark as dirty only when elements actually change (not just view state)
   const onChange = useCallback((
@@ -214,6 +276,63 @@ export const ExcalidrawEditor = forwardRef<any, EditorHostProps>(function Excali
     }
   }, [markDirty]);
 
+  // ---- Collaborative wiring (no-op when host.collaboration is undefined) ---
+  // The binding wraps the imperative Excalidraw API and routes local edits
+  // into the shared Y.Doc + remote Y.Doc changes back onto the canvas. The
+  // hook runs createBinding ONCE per host, after sync completes and after
+  // first-time seeding (if needed).
+  const excalidrawDomRef = useRef<HTMLDivElement | null>(null);
+  const bindingRef = useRef<ExcalidrawBinding | null>(null);
+  // Resolvers waiting for excalidrawAPIRef.current to become non-null.
+  // On reopen the SDK hook's seed branch is skipped, which means
+  // createBinding may run before Excalidraw's internal init has fired the
+  // excalidrawAPI ref-callback. Without this gate the binding would
+  // no-op silently and the canvas would stay blank (see root-cause doc
+  // shared-doc-key-and-share-roundtrip-root-cause.md).
+  const apiReadyResolversRef = useRef<Array<(api: ExcalidrawImperativeAPI) => void>>([]);
+  const awaitExcalidrawApi = useCallback((): Promise<ExcalidrawImperativeAPI> => {
+    if (excalidrawAPIRef.current) {
+      return Promise.resolve(excalidrawAPIRef.current);
+    }
+    return new Promise((resolve) => {
+      apiReadyResolversRef.current.push(resolve);
+    });
+  }, []);
+  const { isCollaborative, status: collabStatus } = useCollaborativeEditor(host, {
+    isEmpty: isExcalidrawYDocEmpty,
+    initializeFromContent: seedExcalidrawYDoc,
+    createBinding: async ({ yDoc, awareness }) => {
+      const api = await awaitExcalidrawApi();
+      const undoManager = new Y.UndoManager(yDoc.getArray('elements'));
+      const binding = new ExcalidrawBinding(
+        yDoc.getArray('elements'),
+        yDoc.getMap('assets'),
+        api,
+        awareness,
+        excalidrawDomRef.current
+          ? { excalidrawDom: excalidrawDomRef.current, undoManager }
+          : undefined,
+      );
+      bindingRef.current = binding;
+      return {
+        destroy: () => {
+          binding.destroy();
+          undoManager.destroy();
+          bindingRef.current = null;
+        },
+      };
+    },
+  });
+  // Forward pointer updates to awareness when in collab mode. Excalidraw's
+  // onPointerUpdate fires very frequently; the binding internally throttles
+  // through y-protocols / DocumentSyncProvider (~2Hz).
+  const onPointerUpdate = useCallback(
+    (payload: Parameters<NonNullable<Parameters<typeof Excalidraw>[0]['onPointerUpdate']>>[0]) => {
+      bindingRef.current?.onPointerUpdate(payload);
+    },
+    [],
+  );
+
   // Create a wrapper around the Excalidraw API that adds screenshot export capability.
   // This keeps Excalidraw-specific export logic in the extension rather than the host.
   const createWrappedAPI = useCallback((api: ExcalidrawImperativeAPI) => {
@@ -267,18 +386,35 @@ export const ExcalidrawEditor = forwardRef<any, EditorHostProps>(function Excali
     );
   }
 
-  // Key by theme to force remount when theme changes
+  // Key by theme to force remount when theme changes. `viewModeEnabled`
+  // does NOT force remount -- the Excalidraw library accepts it as a live
+  // prop, so toggling it from the embed chrome flips toolbars on/off
+  // without losing the canvas state.
   return (
-    <div className="excalidraw-editor w-full h-full" data-theme={theme}>
+    <div
+      className="excalidraw-editor w-full h-full"
+      data-theme={theme}
+      ref={excalidrawDomRef}
+      data-collab-status={isCollaborative ? collabStatus : undefined}
+    >
       <Excalidraw
         key={theme}
         onChange={onChange}
+        onPointerUpdate={isCollaborative ? onPointerUpdate : undefined}
         excalidrawAPI={(api: any) => {
           excalidrawAPIRef.current = api;
-          if (api) host.registerEditorAPI(createWrappedAPI(api));
+          if (api) {
+            host.registerEditorAPI(createWrappedAPI(api));
+            // Unblock any pending createBinding awaiters now that the
+            // imperative API is live.
+            const resolvers = apiReadyResolversRef.current;
+            apiReadyResolversRef.current = [];
+            for (const resolve of resolvers) resolve(api);
+          }
         }}
         initialData={initialData ?? undefined}
         theme={theme}
+        viewModeEnabled={readOnly}
       />
     </div>
   );

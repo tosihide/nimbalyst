@@ -4,7 +4,7 @@ import fs from 'fs';
 import { claudeCodeDetector } from '../services/ClaudeCodeDetector';
 import { query } from '@anthropic-ai/claude-agent-sdk';
 import { logger } from '../utils/logger';
-import { setupClaudeCodeEnvironment, resolveNativeBinaryPath } from '@nimbalyst/runtime/electron/claudeCodeEnvironment';
+import { setupClaudeCodeEnvironment, resolveClaudeCodeExecutablePath } from '@nimbalyst/runtime/electron/claudeCodeEnvironment';
 import { AnalyticsService } from "../services/analytics/AnalyticsService.ts";
 import { shouldShowClaudeCodeWindowsWarning, dismissClaudeCodeWindowsWarning } from '../utils/store';
 import os from "os";
@@ -45,13 +45,38 @@ export function registerClaudeCodeHandlers() {
       // Setup environment for packaged builds
       const env = setupClaudeCodeEnvironment();
 
-      // Build options for query - CRITICAL: pass env to options so SDK can find credentials
-      // This is especially important on Intel Macs where HOME may not be set correctly
-      // in packaged builds without explicitly passing the environment.
-      const nativeBinaryPath = resolveNativeBinaryPath();
+      // Resolve the SAME binary the run path uses (sdkOptionsBuilder ->
+      // resolveClaudeAgentCliPath, allowSystemFallback: false). Verification must
+      // NOT pass via a system/npm `claude` that the bundled-binary-only run path
+      // cannot use -- otherwise the widget reports "logged in" while every message
+      // fails (e.g. a Windows update left claude.exe.old.<ts> with no claude.exe).
+      // See NIM-895. (This intentionally does not consult the per-workspace custom
+      // path override: check-login is a global check with no workspace context.)
+      const nativeBinaryPath = resolveClaudeCodeExecutablePath({
+        pathValue: env.PATH,
+        allowSystemFallback: false,
+      });
+
+      // No bundled binary => the run path can't launch either. Report the broken
+      // state honestly instead of falling through to the SDK (which could
+      // self-resolve a system install and falsely confirm login).
+      if (!nativeBinaryPath) {
+        log.error('[ClaudeCodeHandlers] Bundled Claude runtime not found; cannot verify login');
+        analytics.sendEvent('check_claude_login_error');
+        return {
+          isLoggedIn: false,
+          hasOAuthToken: false,
+          isExpired: false,
+          error: "Nimbalyst's bundled Claude runtime is missing or could not be found. A failed update can leave it in a broken state -- reinstall or repair Nimbalyst.",
+        };
+      }
+
+      // CRITICAL: pass env to options so the SDK can find credentials. This is
+      // especially important on Intel Macs where HOME may not be set correctly in
+      // packaged builds without explicitly passing the environment.
       const options: any = {
         env,
-        ...(nativeBinaryPath ? { pathToClaudeCodeExecutable: nativeBinaryPath } : {}),
+        pathToClaudeCodeExecutable: nativeBinaryPath,
       };
 
       // Call query with proper signature: { prompt, options }
@@ -104,7 +129,10 @@ export function registerClaudeCodeHandlers() {
     try {
       const platform = process.platform;
       analytics.sendEvent('do_claude_code_login', {platform: platform});
-      const binaryPath = resolveNativeBinaryPath() ?? (platform === 'win32' ? findWindowsClaudeExecutable() : null);
+      const binaryPath = resolveClaudeCodeExecutablePath({
+        pathValue: setupClaudeCodeEnvironment().PATH,
+        allowSystemFallback: true,
+      }) ?? (platform === 'win32' ? findWindowsClaudeExecutable() : null);
       if (!binaryPath) {
         const expectedPkg = `@anthropic-ai/claude-agent-sdk-${platform}-${process.arch}`;
         throw new Error(`Claude Agent SDK native binary not found (looking for ${expectedPkg}, arch=${process.arch}). Check main.log for details.`);
@@ -164,7 +192,10 @@ end tell`;
     try {
       const platform = process.platform;
       analytics.sendEvent('do_claude_code_logout', {platform: platform});
-      const binaryPath = resolveNativeBinaryPath() ?? (platform === 'win32' ? findWindowsClaudeExecutable() : null);
+      const binaryPath = resolveClaudeCodeExecutablePath({
+        pathValue: setupClaudeCodeEnvironment().PATH,
+        allowSystemFallback: true,
+      }) ?? (platform === 'win32' ? findWindowsClaudeExecutable() : null);
       if (!binaryPath) {
         const expectedPkg = `@anthropic-ai/claude-agent-sdk-${platform}-${process.arch}`;
         throw new Error(`Claude Agent SDK native binary not found (looking for ${expectedPkg}, arch=${process.arch}). Check main.log for details.`);
@@ -261,4 +292,3 @@ function findWindowsClaudeExecutable(): string | null {
   log.error('[ClaudeCodeHandlers] Claude executable not found in any known location');
   return null;
 }
-

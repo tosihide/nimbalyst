@@ -9,49 +9,35 @@ import { AnalyticsService } from './analytics/AnalyticsService';
 import { hasActiveStreamingSessions } from '../ipc/SessionStateHandlers';
 import { getSessionStateManager } from '@nimbalyst/runtime/ai/server/SessionStateManager';
 import { getDatabase } from '../database/initialize';
+import {
+  categorizeDownloadDuration,
+  classifyUpdateError,
+  isWindowsRenameLockError,
+} from './autoUpdaterUtils';
+import { installAtomFeedFilter } from './electronUpdaterPatch';
+
+// Install the atom-feed filter before any AutoUpdaterService is constructed
+// (which is the first thing that triggers electron-updater to read the feed).
+installAtomFeedFilter();
+
+// Re-export the pure utilities so callers that already pulled them from this
+// module keep working. Unit tests should import from `autoUpdaterUtils`
+// directly to avoid the Electron app-global load chain.
+export { classifyUpdateError, categorizeDownloadDuration, isWindowsRenameLockError };
 
 // Reminder suppression duration: 24 hours
 const REMINDER_SUPPRESSION_DURATION_MS = 24 * 60 * 60 * 1000;
+const GITHUB_UPDATE_PROVIDER = {
+  provider: 'github' as const,
+  owner: 'nimbalyst',
+  repo: 'nimbalyst'
+};
 
-/**
- * Categorize download duration for analytics
- */
-function getDurationCategory(durationMs: number): string {
-  if (durationMs < 30000) return 'fast';       // < 30 seconds
-  if (durationMs < 120000) return 'medium';    // 30s - 2 minutes
-  return 'slow';                                // > 2 minutes
-}
-
-/**
- * Classify update errors for analytics
- */
-function classifyUpdateError(error: Error): string {
-  const message = error.message.toLowerCase();
-  if (message.includes('network') || message.includes('enotfound') || message.includes('timeout') || message.includes('econnrefused')) {
-    return 'network';
-  }
-  if (message.includes('permission') || message.includes('eacces')) {
-    return 'permission';
-  }
-  if (message.includes('disk') || message.includes('space') || message.includes('enospc')) {
-    return 'disk_space';
-  }
-  if (message.includes('signature') || message.includes('verify') || message.includes('certificate') || message.includes('cert')) {
-    return 'signature';
-  }
-  return 'unknown';
-}
-
-// Antivirus on Windows often holds a transient handle on the freshly-downloaded
-// installer, causing electron-updater's temp -> final rename to fail with EPERM
-// (occasionally EBUSY). The fix is to wait briefly and retry the download once.
-function isWindowsRenameLockError(err: Error): boolean {
-  if (process.platform !== 'win32') return false;
-  const msg = err.message || '';
-  if (/\bEPERM\b.*\brename\b/i.test(msg)) return true;
-  if (/\bEBUSY\b/i.test(msg)) return true;
-  return false;
-}
+// classifyUpdateError, categorizeDownloadDuration, isWindowsRenameLockError
+// moved to ./autoUpdaterUtils so unit tests can import them without pulling
+// in this module's Electron-app-global load chain (see #245). Alias keeps
+// the original call-site name (`getDurationCategory`) in scope.
+const getDurationCategory = categorizeDownloadDuration;
 
 export class AutoUpdaterService {
   private updateCheckInterval: NodeJS.Timeout | null = null;
@@ -61,14 +47,21 @@ export class AutoUpdaterService {
   private pendingUpdateInfo: { version: string; releaseNotes?: string; releaseDate?: string } | null = null;
   private downloadStartTime: number | null = null; // Track download start time for duration analytics
   private downloadRetryAttempted = false; // Windows EPERM rename retry guard (one retry per user-initiated download)
+  // Dedup `update_error` analytics: the hourly background check produces a
+  // fresh `error` event every poll on networks that can't reach the update
+  // endpoint, which buries any real signal. Only emit when the
+  // (stage, error_type) tuple changes within a process lifetime.
+  private lastUpdateErrorKey: string | null = null;
 
   constructor() {
     // Configure electron-updater logger
     log.transports.file.level = 'info';
     autoUpdater.logger = log;
 
-    // Configure auto-updater
-    autoUpdater.autoDownload = false;
+    // Configure auto-updater. autoDownload=true: both background polls and the
+    // manual "Check for Updates" trigger download immediately, then surface a
+    // single "Ready to install" toast. Per maintainer direction on #327.
+    autoUpdater.autoDownload = true;
     autoUpdater.autoInstallOnAppQuit = true;
 
     // Configure feed URL based on release channel
@@ -85,21 +78,15 @@ export class AutoUpdaterService {
     const channel = getReleaseChannel();
 
     if (channel === 'alpha') {
-      // Alpha channel: Use Cloudflare R2 bucket
-      const alphaFeedURL = 'https://pub-4357a3345db7463580090984c0e4e2ba.r2.dev/';
-      log.info(`Configuring alpha channel updates from: ${alphaFeedURL}`);
-      autoUpdater.setFeedURL({
-        provider: 'generic',
-        url: alphaFeedURL
-      });
+      log.info('Configuring alpha channel updates from GitHub prereleases');
+      autoUpdater.allowPrerelease = true;
+      autoUpdater.channel = 'alpha';
+      autoUpdater.setFeedURL(GITHUB_UPDATE_PROVIDER);
     } else {
-      // Stable channel: Use GitHub releases (default)
-      log.info('Configuring stable channel updates from GitHub');
-      autoUpdater.setFeedURL({
-        provider: 'github',
-        owner: 'nimbalyst',
-        repo: 'nimbalyst'
-      });
+      log.info('Configuring stable channel updates from GitHub releases');
+      autoUpdater.allowPrerelease = false;
+      autoUpdater.channel = 'latest';
+      autoUpdater.setFeedURL(GITHUB_UPDATE_PROVIDER);
     }
   }
 
@@ -113,34 +100,12 @@ export class AutoUpdaterService {
     autoUpdater.on('update-available', async (info) => {
       log.info('Update available:', info);
       this.isCheckingForUpdate = false;
-      const wasManualCheck = this.isManualCheck;
+      this.lastUpdateErrorKey = null;
       this.isManualCheck = false;
 
-      // Fetch release notes from R2 if using alpha channel
       let releaseNotes = info.releaseNotes as string | undefined;
       const channel = getReleaseChannel();
-      log.info(`Release channel: ${channel}, releaseNotes from info: "${releaseNotes}"`);
-
-      // Always fetch release notes from R2 for alpha channel
-      // The latest-mac.yml doesn't include releaseNotes, so we need to fetch it separately
-      if (channel === 'alpha') {
-        try {
-          const releaseNotesURL = 'https://pub-4357a3345db7463580090984c0e4e2ba.r2.dev/RELEASE_NOTES.md';
-          log.info(`Fetching release notes from: ${releaseNotesURL}`);
-          const response = await fetch(releaseNotesURL);
-          if (response.ok) {
-            releaseNotes = await response.text();
-            log.info('Successfully fetched release notes from R2');
-            log.info(`Release notes length: ${releaseNotes.length} characters`);
-          } else {
-            log.warn(`Failed to fetch release notes: ${response.status}`);
-          }
-        } catch (err) {
-          log.error('Error fetching release notes from R2:', err);
-        }
-      } else {
-        log.debug('Not fetching from R2 - either not alpha channel or releaseNotes already present');
-      }
+      log.info(`Release channel: ${channel}, releaseNotes present: ${Boolean(releaseNotes)}`);
 
       log.info(`Final releaseNotes being sent to window: "${releaseNotes?.substring(0, 100)}..."`);
 
@@ -151,25 +116,18 @@ export class AutoUpdaterService {
         releaseDate: info.releaseDate
       };
 
-      // Send to frontmost window via toast system. The renderer fires
-      // `update_toast_shown` analytics after passing suppression checks --
-      // firing here would over-count by ~14x because update-available
-      // re-fires every hourly auto-check even when the toast is suppressed.
-      this.sendToFrontmostWindow('update-toast:show-available', {
-        currentVersion: app.getVersion(),
-        newVersion: info.version,
-        releaseNotes: releaseNotes,
-        releaseDate: info.releaseDate,
-        releaseChannel: channel,
-        isManualCheck: wasManualCheck
-      });
-
+      // With autoDownload=true the download starts immediately. Per maintainer
+      // direction on #327 we no longer surface an "Update Available" toast - the
+      // download runs in the background and only the "Ready to install" toast
+      // (update-downloaded) is shown. The update-available event is still
+      // broadcast so renderer state stays in sync.
       this.sendToAllWindows('update-available', info);
     });
 
     autoUpdater.on('update-not-available', (info) => {
       log.info('Update not available:', info);
       this.isCheckingForUpdate = false;
+      this.lastUpdateErrorKey = null;
       // Only show up-to-date toast for manual (user-initiated) checks
       if (this.isManualCheck) {
         this.sendToFrontmostWindow('update-toast:up-to-date');
@@ -181,7 +139,10 @@ export class AutoUpdaterService {
     autoUpdater.on('error', (err) => {
       log.error('Update error:', err);
       this.isCheckingForUpdate = false;
-      this.isManualCheck = false; // Reset manual check flag
+      // Capture before reset so the suppression below can distinguish
+      // user-initiated checks from the hourly background poll.
+      const wasManualCheck = this.isManualCheck;
+      this.isManualCheck = false;
 
       // Windows-only: antivirus often holds a transient handle on the freshly
       // downloaded installer, so electron-updater's temp -> final rename throws
@@ -202,18 +163,47 @@ export class AutoUpdaterService {
       // Track update error - determine stage based on context
       // If downloadStartTime is set, we were downloading; otherwise it was a check error
       const stage = wasDownloading ? 'download' : 'check';
-      AnalyticsService.getInstance().sendEvent('update_error', {
-        stage,
-        error_type: classifyUpdateError(err),
-        release_channel: getReleaseChannel()
-      });
+      const errorType = classifyUpdateError(err);
+      const errorKey = `${stage}:${errorType}`;
+      if (this.lastUpdateErrorKey !== errorKey) {
+        this.lastUpdateErrorKey = errorKey;
+        AnalyticsService.getInstance().sendEvent('update_error', {
+          stage,
+          error_type: errorType,
+          release_channel: getReleaseChannel()
+        });
+      }
       this.downloadStartTime = null;
       this.downloadRetryAttempted = false;
 
-      // Send error to frontmost window via toast system
-      this.sendToFrontmostWindow('update-toast:error', {
-        message: err.message
-      });
+      // Suppress the user-facing toast for transient network errors on
+      // automatic background checks (#56). Users on networks that can't
+      // resolve the update endpoint (LAN-only, captive portal, restrictive
+      // firewall) were getting an "Update Error: net::ERR_NAME_NOT_RESOLVED"
+      // toast every hour because the auto-updater retries on a 60-minute
+      // schedule. The error is still logged and reported to analytics.
+      // Manual checks (`Check for Updates` menu item) and download errors
+      // still surface so the user gets feedback when they asked for it
+      // or are mid-download.
+      //
+      // Same treatment for `release_pending` (404 on `latest-*.yml`): the
+      // release workflow pushes the tag minutes before it uploads metadata,
+      // so every alpha client polling during the build window would otherwise
+      // see "Cannot find latest-mac.yml ... HttpError: 404" -- functionally
+      // identical to "no update available". Background polls get nothing;
+      // manual checks get a friendly "release is being published" toast
+      // instead of the raw HttpError dump.
+      const isTransientCheckError =
+        stage === 'check' &&
+        (errorType === 'network' || errorType === 'release_pending') &&
+        !wasManualCheck;
+      if (!isTransientCheckError) {
+        const message =
+          errorType === 'release_pending'
+            ? 'A new release is being published. Check back in a few minutes.'
+            : err.message;
+        this.sendToFrontmostWindow('update-toast:error', { message });
+      }
 
       this.sendToAllWindows('update-error', err.message);
     });
@@ -365,6 +355,28 @@ export class AutoUpdaterService {
     setImmediate(async () => {
       try {
         log.info('Performing quit and install...');
+
+        // Persist open-window list BEFORE we tear listeners down. We remove
+        // the index.ts `before-quit` handler below, which is what normally
+        // calls saveSessionState() during a clean quit. Without saving here
+        // the window-close cascade triggered by quitAndInstall() iterates
+        // each window's WindowManager `close` handler, which deletes the
+        // window from windowStates and re-saves session state minus that
+        // window -- the last window ends up writing `{ windows: [] }`, so
+        // no workspaces restore after the update relaunch (issue #232).
+        //
+        // Mark restarting first so those close handlers short-circuit their
+        // own save (same path the MCP restart flow uses).
+        try {
+          const { setRestarting } = await import('../index');
+          setRestarting(true);
+          const { saveSessionState } = await import('../session/SessionState');
+          await saveSessionState();
+          log.info('Session state saved before quit-and-install');
+        } catch (saveErr) {
+          log.error('Failed to save session state before quit-and-install:', saveErr);
+        }
+
         await this.closeDatabaseBeforeQuit();
         AutoUpdaterService.isUpdating = true;
         app.removeAllListeners('before-quit');
@@ -620,24 +632,26 @@ export class AutoUpdaterService {
 
   private async checkAndDownloadLatest() {
     try {
-      log.info('Re-checking for latest version before download...');
-
-      // Check for the absolute latest version
-      const result = await autoUpdater.checkForUpdates();
-
-      if (result && result.updateInfo) {
-        log.info(`Latest version found: ${result.updateInfo.version}, downloading...`);
-
-        // Download the latest version that was just checked
-        // Progress events will update the toast automatically
-        await autoUpdater.downloadUpdate();
-      } else {
-        log.info('No update found during re-check');
-        // Show up-to-date toast (rare edge case - update was released then pulled)
-        this.sendToFrontmostWindow('update-toast:up-to-date');
-      }
+      // Previously this method called `autoUpdater.checkForUpdates()` immediately
+      // before `downloadUpdate()` to "get the absolute latest version" - but on
+      // macOS each `checkForUpdates()` call spins up a new Squirrel.Mac proxy
+      // server, and the new proxy tears down the prior one that the original
+      // `update-available` event had already handed Squirrel's `SQRLUpdater` a
+      // reference to. By the time `quitAndInstall` fires, Squirrel's internal
+      // downloader points at a closed proxy and rejects the install with
+      // "The command is disabled and cannot be executed." adambhenry hit
+      // exactly this on macOS arm64 (#245); the race is sensitive to process
+      // scheduling so arm64 reproduces it more reliably than x86_64.
+      //
+      // The `update-available` event has already populated `pendingUpdateInfo`
+      // with the version that triggered this download path. Go straight to
+      // `downloadUpdate()` and let the existing event handlers keep the toast
+      // in sync. The single-check flow does not break the proxy lifecycle and
+      // matches how Squirrel.Mac is documented to be driven.
+      log.info('Starting update download (single-check path to avoid Squirrel.Mac proxy race)...');
+      await autoUpdater.downloadUpdate();
     } catch (error) {
-      log.error('Failed to check and download latest:', error);
+      log.error('Failed to download latest:', error);
       this.sendToFrontmostWindow('update-toast:error', {
         message: error instanceof Error ? error.message : 'Failed to download the update'
       });

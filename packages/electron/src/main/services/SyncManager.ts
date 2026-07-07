@@ -14,22 +14,25 @@
  */
 
 import type { SessionStore } from '@nimbalyst/runtime';
+import { asPersonalMemberId } from '@nimbalyst/runtime';
 import type { DeviceInfo } from '@nimbalyst/runtime/sync';
 import * as syncModule from '@nimbalyst/runtime/sync';
-import { getSessionSyncConfig, getReleaseChannel, type SessionSyncConfig } from '../utils/store';
+import { getSessionSyncConfig, setSessionSyncConfig, getReleaseChannel, getDefaultAIModel, getAlphaFeatures, getPreferredAgentLanguage, store, type SessionSyncConfig } from '../utils/store';
 import { logger } from '../utils/logger';
 import { getCredentials } from './CredentialService';
 import { getStytchUserId, isAuthenticated, getPersonalOrgId, getPersonalUserId, resolvePersonalUserId, getPersonalSessionJwt, refreshPersonalSession } from './StytchAuthService';
 import { app } from 'electron';
 import * as os from 'os';
 import { getProjectFileSyncService } from './ProjectFileSyncService';
-import { startProjectFileSync } from '../file/WorkspaceWatcher';
+import { startProjectFileSync, stopAllProjectFileSync } from '../file/WorkspaceWatcher';
 import { windowStates } from '../window/WindowManager';
 import { getNormalizedGitRemote } from '../utils/gitUtils';
+import { resolveProjectPath } from '../utils/workspaceDetection';
 import { createHash } from 'crypto';
 import { setSleepPreventionMode, setSyncConnected, shutdownSleepPrevention, type PreventSleepMode } from './PowerSaveService';
 import { reconnectAllTrackerSyncs } from './TrackerSyncManager';
 import { BrowserWindow } from 'electron';
+import { timeStartupPhase } from '../utils/startupTiming';
 
 function loadSyncModule() {
   return syncModule;
@@ -302,6 +305,10 @@ function getDeviceInfo(userId: string): DeviceInfo {
 export async function initializeSync(baseStore: SessionStore): Promise<SessionStore> {
   logger.main.info('[SyncManager] initializeSync called');
 
+  // Label every sync WebSocket connection with this client build so the server
+  // can attribute connect/disconnect telemetry to a platform + version.
+  syncModule.setSyncClientInfo({ platform: 'desktop', version: app.getVersion() });
+
   const config = getSessionSyncConfig();
   logger.main.info('[SyncManager] config:', JSON.stringify(config));
 
@@ -354,18 +361,23 @@ export async function initializeSync(baseStore: SessionStore): Promise<SessionSt
     // to the team org member ID. We must use the personal org member ID for:
     // 1. Encryption key salt (must match iOS which always uses personal member ID)
     // 2. Sync room IDs (must be same room as iOS to see each other's data)
-    let personalUserId = getPersonalUserId();
+    // Always re-derive from the authoritative personal-org exchange so a stale
+    // persisted personalUserId is corrected BEFORE we build the sync provider
+    // (NIM-859). resolvePersonalUserId() falls back to the cached value when it
+    // can't reach the server, so offline init is unchanged.
+    let personalUserId = await resolvePersonalUserId(serverUrl);
     if (!personalUserId) {
-      // Migration: personalUserId not yet stored. Try to resolve by exchanging
-      // the session to the personal org and extracting the member ID from the JWT.
-      logger.main.info('[SyncManager] personalUserId not set, attempting to resolve via session exchange...');
-      personalUserId = await resolvePersonalUserId(serverUrl);
+      personalUserId = getPersonalUserId();
     }
     if (!personalUserId) {
-      // Last resort fallback: use whatever userId we have (may be team member ID).
-      // This is wrong for multi-org users but better than not syncing at all.
-      logger.main.warn('[SyncManager] Could not resolve personalUserId, falling back to stytchUserId:', stytchUserId);
-      personalUserId = stytchUserId;
+      // Last-resort fallback: the active/team member id is NOT a personal member
+      // id (see jwtScopes / NIM-859) -- using it for the personal index room is
+      // wrong for multi-org users, but better than not syncing at all. The
+      // explicit cast records that we KNOW this is a personal-scope violation.
+      logger.main.warn('[SyncManager] Could not resolve personalUserId, falling back to stytchUserId (NOT personal-scoped):', stytchUserId);
+      // stytchUserId is guaranteed non-null (guarded above). The cast records
+      // that we KNOWINGLY use the active/team member id for the personal room.
+      personalUserId = asPersonalMemberId(stytchUserId);
     }
 
     logger.main.info('[SyncManager] Initializing session sync...', {
@@ -398,10 +410,37 @@ export async function initializeSync(baseStore: SessionStore): Promise<SessionSt
     const initialDeviceInfo = getDeviceInfo(stytchUserId);
     logger.main.info('[SyncManager] Initial device info:', JSON.stringify(initialDeviceInfo));
 
-    // Cache JWT refresh to prevent spamming Stytch during batch sync
-    // JWTs expire in ~5 minutes, so refresh at most once per minute
-    let lastRefreshTime = 0;
-    const MIN_REFRESH_INTERVAL = 60000; // 1 minute
+    // Refresh the personal JWT when its `exp` claim is within this window.
+    // Stytch JWTs live ~5 minutes; refreshing inside the last minute keeps a
+    // comfortable margin against clock skew and round-trip time without
+    // hammering Stytch on every reconnect.
+    const REFRESH_SKEW_MS = 60_000;
+    // Minimum gap between refresh *attempts* when the prior attempt failed.
+    // Without this, a reconnect storm (every WS in the stack calling getJwt
+    // back-to-back) would spam Stytch with doomed refresh calls. We do NOT
+    // throttle on success -- the expiry check above is what gates that path.
+    const FAILED_REFRESH_BACKOFF_MS = 5_000;
+    let lastFailedRefreshTime = 0;
+
+    /**
+     * Returns the `exp` claim (in ms since epoch) for the JWT, or null if it
+     * can't be decoded. JWT signatures are verified by the server; we only
+     * read `exp` to decide if a refresh is needed before reconnect.
+     */
+    function getJwtExpiryMs(jwt: string | null): number | null {
+      if (!jwt) return null;
+      const parts = jwt.split('.');
+      if (parts.length !== 3) return null;
+      try {
+        const padded = parts[1] + '='.repeat((4 - (parts[1].length % 4)) % 4);
+        const payload = JSON.parse(
+          Buffer.from(padded.replace(/-/g, '+').replace(/_/g, '/'), 'base64').toString(),
+        ) as { exp?: number };
+        return typeof payload.exp === 'number' ? payload.exp * 1000 : null;
+      } catch {
+        return null;
+      }
+    }
 
     // Use personalOrgId and personalUserId for session sync room IDs -- these stay
     // stable even when the JWT is scoped to a team org (after a Stytch session exchange).
@@ -421,7 +460,6 @@ export async function initializeSync(baseStore: SessionStore): Promise<SessionSt
     // If the config didn't have a persisted personalOrgId, persist it now
     // so future restarts/re-logins use the correct value.
     if (!config.personalOrgId && personalOrgId) {
-      const { setSessionSyncConfig, getSessionSyncConfig } = await import('../utils/store');
       const currentConfig = getSessionSyncConfig();
       if (currentConfig) {
         setSessionSyncConfig({
@@ -433,10 +471,23 @@ export async function initializeSync(baseStore: SessionStore): Promise<SessionSt
       }
     }
 
-    // Also prefer persisted personalUserId from config if available
+    // If the persisted sync config disagrees with the personalUserId we just
+    // resolved from the authoritative personal-org exchange, the config value is
+    // stale (NIM-859). Prefer the resolved id and rewrite the config -- but only
+    // when both refer to the same personal org, to avoid clobbering a config
+    // written under a different login order (see personalOrgId note above).
     if (config.personalUserId && config.personalUserId !== personalUserId) {
-      logger.main.info(`[SyncManager] Using persisted personalUserId=${config.personalUserId} (auth state had ${personalUserId})`);
-      personalUserId = config.personalUserId;
+      const sameOrg = !config.personalOrgId || config.personalOrgId === getPersonalOrgId();
+      if (sameOrg && personalUserId) {
+        logger.main.info(`[SyncManager] Correcting stale sync-config personalUserId ${config.personalUserId} -> ${personalUserId}`);
+        const currentConfig = getSessionSyncConfig();
+        if (currentConfig) {
+          setSessionSyncConfig({ ...currentConfig, personalUserId });
+        }
+      } else {
+        logger.main.info(`[SyncManager] Using persisted personalUserId=${config.personalUserId} (resolved ${personalUserId}; differing org, not overriding)`);
+        personalUserId = asPersonalMemberId(config.personalUserId);
+      }
     }
 
     logger.main.info(`[SyncManager] Using personalOrgId=${personalOrgId} personalUserId=${personalUserId} for sync room IDs`);
@@ -450,18 +501,41 @@ export async function initializeSync(baseStore: SessionStore): Promise<SessionSt
         // which the server validates against the room URL path. The team-scoped JWT
         // (from getSessionJwt) has a different sub and would fail auth.
         const now = Date.now();
-        if (now - lastRefreshTime > MIN_REFRESH_INTERVAL) {
-          const refreshed = await refreshPersonalSession(serverUrl);
-          lastRefreshTime = now;
+        const cachedJwt = getPersonalSessionJwt();
+        const expiryMs = getJwtExpiryMs(cachedJwt);
+        const cachedIsFresh = expiryMs !== null && expiryMs - now > REFRESH_SKEW_MS;
 
-          if (!refreshed) {
-            logger.main.warn('[SyncManager] Personal session refresh failed, JWT may be stale');
+        if (!cachedIsFresh) {
+          // Avoid hammering Stytch in a tight reconnect loop when the prior
+          // refresh just failed. The backoff is short enough that legitimate
+          // recovery (network coming back after sleep) happens within a couple
+          // of WS retry attempts.
+          const failedRecently =
+            lastFailedRefreshTime > 0 && now - lastFailedRefreshTime < FAILED_REFRESH_BACKOFF_MS;
+          if (!failedRecently) {
+            const refreshed = await refreshPersonalSession(serverUrl);
+            if (!refreshed) {
+              lastFailedRefreshTime = Date.now();
+              logger.main.warn('[SyncManager] Personal session refresh failed, JWT may be stale');
+            } else {
+              lastFailedRefreshTime = 0;
+            }
           }
         }
 
         const freshJwt = getPersonalSessionJwt();
         if (!freshJwt || freshJwt.split('.').length !== 3) {
           throw new Error('Failed to get valid personal JWT for session sync');
+        }
+
+        const freshExpiryMs = getJwtExpiryMs(freshJwt);
+        if (freshExpiryMs !== null && freshExpiryMs <= now) {
+          // Returning an already-expired JWT guarantees the server rejects the
+          // upgrade and the WS error loop never escapes. Throw so the caller's
+          // reconnect-with-backoff path runs instead of the bad-token hammer.
+          throw new Error(
+            `[SyncManager] Personal JWT is expired (exp=${new Date(freshExpiryMs).toISOString()}) and refresh did not produce a fresh one`,
+          );
         }
 
         return freshJwt;
@@ -521,7 +595,10 @@ export async function initializeSync(baseStore: SessionStore): Promise<SessionSt
         // logger.main.info('[SyncManager] Fetching server index...');
         let serverIndex: Awaited<ReturnType<NonNullable<typeof provider.fetchIndex>>>;
         try {
-          serverIndex = await provider.fetchIndex();
+          serverIndex = await timeStartupPhase(
+            'SyncManager.fetchIndex',
+            () => provider.fetchIndex!(),
+          );
           const fetchTime = performance.now() - fetchStart;
           // logger.main.info(`[SyncManager] Server has ${serverIndex.sessions.length} sessions (fetch took ${fetchTime.toFixed(1)}ms)`);
         } catch (fetchError) {
@@ -539,12 +616,14 @@ export async function initializeSync(baseStore: SessionStore): Promise<SessionSt
         // Step 2: Get local sessions (without messages first for comparison)
         const localStart = performance.now();
         const { getAllSessionsForSync } = await import('./PGLiteSessionStore');
-        const allLocalSessions = await getAllSessionsForSync(false); // No messages yet
+        const allLocalSessions = await timeStartupPhase(
+          'SyncManager.getAllSessionsForSync',
+          () => getAllSessionsForSync(false), // No messages yet
+        );
         const localTime = performance.now() - localStart;
         // logger.main.info(`[SyncManager] Local has ${allLocalSessions.length} sessions (query took ${localTime.toFixed(1)}ms)`);
 
         // Get enabled projects filter (if configured)
-        const { store } = await import('../utils/store');
         const syncSettings = store.get('sessionSync');
         const enabledProjects = syncSettings?.enabledProjects ?? [];
         // logger.main.info(`[SyncManager] Enabled projects filter: ${JSON.stringify(enabledProjects)}`);
@@ -564,9 +643,19 @@ export async function initializeSync(baseStore: SessionStore): Promise<SessionSt
             continue;
           }
 
-          // Skip sessions from disabled projects (if project filtering is enabled)
-          if (enabledProjectIds && !enabledProjectIds.has(localSession.workspaceId)) {
-            continue;
+          // Skip sessions from disabled projects (if project filtering is enabled).
+          // Sessions running in a git worktree may have a workspaceId of
+          // ".../<project>_worktrees/<name>" rather than the parent project path
+          // the user enabled in Settings > Sync. Claude sessions normally adopt
+          // the parent path via adoptWorktreeForSession(), but the Codex
+          // provider currently does not, so a Codex worktree session keeps the
+          // raw worktree path and is silently filtered out here. Resolve to the
+          // parent project path and accept either form against the enabled set.
+          if (enabledProjectIds) {
+            const projectPath = resolveProjectPath(localSession.workspaceId);
+            if (!enabledProjectIds.has(localSession.workspaceId) && !enabledProjectIds.has(projectPath)) {
+              continue;
+            }
           }
 
           const serverSession = serverSessionMap.get(localSession.id);
@@ -576,12 +665,18 @@ export async function initializeSync(baseStore: SessionStore): Promise<SessionSt
             // if so, the server already expired it and re-uploading is wasteful.
             const localUpdatedAt = localSession.updatedAt || 0;
             const ttlCutoff = Date.now() - SESSION_TTL_MS;
-            if (localUpdatedAt < ttlCutoff) {
-              continue; // Expired session, skip
+            const ttlExpired = localUpdatedAt < ttlCutoff;
+            if (ttlExpired && !localSession.isArchived) {
+              continue; // Expired and not archived: nothing the other devices need.
             }
-            // Genuinely new session - needs full sync (index + messages)
+            // Push index entry. For TTL-expired but locally archived sessions,
+            // we push without messages so iOS can see the archived flag and stop
+            // showing the session even though its message body is long gone from
+            // the server.
             sessionsNeedingIndexUpdate.push(localSession);
-            sessionsNeedingMessageSync.push(localSession.id);
+            if (!ttlExpired) {
+              sessionsNeedingMessageSync.push(localSession.id);
+            }
           } else {
             // Compare timestamps AND message counts to detect sessions needing sync.
             // The real-time pushChange sends updatedAt=Date.now() after DB write, so
@@ -607,17 +702,30 @@ export async function initializeSync(baseStore: SessionStore): Promise<SessionSt
               // missing a value the desktop has.
               (localSession.worktreeId && !serverSession.worktreeId) ||
               (localSession.sessionType && !serverSession.sessionType) ||
-              (localSession.parentSessionId && !serverSession.parentSessionId) ||
               (localSession.provider && !serverSession.provider) ||
               (localSession.model && !serverSession.model) ||
-              (localSession.mode && !serverSession.mode)
+              (localSession.mode && !serverSession.mode) ||
+              // Value-mismatch checks for fields whose changes don't bump
+              // updated_at. updateMetadata intentionally keeps updated_at stable
+              // for pins/reparents/archives/title-edits to avoid resorting the
+              // list on iOS, so the timestamp comparison above can't catch a
+              // real divergence. Heal those on the next reconnect.
+              (Boolean(localSession.isArchived) !== Boolean(serverSession.isArchived)) ||
+              (Boolean(localSession.isPinned) !== Boolean(serverSession.isPinned)) ||
+              ((localSession.parentSessionId ?? null) !== (serverSession.parentSessionId ?? null)) ||
+              (localSession.title !== serverSession.title)
             ) {
               sessionsNeedingIndexUpdate.push(localSession);
             }
           }
         }
 
-        // logger.main.info(`[SyncManager] Delta sync: ${sessionsNeedingIndexUpdate.length}/${allLocalSessions.length} sessions need update, ${sessionsNeedingMessageSync.length} need message sync (server has ${serverIndex.sessions.length})`);
+        const archiveMismatches = sessionsNeedingIndexUpdate.filter(s => {
+          const server = serverSessionMap.get(s.id);
+          return server && Boolean(s.isArchived) !== Boolean(server.isArchived);
+        }).length;
+        const ttlExpiredArchives = sessionsNeedingIndexUpdate.filter(s => !serverSessionMap.has(s.id) && s.isArchived).length;
+        logger.main.info(`[SyncManager] startup sync: ${sessionsNeedingIndexUpdate.length} need index update (${archiveMismatches} archive mismatches, ${ttlExpiredArchives} ttl-expired archives), ${sessionsNeedingMessageSync.length} need message sync, local=${allLocalSessions.length}, server=${serverIndex.sessions.length}`);
 
         // Sync sessions that need it
         if (sessionsNeedingIndexUpdate.length === 0 && sessionsNeedingMessageSync.length === 0) {
@@ -682,10 +790,11 @@ export async function initializeSync(baseStore: SessionStore): Promise<SessionSt
         const aiStore = new Store({ name: 'ai-settings' });
         const apiKeys = aiStore.get('apiKeys', {}) as Record<string, string>;
         const openaiKey = apiKeys['openai'];
-        if (openaiKey) {
-          // logger.main.info('[SyncManager] Syncing existing OpenAI API key to mobile devices');
-          syncSettingsToMobile(openaiKey);
-        }
+        // Always sync so the mobile model picker gets the available-models list
+        // even for agent-only users with no OpenAI key (e.g. Codex). Mobile
+        // keeps its stored key when openaiKey is undefined (NIM-976).
+        // logger.main.info('[SyncManager] Syncing existing settings to mobile devices');
+        syncSettingsToMobile(openaiKey);
       } catch (error) {
         logger.main.warn('[SyncManager] Failed to sync initial settings:', error);
       }
@@ -713,11 +822,10 @@ export async function initializeSync(baseStore: SessionStore): Promise<SessionSt
                 const aiStore = new Store({ name: 'ai-settings' });
                 const apiKeys = aiStore.get('apiKeys', {}) as Record<string, string>;
                 const openaiKey = apiKeys['openai'];
-                if (openaiKey) {
-                  syncSettingsToMobile(openaiKey);
-                } else {
-                  logger.main.debug('[SyncManager] No OpenAI API key to sync');
-                }
+                // Always sync the available-models list so agent-only users with
+                // no OpenAI key still get the model picker populated (NIM-976).
+                // Mobile retains its stored key when openaiKey is undefined.
+                syncSettingsToMobile(openaiKey);
               }).catch((err) => {
                 logger.main.warn('[SyncManager] Failed to sync settings to device:', err);
               });
@@ -856,8 +964,12 @@ export function shutdownSync(): void {
     clearInterval(state.sessionKeepAliveInterval);
     state.sessionKeepAliveInterval = null;
   }
-  // Shutdown ProjectFileSyncService
+  // Shutdown ProjectFileSyncService. Clear the watcher subscriptions first so
+  // a subsequent initializeSync re-subscribes and reconnects each project room
+  // (a stale subscription entry would make startProjectFileSync early-return
+  // and strand every later file save in a never-drained offline queue).
   try {
+    stopAllProjectFileSync();
     getProjectFileSyncService().shutdown();
   } catch {
     // Non-fatal
@@ -951,7 +1063,6 @@ export async function triggerIncrementalSync(): Promise<void> {
     // logger.main.info(`[SyncManager] Triggered sync: local has ${allLocalSessions.length} sessions (query took ${localTime.toFixed(1)}ms)`);
 
     // Get enabled projects filter
-    const { store } = await import('../utils/store');
     const syncSettings = store.get('sessionSync');
     const enabledProjects = syncSettings?.enabledProjects ?? [];
     // logger.main.info(`[SyncManager] Triggered sync: enabled projects: ${JSON.stringify(enabledProjects)}`);
@@ -968,9 +1079,14 @@ export async function triggerIncrementalSync(): Promise<void> {
         continue;
       }
 
-      // Skip sessions from disabled projects
-      if (enabledProjectIds && !enabledProjectIds.has(localSession.workspaceId)) {
-        continue;
+      // Skip sessions from disabled projects. Resolve worktree paths to their
+      // parent project path so Codex worktree sessions (which do not adopt the
+      // parent path the way Claude sessions do) match the user's enabled set.
+      if (enabledProjectIds) {
+        const projectPath = resolveProjectPath(localSession.workspaceId);
+        if (!enabledProjectIds.has(localSession.workspaceId) && !enabledProjectIds.has(projectPath)) {
+          continue;
+        }
       }
 
       const serverSession = serverSessionMap.get(localSession.id);
@@ -980,11 +1096,16 @@ export async function triggerIncrementalSync(): Promise<void> {
         // if so, the server already expired it and re-uploading is wasteful.
         const localUpdatedAt = localSession.updatedAt || 0;
         const ttlCutoff = Date.now() - SESSION_TTL_MS;
-        if (localUpdatedAt < ttlCutoff) {
-          continue; // Expired session, skip
+        const ttlExpired = localUpdatedAt < ttlCutoff;
+        if (ttlExpired && !localSession.isArchived) {
+          continue; // Expired and not archived: nothing other devices need.
         }
+        // For TTL-expired but locally archived sessions, push the index entry
+        // without messages so iOS can see the archived flag and hide the row.
         sessionsNeedingIndexUpdate.push(localSession);
-        sessionsNeedingMessageSync.push(localSession.id);
+        if (!ttlExpired) {
+          sessionsNeedingMessageSync.push(localSession.id);
+        }
       } else {
         // Compare timestamps AND message counts to detect sessions that need syncing.
         // Note: The real-time pushChange path sends updatedAt=Date.now() AFTER the DB write,
@@ -1004,6 +1125,12 @@ export async function triggerIncrementalSync(): Promise<void> {
           sessionsNeedingIndexUpdate.push(localSession);
           sessionsNeedingMessageSync.push(localSession.id);
           // logger.main.info(`[SyncManager] Session ${localSession.id} needs sync (messages): local=${localMessageCount} server=${serverMessageCount}`);
+        } else if (Boolean(localSession.isArchived) !== Boolean(serverSession.isArchived)) {
+          // Archive state diverged. updateMetadata doesn't bump updated_at, so the
+          // timestamp comparison above misses it. Push the index entry without
+          // re-uploading messages.
+          sessionsNeedingIndexUpdate.push(localSession);
+          logger.main.info(`[SyncManager] triggered sync: archive mismatch ${localSession.id.slice(0,8)} local=${localSession.isArchived} server=${serverSession.isArchived}`);
         }
       }
     }
@@ -1070,7 +1197,6 @@ async function getAvailableModelsForMobile(): Promise<{ models: Array<{ id: stri
   try {
     const Store = (await import('electron-store')).default;
     const { ModelRegistry } = await import('@nimbalyst/runtime/ai/server/ModelRegistry');
-    const { getDefaultAIModel } = await import('../utils/store');
 
     const aiStore = new Store<Record<string, unknown>>({ name: 'ai-settings' });
     const apiKeys = aiStore.get('apiKeys', {}) as Record<string, string>;
@@ -1136,6 +1262,14 @@ export async function syncSettingsToMobile(openaiApiKey?: string): Promise<void>
   // Get available AI models for the mobile model picker
   const { models: availableModels, defaultModel } = await getAvailableModelsForMobile();
 
+  // Whether the desktop "meta-agent" alpha feature is enabled (gates the mobile Meta Agent UI)
+  const metaAgentEnabled = getAlphaFeatures()['meta-agent'] ?? false;
+
+  // Desktop's preferred agent language. The mobile voice agent pins its spoken
+  // language to this so it never starts up in a different language than the
+  // desktop is configured for. Undefined (no preference) -> falls back to English.
+  const preferredAgentLanguage = getPreferredAgentLanguage();
+
   // logger.main.info(`[SyncManager] Syncing settings to mobile devices (version ${settingsVersion}, ${availableModels.length} models)`);
 
   try {
@@ -1147,6 +1281,8 @@ export async function syncSettingsToMobile(openaiApiKey?: string): Promise<void>
       } : undefined,
       availableModels,
       defaultModel,
+      metaAgentEnabled,
+      preferredAgentLanguage,
       version: settingsVersion,
     });
     // logger.main.info('[SyncManager] Settings synced successfully');

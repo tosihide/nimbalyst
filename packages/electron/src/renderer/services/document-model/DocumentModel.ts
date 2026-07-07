@@ -44,29 +44,6 @@ export class FileDeletedError extends Error {
   }
 }
 
-/**
- * Forward a save-blocked-after-delete telemetry signal to the main process.
- * Best effort; failure to emit telemetry must never affect save behavior.
- */
-function reportSaveBlockedAfterDelete(
-  layer: 'recently-deleted' | 'document-model-deleted' | 'conflict-mismatch',
-  filePath: string,
-  wasAutosave?: boolean,
-): void {
-  try {
-    const api = (window as {
-      electronAPI?: { send?: (channel: string, payload: unknown) => void };
-    }).electronAPI;
-    api?.send?.('telemetry:file-save-blocked-after-delete', {
-      layer,
-      filePath,
-      wasAutosave: wasAutosave ?? false,
-    });
-  } catch {
-    // No-op. Telemetry must never affect program behavior.
-  }
-}
-
 interface EditorAttachment {
   id: string;
   isDirty: boolean;
@@ -100,7 +77,7 @@ export interface DocumentModelOptions {
 }
 
 export class DocumentModel {
-  readonly filePath: string;
+  filePath: string;
   private backingStore: DocumentBackingStore;
   private options: Required<DocumentModelOptions>;
 
@@ -471,7 +448,6 @@ export class DocumentModel {
       // The file was deleted. Refuse to save until the user explicitly
       // reloads (which calls loadContent and clears the flag). This is the
       // model-side guard against autosave overwriting an AI-recreated file.
-      reportSaveBlockedAfterDelete('document-model-deleted', this.filePath);
       throw new FileDeletedError(this.filePath);
     }
 
@@ -598,6 +574,27 @@ export class DocumentModel {
         oldContent = baseline?.content ?? (typeof this.lastPersistedContent === 'string' ? this.lastPersistedContent : '');
       } catch {
         oldContent = typeof this.lastPersistedContent === 'string' ? this.lastPersistedContent : '';
+      }
+
+      // Race guard: when the renderer reads disk on the `history:pending-tag-created`
+      // signal, the agent may not yet have written. Claude's AgentToolHooks fires the
+      // pre-edit tag BEFORE its own write; Codex's chokidar event can outrun the
+      // OS-level write completion. In both cases we land here with info.content equal
+      // to the baseline. Creating an empty-diff DiffSession would lock the editor into
+      // an `applying` phase with appliedContent === baselineContent; the real
+      // disk-write event that arrives a moment later then either gets queued (and
+      // sometimes never drains) or applies an "X -> Y" transition over an editor that
+      // never visibly entered diff mode. Defer instead -- the next file-changed-on-disk
+      // event will arrive with the actual new content and create the session correctly.
+      if (!this.currentSession && newContentString === oldContent) {
+        diffTrace('DocumentModel.handleExternalChange skip empty-diff session', {
+          path: this.filePath,
+          tagId: tag.id,
+          contentLen: newContentString.length,
+          checkPendingTags: info.checkPendingTags,
+          t: performance.now(),
+        });
+        return;
       }
 
       // Drive the DiffSession state machine. It owns duplicate-suppression and
@@ -894,6 +891,38 @@ export class DocumentModel {
 
   // -- Lifecycle ------------------------------------------------------------
 
+  /**
+   * Replace the backing store and update filePath in-place.
+   * Called by DocumentModelRegistry.rename() when a file is renamed so the
+   * existing in-memory state (dirty buffer, autosave timer, attachments) is
+   * preserved rather than discarding it and reloading from disk.
+   */
+  migrateToNewPath(newPath: string, newStore: DocumentBackingStore): void {
+    // Tear down old backing-store subscriptions held by this model
+    this.externalChangeCleanup?.();
+    this.externalChangeCleanup = null;
+    this.fileDeletedCleanup?.();
+    this.fileDeletedCleanup = null;
+
+    // Dispose the old store's own internal subscriptions (atom watchers, etc.)
+    this.backingStore.dispose?.();
+
+    // Switch to the new store and path
+    this.backingStore = newStore;
+    this.filePath = newPath;
+
+    // Re-subscribe with the new store
+    this.externalChangeCleanup = newStore.onExternalChange(
+      this.handleExternalChange.bind(this),
+    );
+    if (typeof newStore.onDeletion === 'function') {
+      this.fileDeletedCleanup = newStore.onDeletion(this.markDeleted.bind(this));
+    }
+
+    // The file now exists at the new path, so clear the deleted guard
+    this.deleted = false;
+  }
+
   dispose(): void {
     this.disposed = true;
 
@@ -920,9 +949,6 @@ export class DocumentModel {
     // Clear event listeners
     this.eventListeners.clear();
 
-    // Dispose backing store if it has a dispose method
-    if ('dispose' in this.backingStore && typeof (this.backingStore as any).dispose === 'function') {
-      (this.backingStore as any).dispose();
-    }
+    this.backingStore.dispose?.();
   }
 }

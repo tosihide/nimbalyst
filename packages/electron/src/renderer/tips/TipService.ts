@@ -19,30 +19,23 @@ export function shouldShowTip(
   // Globally disabled (shared with walkthroughs)
   if (!state.enabled) return false;
 
-  // Already completed (user clicked primary action)
-  if (state.completed.includes(tip.id)) return false;
-
-  // Already dismissed (user clicked X)
-  if (state.dismissed.includes(tip.id)) return false;
-
-  // Check for version update (allow re-showing if version changed)
+  // Newer versions should re-show even if the previous version was dismissed
+  // or completed. History tracks the last version the user saw.
   if (tip.version !== undefined) {
     const history = state.history?.[tip.id];
     if (history?.version !== undefined && history.version !== tip.version) {
-      // New version -- allow showing again
       return true;
     }
   }
 
-  return true;
-}
+  // Already completed (user clicked primary action)
+  if (state.completed.includes(tip.id)) return false;
 
-/**
- * Mark a tip as dismissed (user clicked X).
- * Persisted -- won't show again for this version.
- */
-export async function markTipDismissed(tipId: string, version?: number): Promise<void> {
-  return window.electronAPI.invoke('walkthroughs:mark-dismissed', tipId, version);
+  // Legacy: tips are no longer dismissible, but honor any historical dismissed
+  // entries from the shared walkthrough store so they stay hidden.
+  if (state.dismissed.includes(tip.id)) return false;
+
+  return true;
 }
 
 /**

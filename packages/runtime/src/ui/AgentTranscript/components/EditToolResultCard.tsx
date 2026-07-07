@@ -19,6 +19,14 @@ interface EditToolResultCardProps {
   edits: any[];
   workspacePath?: string;
   onOpenFile?: (filePath: string) => void;
+  renderEmbeddedFile?: (params: { filePath: string; defaultExpanded?: boolean }) => React.ReactNode;
+  /**
+   * Host-provided predicate: returns true if `filePath` will be rendered
+   * by `renderEmbeddedFile` so this card can suppress the redundant
+   * diff/new-file view in favor of the inline preview. The host knows
+   * its custom editor registry; the runtime does not, so we ask.
+   */
+  canEmbedFile?: (filePath: string) => boolean;
 }
 
 const resolveEditFilePath = (edit: any, toolMessage: TranscriptViewMessage): string | undefined => {
@@ -49,24 +57,56 @@ const truncateInstruction = (text: string, maxLength = 320) => {
   return `${text.slice(0, maxLength - 1)}…`;
 };
 
-export const EditToolResultCard: React.FC<EditToolResultCardProps> = ({ toolMessage, edits, workspacePath, onOpenFile }) => {
+export const EditToolResultCard: React.FC<EditToolResultCardProps> = ({
+  toolMessage,
+  edits,
+  workspacePath,
+  onOpenFile,
+  renderEmbeddedFile,
+  canEmbedFile,
+}) => {
+  const isEmbeddable = (filePath?: string) =>
+    typeof filePath === 'string' && !!canEmbedFile?.(filePath);
   const tool = toolMessage.toolCall;
   if (!tool || edits.length === 0) {
     return null;
   }
 
   const firstEditPath = resolveEditFilePath(edits[0], toolMessage);
+  const primarySupportsEmbeddedPreview = isEmbeddable(firstEditPath);
   const displayPath = firstEditPath ? toProjectRelative(firstEditPath, workspacePath) : '';
   const prettyPath = displayPath ? shortenPath(displayPath, 64) : '';
   const toolDisplayName = formatToolDisplayName(tool.toolName || '') || tool.toolName || 'Edit';
 
   const instruction = truncateInstruction(getInstructionText(toolMessage));
   const allNewFiles = edits.every(isNewFileEdit);
-  const statusLabel = toolMessage.isError ? 'Failed' : allNewFiles ? 'Created' : 'Applied';
-  const statusClass = toolMessage.isError ? 'error' : 'success';
+  // NIM-806: the Created/Applied badge is an OUTCOME — it must not render from
+  // the tool_use arguments alone. For the genuine claude-code-cli the proxy
+  // emits the Write/Edit tool_use at message_stop, BEFORE the user approves the
+  // permission prompt and before the file is actually written; the real
+  // tool_result only arrives in the next request body. Gate the success label on
+  // an observed tool_result so a gated edit shows "Pending" (not a premature
+  // "Created"). isError still wins (an errored/denied edit reads "Failed").
+  const rawResult = toolMessage.toolCall?.result;
+  const hasResult = rawResult !== undefined && rawResult !== null && rawResult !== '';
+  const statusLabel = toolMessage.isError
+    ? 'Failed'
+    : !hasResult
+      ? 'Pending'
+      : allNewFiles ? 'Created' : 'Applied';
+  const statusClass = toolMessage.isError ? 'error' : !hasResult ? 'pending' : 'success';
   const editCountLabel = allNewFiles
     ? `${edits[0].content.split('\n').length} lines`
     : edits.length === 1 ? '1 edit' : `${edits.length} edits`;
+  const previewFilePaths = Array.from(new Set(
+    edits
+      .map((edit) => resolveEditFilePath(edit, toolMessage))
+      .filter((filePath): filePath is string => (
+        !!filePath &&
+        primarySupportsEmbeddedPreview &&
+        isEmbeddable(filePath)
+      ))
+  ));
 
   const handleOpenFile = () => {
     if (firstEditPath && onOpenFile) {
@@ -116,7 +156,7 @@ export const EditToolResultCard: React.FC<EditToolResultCardProps> = ({ toolMess
             <MaterialSymbol icon="open_in_new" size={14} />
           </button>
         )}
-        <span className={`rich-transcript-edit-card__status rich-transcript-edit-card__status--${statusClass} text-[0.7rem] font-semibold py-0.5 px-2 rounded-full uppercase tracking-[0.02em] ${statusClass === 'success' ? 'text-nim-success' : 'text-nim-error'}`}>
+        <span className={`rich-transcript-edit-card__status rich-transcript-edit-card__status--${statusClass} text-[0.7rem] font-semibold py-0.5 px-2 rounded-full uppercase tracking-[0.02em] ${statusClass === 'success' ? 'text-nim-success' : statusClass === 'pending' ? 'text-nim-muted' : 'text-nim-error'}`}>
           {statusLabel}
         </span>
       </div>
@@ -131,32 +171,56 @@ export const EditToolResultCard: React.FC<EditToolResultCardProps> = ({ toolMess
         {edits.map((edit, idx) => {
           const absolutePath = resolveEditFilePath(edit, toolMessage);
           const relativePath = absolutePath ? toProjectRelative(absolutePath, workspacePath) : undefined;
+          const isSecondaryEmbeddableFile =
+            !!absolutePath &&
+            absolutePath !== firstEditPath &&
+            isEmbeddable(absolutePath);
+          const shouldUseEmbeddedPreview =
+            !!renderEmbeddedFile &&
+            primarySupportsEmbeddedPreview &&
+            isEmbeddable(absolutePath);
+
+          if (shouldUseEmbeddedPreview || (!primarySupportsEmbeddedPreview && isSecondaryEmbeddableFile)) {
+            return null;
+          }
 
           if (isNewFileEdit(edit)) {
             return (
-              <NewFilePreview
-                key={`new-${idx}`}
-                content={edit.content}
+              <React.Fragment key={`new-${idx}`}>
+                <NewFilePreview
+                  content={edit.content}
+                  filePath={relativePath || absolutePath}
+                  maxHeight="18rem"
+                  onOpenFile={onOpenFile}
+                  absoluteFilePath={absolutePath}
+                />
+              </React.Fragment>
+            );
+          }
+
+          return (
+            <React.Fragment key={`edit-${idx}`}>
+              <DiffViewer
+                edit={edit}
                 filePath={relativePath || absolutePath}
                 maxHeight="18rem"
                 onOpenFile={onOpenFile}
                 absoluteFilePath={absolutePath}
               />
-            );
-          }
-
-          return (
-            <DiffViewer
-              key={`edit-${idx}`}
-              edit={edit}
-              filePath={relativePath || absolutePath}
-              maxHeight="18rem"
-              onOpenFile={onOpenFile}
-              absoluteFilePath={absolutePath}
-            />
+            </React.Fragment>
           );
         })}
       </div>
+
+      {renderEmbeddedFile && previewFilePaths.length > 0 && (
+        <div className="rich-transcript-edit-card__previews flex flex-col gap-2">
+          {previewFilePaths.map((filePath) => (
+            <React.Fragment key={filePath}>
+              {renderEmbeddedFile({ filePath, defaultExpanded: allNewFiles })}
+            </React.Fragment>
+          ))}
+        </div>
+      )}
     </div>
   );
 };

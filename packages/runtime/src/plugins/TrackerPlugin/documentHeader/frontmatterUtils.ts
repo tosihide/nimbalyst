@@ -39,10 +39,14 @@ function resolveFieldData(type: string, data: Record<string, any>): Record<strin
 }
 
 /**
- * Extract YAML frontmatter from markdown content
+ * Extract YAML frontmatter from markdown content.
+ *
+ * `\r?\n` tolerates Windows `\r\n` line endings (e.g. files checked out
+ * with `git config core.autocrlf=true`). Without it, frontmatter on
+ * Windows-newline files is silently undetectable. See nimbalyst#68.
  */
 export function extractFrontmatter(content: string): Record<string, any> | null {
-  const frontmatterRegex = /^---\n([\s\S]*?)\n---/;
+  const frontmatterRegex = /^---\r?\n([\s\S]*?)\r?\n---/;
   const match = content.match(frontmatterRegex);
 
   if (!match) {
@@ -63,7 +67,7 @@ export function extractFrontmatter(content: string): Record<string, any> | null 
  * Legacy frontmatter key -> tracker type mapping.
  * These keys were used before the unified `trackerStatus` format.
  */
-const LEGACY_KEY_TO_TYPE: Record<string, string> = {
+export const LEGACY_KEY_TO_TYPE: Record<string, string> = {
   planStatus: 'plan',
   decisionStatus: 'decision',
   bugStatus: 'bug',
@@ -74,10 +78,40 @@ const LEGACY_KEY_TO_TYPE: Record<string, string> = {
 /**
  * Extension-owned frontmatter keys that the tracker should detect but never flatten or rewrite.
  * The owning extension manages these blocks; the tracker only reads `type` from their presence.
+ *
+ * Exported so consumers like `TrackerTable.resolveTrackerFrontmatter` can use the same map
+ * and stay in sync with `detectTrackerFromFrontmatter` instead of duplicating it. See
+ * nimbalyst#67 for the consequences of having two diverging copies.
  */
-const EXTENSION_OWNED_KEYS: Record<string, string> = {
+export const EXTENSION_OWNED_KEYS: Record<string, string> = {
   automationStatus: 'automation',
 };
+
+/**
+ * Canonical public ID for a full-document tracker item backed by a file.
+ * Shared by renderer, main-process services, and MCP-facing code so plan /
+ * decision / other full-document items resolve to the same identifier
+ * everywhere, even if the backing projection row in `tracker_items` uses an
+ * older legacy ID.
+ */
+export function buildFullDocumentTrackerId(trackerType: string, relativePath: string): string {
+  return `fm:${trackerType}:${relativePath}`;
+}
+
+/**
+ * Parse a canonical full-document tracker ID back into its tracker type and
+ * workspace-relative file path.
+ */
+export function parseFullDocumentTrackerId(
+  itemId: string,
+): { trackerType: string; relativePath: string } | null {
+  const match = /^fm:([^:]+):(.+)$/.exec(itemId);
+  if (!match) return null;
+  return {
+    trackerType: match[1],
+    relativePath: match[2],
+  };
+}
 
 /**
  * Detect tracker type and data from frontmatter.
@@ -93,12 +127,16 @@ export function detectTrackerFromFrontmatter(content: string): TrackerFrontmatte
   }
 
   // Extension-owned keys take priority -- their extension manages the nested block,
-  // so always read from it rather than stale top-level fields.
+  // so always read from it rather than stale top-level fields. Top-level fields
+  // are still surfaced when they don't shadow a nested field (e.g. tracker
+  // workflow `status` and `tags`, which the nested AutomationStatus block does
+  // not own). The nested block wins on overlap to defeat any stale duplicates
+  // left over by previous flattening.
   for (const [extKey, trackerType] of Object.entries(EXTENSION_OWNED_KEYS)) {
     if (frontmatter[extKey] && typeof frontmatter[extKey] === 'object') {
       const extData = frontmatter[extKey] as Record<string, any>;
       const { [extKey]: _, trackerStatus: _ts, ...otherTopLevel } = frontmatter;
-      const merged = { ...extData, ...otherTopLevel, type: trackerType };
+      const merged = { ...otherTopLevel, ...extData, type: trackerType };
       return {
         type: trackerType,
         data: resolveFieldData(trackerType, merged),
@@ -138,6 +176,39 @@ export function detectTrackerFromFrontmatter(content: string): TrackerFrontmatte
 }
 
 /**
+ * Set or clear ONLY the `share` flag in a document's frontmatter, preserving
+ * every other key (including extension/legacy blocks like `planStatus`) exactly
+ * as-is. Unlike `updateTrackerInFrontmatter`, this does NOT migrate legacy keys
+ * to the canonical `trackerStatus` format -- so toggling team-sharing on a plan
+ * never reshuffles the plan extension's own frontmatter block.
+ *
+ * `share` is the tracker's per-item team-share flag; it sits at the top level,
+ * where the projection's field merge still surfaces it. Pass `null` to remove
+ * the key entirely (the unshare case).
+ */
+export function setShareInFrontmatter(
+  content: string,
+  share: { status: string; body: string } | null,
+): string {
+  const frontmatter = extractFrontmatter(content) || {};
+  const next: Record<string, any> = { ...frontmatter };
+  if (share) next.share = share;
+  else delete next.share;
+
+  const yamlContent = jsyaml.dump(next, {
+    indent: 2,
+    lineWidth: -1,
+    noRefs: true,
+  });
+  // `\r?\n` matches both LF and CRLF openers (nimbalyst#68).
+  const frontmatterRegex = /^---\r?\n[\s\S]*?\r?\n---\r?\n?/;
+  if (frontmatterRegex.test(content)) {
+    return content.replace(frontmatterRegex, `---\n${yamlContent}---\n`);
+  }
+  return `---\n${yamlContent}---\n${content}`;
+}
+
+/**
  * Update frontmatter in markdown content
  */
 export function updateFrontmatter(
@@ -153,7 +224,8 @@ export function updateFrontmatter(
     noRefs: true,
   });
 
-  const frontmatterRegex = /^---\n[\s\S]*?\n---\n?/;
+  // `\r?\n` matches both LF and CRLF openers (nimbalyst#68).
+  const frontmatterRegex = /^---\r?\n[\s\S]*?\r?\n---\r?\n?/;
   const hasFrontmatter = frontmatterRegex.test(content);
 
   if (hasFrontmatter) {
@@ -176,35 +248,52 @@ export function updateTrackerInFrontmatter(
 ): string {
   const frontmatter = extractFrontmatter(content) || {};
 
-  // Extension-owned keys are managed by their respective extensions -- don't touch them.
-  // Write only trackerStatus.type and timestamps; leave the nested block intact.
-  // Also clean up stale top-level duplicates of fields that belong in the nested block.
+  // Extension-owned keys are managed by their respective extensions -- never
+  // flatten or rewrite the nested block. Only mutate top-level fields the
+  // extension does not own (e.g. tracker workflow `status`, `tags`, timestamps),
+  // and clean up any stale top-level duplicates of nested fields that previous
+  // tracker code may have written before this fix landed.
   const extensionOwnedKey = Object.keys(EXTENSION_OWNED_KEYS).find(
     key => frontmatter[key] && typeof frontmatter[key] === 'object'
   );
   if (extensionOwnedKey) {
     const nestedData = frontmatter[extensionOwnedKey] as Record<string, any>;
-    const cleanedFrontmatter = { ...frontmatter };
-    for (const field of Object.keys(nestedData)) {
-      if (field in cleanedFrontmatter && field !== extensionOwnedKey) {
-        delete cleanedFrontmatter[field];
-      }
+    const nestedFieldNames = new Set(Object.keys(nestedData));
+
+    const topLevel: Record<string, any> = {};
+    for (const [key, value] of Object.entries(frontmatter)) {
+      if (key === extensionOwnedKey) continue;
+      if (key === 'trackerStatus') continue;
+      if (nestedFieldNames.has(key)) continue; // drop stale duplicate
+      topLevel[key] = value;
     }
+
+    // Apply caller updates targeting top-level tracker fields. Updates aimed at
+    // fields the nested block owns are dropped here -- the owning extension is
+    // the only writer for those fields.
+    for (const [key, value] of Object.entries(updates)) {
+      if (key === 'type') continue;
+      if (nestedFieldNames.has(key)) continue;
+      topLevel[key] = value;
+    }
+
     const now = formatLocalDateOnly(new Date());
-    const mergedUpdates: Record<string, any> = {};
-    for (const [key, value] of Object.entries(cleanedFrontmatter)) {
-      mergedUpdates[key] = value;
-    }
-    mergedUpdates.trackerStatus = { type: trackerType };
-    if (!cleanedFrontmatter.created) mergedUpdates.created = now;
-    mergedUpdates.updated = now;
+    if (!topLevel.created) topLevel.created = now;
+    topLevel.updated = now;
+
+    const mergedUpdates: Record<string, any> = {
+      ...topLevel,
+      [extensionOwnedKey]: nestedData,
+      trackerStatus: { type: trackerType },
+    };
 
     const yamlContent = jsyaml.dump(mergedUpdates, {
       indent: 2,
       lineWidth: -1,
       noRefs: true,
     });
-    const frontmatterRegex = /^---\n[\s\S]*?\n---\n?/;
+    // `\r?\n` matches both LF and CRLF openers (nimbalyst#68).
+    const frontmatterRegex = /^---\r?\n[\s\S]*?\r?\n---\r?\n?/;
     if (frontmatterRegex.test(content)) {
       return content.replace(frontmatterRegex, `---\n${yamlContent}---\n`);
     }
@@ -261,10 +350,37 @@ export function updateTrackerInFrontmatter(
  * Finds a line matching `... #type[id:ITEM_ID ...]` and rewrites the metadata fields.
  * Returns the updated content, or null if the item was not found.
  */
+/**
+ * Item/record field names that map to a different key in the compact inline
+ * `#type[...]` marker grammar. The re-scan parser reads the marker key (e.g.
+ * `due`), so the serializer must write that key, not the UI field name (e.g.
+ * `dueDate`). Without this a due-date edit is written as `dueDate:` and dropped
+ * on the next scan (GitHub #404).
+ */
+export const INLINE_FIELD_TO_MARKER_KEY: Record<string, string> = {
+  dueDate: 'due',
+};
+
+/**
+ * Normalize a marker's leading text to the same shape the indexer stores as the
+ * item title (strip a list/checkbox prefix, collapse whitespace, lowercase).
+ * Used to locate id-less markers by title.
+ */
+function normalizeInlineTitleForMatch(title: string): string {
+  return title
+    .replace(/^- /, '')
+    .replace(/^\[ \] /, '')
+    .replace(/^\[x\] /, '')
+    .trim()
+    .replace(/\s+/g, ' ')
+    .toLowerCase();
+}
+
 export function updateInlineTrackerItem(
   content: string,
   itemId: string,
-  updates: Record<string, any>
+  updates: Record<string, any>,
+  fallbackLocator?: { lineNumber?: number; title?: string }
 ): string | null {
   const lines = content.split('\n');
   let found = false;
@@ -274,27 +390,67 @@ export function updateInlineTrackerItem(
     `^(.+?)\\s+#([a-z][\\w-]*)\\[(.+?)\\](.*)$`
   );
 
+  const hasFallback =
+    fallbackLocator != null &&
+    (fallbackLocator.lineNumber != null || fallbackLocator.title != null);
+
   for (let i = 0; i < lines.length; i++) {
     const match = lines[i].match(inlineRegex);
     if (!match) continue;
 
     const [, textContent, type, propsStr, trailing] = match;
 
-    // Parse existing props to check if this is the right item
+    // Parse existing props to identify this marker.
     const props = parseInlineProps(propsStr);
-    if (props.id !== itemId) continue;
 
-    // Apply updates
+    // Explicit-id markers match by id. Id-less markers (their id is a
+    // deterministic hash that never reaches the file) fall back to a line +
+    // title match supplied by the caller; both provided signals must agree, so
+    // a drifted file fails to a no-op rather than editing the wrong marker.
+    let isMatch: boolean;
+    if (props.id) {
+      isMatch = props.id === itemId;
+    } else if (hasFallback) {
+      // Id-less markers: require the marker type, line, and title to all agree.
+      // An id-less item's id is a deterministic `${type}_${hash}`, so the marker
+      // type must match the itemId prefix. Requiring all three avoids editing the
+      // wrong marker after the file has drifted.
+      const typeOk = itemId.startsWith(`${type}_`);
+      const lineOk =
+        fallbackLocator!.lineNumber != null && fallbackLocator!.lineNumber === i + 1;
+      const titleOk =
+        fallbackLocator!.title != null &&
+        normalizeInlineTitleForMatch(textContent) ===
+          normalizeInlineTitleForMatch(fallbackLocator!.title);
+      isMatch = typeOk && lineOk && titleOk;
+    } else {
+      isMatch = false;
+    }
+    if (!isMatch) continue;
+
+    // Apply updates, mapping item field names to their inline marker key.
     for (const [key, value] of Object.entries(updates)) {
       if (key === 'title') {
         // Title is the text before #type[...], handled separately below
         continue;
       }
+      if (key === 'description') {
+        // An inline item's description lives in the indented block below the
+        // marker, not as a marker prop. Writing it here would pollute the marker
+        // and be ignored by the re-scan parser, so leave it out.
+        continue;
+      }
+      const markerKey = INLINE_FIELD_TO_MARKER_KEY[key] ?? key;
+      if (markerKey !== key) {
+        // Drop any stale prop written under the UI field name (e.g. a previously
+        // mis-written `dueDate:`) so it cannot shadow the canonical marker key.
+        delete props[key];
+      }
       if (value === null || value === undefined) {
         // Remove the prop when set to null/undefined
-        delete props[key];
+        delete props[markerKey];
       } else {
-        props[key] = value;
+        props[markerKey] = value;
       }
     }
 
@@ -348,7 +504,7 @@ function parseInlineProps(propsStr: string): Record<string, string> {
 /** Serialize props back to inline format: id:X status:Y priority:Z */
 function serializeInlineProps(props: Record<string, string>): string {
   // Maintain a consistent field order
-  const order = ['id', 'status', 'priority', 'owner', 'created', 'updated', 'tags', 'archived'];
+  const order = ['id', 'status', 'priority', 'owner', 'created', 'updated', 'due', 'tags', 'archived'];
   const parts: string[] = [];
 
   for (const key of order) {

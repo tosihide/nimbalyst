@@ -93,6 +93,15 @@ export interface SyncProvider {
   /** Check if a session is connected */
   isConnected(sessionId: string): boolean;
 
+  /**
+   * Returns true when the provider has latched a JWT/userId mismatch
+   * (server-rejected, locally refused). Callers in hot paths (e.g.
+   * MessageSyncHandler running on every agent message) should consult
+   * this before attempting connect() to avoid log floods and CPU spin.
+   * Optional so non-Stytch-backed providers don't have to implement it.
+   */
+  isAuthMismatched?(): boolean;
+
   /** Get sync status for a session */
   getStatus(sessionId: string): SyncStatus;
 
@@ -140,6 +149,8 @@ export interface SyncProvider {
       sessionType?: string;
       parentSessionId?: string;
       worktreeId?: string;
+      isArchived?: boolean;
+      isPinned?: boolean;
       messageCount: number;
       lastMessageAt: number;
       createdAt: number;
@@ -239,6 +250,18 @@ export interface SyncProvider {
   /** Subscribe to session creation responses (for mobile to receive response from desktop) */
   onCreateSessionResponse?(callback: (response: CreateSessionResponse) => void): () => void;
 
+  /** Subscribe to voice-tool requests from other devices (desktop runs the tool). */
+  onVoiceToolRequest?(callback: (request: VoiceToolRequest) => void): () => void;
+
+  /** Send a voice-tool result back to the requesting device (desktop -> mobile). */
+  sendVoiceToolResponse?(response: VoiceToolResponse): Promise<void>;
+
+  /** Send a voice-tool request (mobile -> desktop). */
+  sendVoiceToolRequest?(request: VoiceToolRequest): Promise<void>;
+
+  /** Subscribe to voice-tool responses (mobile receives the desktop result). */
+  onVoiceToolResponse?(callback: (response: VoiceToolResponse) => void): () => void;
+
   /** Subscribe to worktree creation requests from other devices (e.g., mobile) */
   onCreateWorktreeRequest?(callback: (request: CreateWorktreeRequest) => void): () => void;
 
@@ -334,6 +357,8 @@ export interface SessionIndexData {
   isArchived?: boolean;
   /** Whether the session is pinned */
   isPinned?: boolean;
+  /** Marker that the title was AI-chosen; prevents repeated rename attempts. */
+  hasBeenNamed?: boolean;
   /** Session ID this was branched/forked from */
   branchedFromSessionId?: string;
   /** Message ID at the branch point */
@@ -398,15 +423,27 @@ export interface SyncedSessionMetadata {
   sessionType?: string;
   /** Parent session ID for workstream/worktree hierarchy */
   parentSessionId?: string;
+  /** Worktree association (mirrored from ai_sessions.worktree_id). */
+  worktreeId?: string;
   provider?: string;
   model?: string;
   workspaceId?: string;
   workspacePath?: string;
   isArchived?: boolean;
+  /** Whether the session is pinned in the list on every device. */
+  isPinned?: boolean;
+  /** Marker that the title was AI-chosen; prevents repeated rename attempts. */
+  hasBeenNamed?: boolean;
   draftInput?: string;
   /** Epoch ms when draftInput was last updated by the sending device */
   draftUpdatedAt?: number;
-  updatedAt: number;
+  /**
+   * Set only when the change should bump session sort order on iOS (title,
+   * mode, archive, provider, model). Pins, reparents, archive flips, draft
+   * input, etc. deliberately push without updatedAt so the row keeps its
+   * place.
+   */
+  updatedAt?: number;
   /** Queued prompts waiting to be processed by desktop */
   queuedPrompts?: SyncedQueuedPrompt[];
   /** Signals that a message is waiting for desktop to process it */
@@ -540,6 +577,8 @@ export interface CreateSessionRequest {
   provider?: string;
   /** Model ID selected by mobile (e.g., "claude-code:opus"). Falls back to desktop default if omitted. */
   model?: string;
+  /** Agent role (e.g., "meta-agent", "standard"). Falls back to "standard" if omitted. */
+  agentRole?: string;
   /** Timestamp when request was created */
   timestamp: number;
 }
@@ -556,6 +595,41 @@ export interface CreateSessionResponse {
   /** Session ID if created successfully */
   sessionId?: string;
   /** Error message if creation failed */
+  error?: string;
+}
+
+/**
+ * Generic voice-tool RPC: a mobile voice agent asks the desktop to run a
+ * voice-enabled tool (e.g. the Nimbalyst Memory extension's
+ * search_project_knowledge / recall / remember) and return the result.
+ * Sent via index WebSocket, processed by desktop. The desktop gates execution
+ * to tools flagged voiceAgent:true. toolName/args/result are E2E-encrypted on
+ * the wire (they carry project knowledge).
+ */
+export interface VoiceToolRequest {
+  /** Unique request ID for correlation */
+  requestId: string;
+  /** Project/workspace this call targets */
+  projectId: string;
+  /** Tool name (realtime-safe, e.g. "search_project_knowledge") */
+  toolName: string;
+  /** JSON-stringified tool arguments */
+  argsJson: string;
+  /** Timestamp when request was created */
+  timestamp: number;
+}
+
+/**
+ * Response to a voice-tool request. Sent by desktop after the tool runs.
+ */
+export interface VoiceToolResponse {
+  /** Request ID this is responding to */
+  requestId: string;
+  /** Whether the tool ran successfully */
+  success: boolean;
+  /** JSON-stringified tool result (success message / data), if any */
+  resultJson?: string;
+  /** Error message if the tool failed or was not permitted */
   error?: string;
 }
 
@@ -625,6 +699,15 @@ export interface SyncedSettings {
   availableModels?: SyncedAvailableModel[];
   /** Desktop's default model ID (e.g., "claude-code:opus") */
   defaultModel?: string;
+  /** Whether the desktop "meta-agent" alpha feature is enabled (gates the mobile Meta Agent UI) */
+  metaAgentEnabled?: boolean;
+  /**
+   * Desktop's preferred agent language (BCP-47 or common language name). The
+   * voice agent pins its spoken language to this so mobile never starts up in a
+   * different language than the desktop is configured for. Empty/omitted means
+   * no preference -> the voice agent falls back to English.
+   */
+  preferredAgentLanguage?: string;
   /** Version for handling future upgrades */
   version: number;
 }

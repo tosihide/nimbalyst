@@ -1,199 +1,65 @@
 # Electron Package
 
-This package contains the Nimbalyst desktop application built with Electron.
+The Nimbalyst desktop app, built with Electron.
 
 ## Development Commands
 
-- **Start dev server**: `npm run dev` - Runs Electron app with hot reload
-- **Start dev server loop**: `npm run dev:loop` - Runs Electron with hot reload and enables restart by restart button or /restart command
-- **Build for Mac**: `npm run build:mac:local` - Creates local Mac build
-- **Build for Mac (notarized)**: `npm run build:mac:notarized` - Creates notarized Mac build
+- **Dev server**: `npm run dev` (user runs this — don't do it yourself)
+- **Dev with restart loop**: `npm run dev:loop` (enables restart button / `/restart` command)
+- **Build for Mac**: `npm run build:mac:local` or `npm run build:mac:notarized`
 
 ### Testing
 
 From the repository root:
-- **Run specific test file**: `npx playwright test e2e/monaco/file-watcher-updates.spec.ts`
-- **Run tests in a directory**: `npx playwright test e2e/monaco/`
-- **Run all E2E tests**: `npx playwright test`
+- Run one spec: `npx playwright test e2e/monaco/file-watcher-updates.spec.ts`
+- Run a directory: `npx playwright test e2e/monaco/`
+- Run all: `npx playwright test`
 
-**IMPORTANT**: Always use `npx playwright test` directly for E2E tests. Never use parallel execution as it corrupts PGLite.
-
-See `/docs/E2E_TESTING.md` for comprehensive E2E testing documentation.
+**Always use `npx playwright test` directly.** Never use parallel execution — it corrupts PGLite. See [/docs/E2E_TESTING.md](/docs/E2E_TESTING.md).
 
 ## Architecture
 
 ### Main and Renderer Processes
 
-Electron apps are split into two main contexts:
-- **Main process**: Runs Node.js, manages application lifecycle, windows, menus, and system interactions
-- **Renderer process**: Runs in a Chromium browser context, handles UI rendering and user interactions
+Electron apps split into two contexts:
+- **Main** runs Node.js, manages lifecycle, windows, menus, system interactions.
+- **Renderer** runs in a Chromium context; UI only.
 
-Whenever working in the main process, use NodeJS APIs to write platform-independent code. This is crucial because we target Windows, macOS, and Linux.
-
-Example:
-```typescript
-// GOOD: Cross-platform path handling
-import * as path from 'path';
-const fileName = path.basename(filePath, '.md');
-
-// BAD: Hardcoded path separators
-const fileName = filePath.split('/').pop()?.replace('.md', '');
-```
-
-Renderer processes cannot access Node.js APIs directly for security reasons. Use IPC to request services from the main process instead.
+Renderers cannot access Node.js APIs directly — use IPC to request main-process services. For initialization rules (dynamic import in `bootstrap.ts`, lazy init for `app.getPath()` consumers, `safeHandle` / `safeOn`), and cross-platform code patterns, see [MAIN_PROCESS_INIT.md](./MAIN_PROCESS_INIT.md).
 
 ## IPC Communication
 
 ### Preload API
 - **Location**: `src/preload/index.ts`
 - **Exposed as**: `window.electronAPI` (NOT `window.api`)
-- **Generic IPC methods**: `invoke`, `send`, `on`, and `off` for flexible service communication
-- **Service pattern**: Renderer services use these generic methods to communicate with main process services
+- **Generic methods**: `invoke`, `send`, `on`, `off`
+- Renderer services use these to talk to main-process services.
 
 ### Document Service
-- **Main process**: `ElectronDocumentService` handles file scanning, metadata extraction, and caching
-- **Renderer process**: `RendererDocumentService` acts as a facade, using IPC to communicate with main
-- **Metadata API**: Supports frontmatter extraction and caching for all markdown documents with bounded file reads (4KB)
-- **IPC channels**: `document-service:*` for all document-related operations
+- Main: `ElectronDocumentService` (file scanning, metadata extraction, caching)
+- Renderer: `RendererDocumentService` (facade over IPC)
+- **Metadata**: frontmatter extraction with bounded reads (4KB)
+- **Channels**: `document-service:*`
 
 ### Common IPC Issues
-- **window.api undefined**: Use `window.electronAPI`, not `window.api`
-- **Empty responses**: Check that window state has a valid workspace path
-- **Service resolution**: Main process resolves services based on workspace path
+- `window.api undefined` → use `window.electronAPI`
+- Empty responses → check the window has a valid workspace path
+- Service resolution is keyed off workspace path
 
-## Main Process Initialization
-
-The Electron main process has specific initialization constraints that must be respected:
-
-### Bootstrap and Dynamic Import
-
-`bootstrap.ts` is the entry point and uses a dynamic import for `index.ts`:
-```typescript
-import('./index.js');  // Dynamic, not static!
-```
-
-**Why dynamic import is required:**
-1. `NODE_PATH` must be set before `node-pty` can be resolved in packaged builds
-2. Static imports are resolved before any code runs
-3. Dynamic import defers loading until after `NODE_PATH` is configured
-
-**Never change this to a static import** - it will break packaged builds.
-
-### Lazy Initialization Pattern
-
-Singletons that read `app.getPath()` must use lazy initialization:
-
-```typescript
-// BAD: Reads userData path at module load time
-const store = new Store({ name: 'settings' });
-
-// GOOD: Defers until first access
-let _store: Store | null = null;
-function getStore() {
-  if (!_store) {
-    _store = new Store({ name: 'settings' });
-  }
-  return _store;
-}
-```
-
-This ensures `app.setPath('userData')` in bootstrap.ts takes effect.
-
-### IPC Handler Registration
-
-Use `safeHandle`/`safeOn` from `ipcRegistry.ts` instead of `ipcMain.handle`/`ipcMain.on`:
-
-```typescript
-// BAD: Crashes if handler already registered
-ipcMain.handle('my-channel', handler);
-
-// GOOD: Safe for duplicate registration
-safeHandle('my-channel', handler);
-```
-
-This prevents "second handler" errors from module duplication across chunk boundaries.
+For deep IPC patterns (`safeHandle`/`safeOn`, error handling, channel structure), see [/docs/IPC_GUIDE.md](/docs/IPC_GUIDE.md).
 
 ## Data Persistence
 
-The app uses **PGLite** (PostgreSQL in WebAssembly) for all data storage.
-
-**CRITICAL: Never use localStorage in the renderer process.** All persistent state must be stored via IPC to the main process using either:
+The app runs over **either PGLite (PostgreSQL in WebAssembly) or better-sqlite3** — both backends are active during the in-progress migration. Code must work on either; do not assume one. **Never use `localStorage` in the renderer.** Persist via IPC to main using:
 - **app-settings store** (`src/main/utils/store.ts`) for global app settings
 - **workspace-settings store** for per-project state
-- **PGLite database** for complex data like AI sessions and document history
+- **AppDatabase** (PGLite or SQLite, selected at init) for complex data (AI sessions, document history, trackers)
 
-### Database System
-- **Technology**: PGLite running in Node.js worker thread
-- **Storage**: Persistent file-based database with ACID compliance
-- **Worker architecture**: Isolated worker thread prevents module conflicts
-- **Bundling**: PGLite is fully bundled in packaged apps
-
-### Database Tables
-- **ai\_sessions**: AI chat conversations with full message history, document context, and provider configurations
-- **app\_settings**: Global application settings (theme, providers, shortcuts, etc.)
-- **project\_state**: Per-project state including window bounds, UI layout, open tabs, file tree, and editor settings
-- **session\_state**: Global session restoration data for windows and focus order
-- **document\_history**: Compressed document edit history with binary content storage
-
-### Data Locations (macOS)
-- **Database**: `~/Library/Application Support/@nimbalyst/electron/pglite-db/`
-- **Logs**: `~/Library/Application Support/@nimbalyst/electron/logs/`
-- **Debug log**: `~/Library/Application Support/@nimbalyst/electron/nimbalyst-debug.log`
-- **Legacy files**: `~/Library/Application Support/@nimbalyst/electron/history/` (preserved after migration)
-
-### Database Features
-- **Compression**: Document history stored as compressed binary data (BYTEA)
-- **JSON support**: Rich JSON fields for complex data structures (JSONB columns)
-- **Indexing**: Optimized indexes for fast queries on projects, timestamps, and file paths
-- **Protocol server**: Optional PostgreSQL protocol server for external database access
-
-### CRITICAL: App Shutdown and Database Integrity
-
-**NEVER use `app.exit()` to terminate the app.** It bypasses the `before-quit` handler in `index.ts`, skipping database backup and PGLite worker shutdown, which causes database corruption.
-
-Always use `app.quit()` to trigger proper cleanup. For programmatic restarts:
-
-```typescript
-// Dev mode: write signal file, let dev-loop.sh handle restart
-fs.writeFileSync(path.join(app.getAppPath(), '.restart-requested'), Date.now().toString());
-app.quit();
-
-// Production: use relaunch + quit
-app.relaunch();
-app.quit();
-```
-
-Dev mode requires the signal file because `app.relaunch()` doesn't work when electron-vite spawns both Vite and Electron processes.
-
-### CRITICAL: Date/Timestamp Handling
-
-All timestamp columns use TIMESTAMPTZ (timestamp with time zone). With TIMESTAMPTZ, PGLite returns Date objects that already represent the correct instant in time.
-
-**Rules when working with database timestamps:**
-
-1. **DO**: Use TIMESTAMPTZ for all timestamp columns (not TIMESTAMP without timezone)
-
-2. **DO**: Pass Date objects directly when writing to TIMESTAMPTZ columns
-```typescript
-db.query('INSERT INTO ... VALUES ($1)', [new Date()])
-```
-
-3. **DO**: Retrieve timestamps through `toMillis()` function
-```typescript
-const createdAt = toMillis(row.created_at);  // Returns epoch milliseconds
-```
-
-4. **DO**: Display with `toLocaleString()` for user's local timezone
-
-**Related files:**
-- `src/main/database/worker.js` - Database schema and comments
-- `src/main/services/PGLiteSessionStore.ts` - toMillis() implementation
+The biggest divergence to remember: `data->'key'` returns a parsed object on PGLite but a JSON string on SQLite. For tables, locations, shutdown rules, timestamp handling, and the full list of backend-divergent behaviors, see [DATABASE.md](./DATABASE.md).
 
 ## Renderer State Architecture
 
-### Jotai Atoms by Domain
-
-The renderer uses Jotai for state that needs to cross component boundaries:
+The renderer uses Jotai for state that crosses component boundaries. Editors use **EditorHost** — a stable service object — for all host communication; content state lives in the editor, not parent components.
 
 | Domain | Atoms | Owner |
 | --- | --- | --- |
@@ -203,189 +69,60 @@ The renderer uses Jotai for state that needs to cross component boundaries:
 | File Tree | `gitStatusAtom`, `expandedDirsAtom` | WorkspaceSidebar writes, FileTree reads |
 | Trackers | `trackerCountsAtom` | TrackerService writes, UI reads |
 
-### EditorHost Architecture
+**Re-render isolation**: parents subscribe to lists of IDs; children subscribe to their own atoms. If you need `React.memo` to prevent re-renders, you have the wrong architecture.
 
-All editors use EditorHost - a stable service object that handles all host communication:
-
-```typescript
-// TabEditor creates host once, passes to editor
-function TabEditor({ editorKey }: { editorKey: EditorKey }) {
-  const host = useMemo(() => createEditorHost({ editorKey }), [editorKey]);
-  const Editor = useEditorForFile(host.filePath);
-  return <Editor host={host} />;
-}
-
-// Editor uses host for everything
-function CustomEditor({ host }: { host: EditorHost }) {
-  useEffect(() => host.loadContent().then(setContent), [host]);
-  useEffect(() => host.onThemeChanged(setTheme), [host]);
-  useEffect(() => host.onFileChanged(handleFileChange), [host]);
-  useEffect(() => host.onSaveRequested(handleSave), [host]);
-
-  const handleChange = (content) => {
-    setContent(content);
-    host.setDirty(true);  // Writes to atom, Tab re-renders, TabEditor does NOT
-  };
-}
-```
-
-**Key principle:** EditorHost methods write to atoms. Components that need that state subscribe to the atoms directly. The parent (TabEditor) never subscribes, so it never re-renders.
-
-### Re-render Isolation
-
-Parents subscribe ONLY to lists of IDs. Children subscribe to their own atoms:
-
-```typescript
-// TabBar subscribes to list of tab IDs only
-function TabBar() {
-  const tabIds = useAtomValue(tabIdsAtom);  // Re-renders when tabs added/removed
-  return tabIds.map(id => <Tab key={id} editorKey={id} />);
-}
-
-// Each Tab subscribes to its own dirty atom
-function Tab({ editorKey }) {
-  const isDirty = useAtomValue(editorDirtyAtom(editorKey));  // Only THIS tab re-renders
-  return <div>{isDirty && '*'}</div>;
-}
-```
-
-**If you need React.memo to prevent re-renders, you have the wrong architecture.**
+For full patterns, see [/docs/EDITOR_STATE.md](/docs/EDITOR_STATE.md) and [/docs/JOTAI.md](/docs/JOTAI.md).
 
 ## Logging
 
-The Electron app has multiple log outputs:
+Three log destinations:
 
-### Main Process Logs
-- **Location**: `~/Library/Application Support/@nimbalyst/electron/logs/main.log` (macOS)
-- **View live**: `tail -f ~/Library/Application\ Support/@nimbalyst/electron/logs/main.log`
-- **What's logged**: Main process events, AI service, sync operations, file operations
-- **Categories**: `(MAIN)`, `(AI)`, `(API)`, `(SYNC)`, etc.
+- **Main process log**: `~/Library/Application Support/@nimbalyst/electron/logs/main.log` — main-process events, AI, sync, file ops; categories like `(MAIN)`, `(AI)`, `(API)`, `(SYNC)`.
+- **Renderer console log** (dev mode only): `~/Library/Application Support/@nimbalyst/electron/nimbalyst-debug.log` — captured via `webContents.on('console-message')` in `src/main/index.ts`.
 
-### Renderer Console Logs
-- **Location**: `~/Library/Application Support/@nimbalyst/electron/nimbalyst-debug.log` (macOS)
-- **What's logged**: Browser console messages from renderer process
-- **When active**: Only in development mode (`NODE_ENV !== 'production'`)
-- **Implementation**: `src/main/index.ts` - uses `webContents.on('console-message')`
-
-### Quick Debug Commands
-```bash
-# Watch main process logs live
-tail -f ~/Library/Application\ Support/@nimbalyst/electron/logs/main.log
-
-# Search for specific events
-grep "queuedPrompts\|index_broadcast" ~/Library/Application\ Support/@nimbalyst/electron/logs/main.log | tail -50
-
-# Watch sync-related logs
-tail -f ~/Library/Application\ Support/@nimbalyst/electron/logs/main.log | grep -E "CollabV3|Sync"
-```
+Use the agent log access tools (`get_main_process_logs`, `get_renderer_debug_logs`) instead of asking users to paste logs. See [/docs/DEBUGGING_LOGS.md](/docs/DEBUGGING_LOGS.md).
 
 ## Window State Persistence
 
-### Session State
-- **Global session state**: Restores all windows when the app restarts
-- **Window position and size**: Each window's bounds are saved and restored
-- **Focus order**: Windows are restored in the correct stacking order
-- **Developer tools state**: Dev tools are reopened if they were open when the window was closed
-
-### Project-Specific State
-- **Per-project window state**: Each project remembers its own window configuration
-- **Persistent across sessions**: Opening a project restores its last window position, size, and dev tools state
-- **File state**: Remembers which file was open in each project window
-
-### AI Chat Integration
-- **Panel width persistence**: The AI Chat panel width is saved per-window
-- **Collapsed state**: Whether the AI Chat panel is visible or hidden is remembered
-- **Draft input persistence**: Unsent messages in the chat input are saved with the session
-- **Session continuity**: Chat sessions persist across app restarts
+- **Global session state** restores all windows on restart (bounds, focus order, dev tools state).
+- **Per-project state** restores window configuration, open file, AI panel width and collapsed state, draft inputs.
+- **Session continuity** — chat sessions persist across restarts.
 
 ## Theme Support
 
-The editor supports multiple themes:
-- **Light**: Clean, bright theme for daytime use
-- **Dark**: Standard dark theme with warm gray colors (#2d2d2d, #1a1a1a, #3a3a3a)
-- **Crystal Dark**: A premium dark theme with Tailwind gray scale colors (#0f172a, #020617, #1e293b)
-- **Auto**: Follows system preference
+Themes: Light, Dark (#2d2d2d / #1a1a1a / #3a3a3a), Crystal Dark (Tailwind gray scale), Auto.
 
-The Electron app includes a Window > Theme menu to switch between all themes. The selected theme is persisted and applied to all windows.
+**Critical rules:**
+- Never hardcode colors in CSS files — use CSS variables.
+- `src/renderer/index.css` is the only place theme colors are defined.
+- Apply themes by setting both the `data-theme` attribute and the CSS class on the root element.
 
-### CRITICAL THEMING RULES
-- **NEVER hardcode colors in CSS files** - Always use CSS variables
-- **Single source of truth**: `src/renderer/index.css` is the ONLY place where theme colors are defined
-- **Always set both**: When applying themes, set both `data-theme` attribute AND CSS class on root element
-- **See THEMING.md**: Comprehensive theming documentation at `/packages/electron/THEMING.md`
+Comprehensive: [THEMING.md](./THEMING.md).
 
 ## File Operations
 
-### Project Sidebar
-- **Drag and drop**: Move files and folders via drag and drop
-- **Copy on drag**: Hold Option/Alt while dragging to copy instead of move
-- **Visual feedback**: Drop targets are highlighted during drag operations
-- **Automatic renaming**: Copied files get unique names to avoid conflicts
+- **Drag-and-drop**: move files/folders in the Project Sidebar; hold Option/Alt to copy.
+- **Context menus**: rename, delete, open in new window.
+- **File watching**: auto-update on disk changes.
 
-### File Tree Features
-- **Context menus**: Right-click files for rename, delete, open in new window
-- **File watching**: Automatic updates when files change on disk
-- **Recent files**: Quick access to recently opened files in projects
+## AI Providers
 
-## AI Provider Implementation Details
+Provider implementations live in `packages/runtime` — see `/packages/runtime/CLAUDE.md`. Electron-only pieces:
 
-### Key Files for Claude Providers
-- **Claude API Provider**:
-  - Main implementation: `packages/runtime/src/ai/server/providers/ClaudeProvider.ts`
-  - UI panel: `src/renderer/components/AIModels/panels/ClaudePanel.tsx`
-  - Uses Anthropic SDK directly with API key authentication
-  - Supports model selection from predefined list in `packages/runtime/src/ai/modelConstants.ts`
-
-- **Claude Code Provider**:
-  - Implementation: `packages/runtime/src/ai/server/providers/ClaudeCodeProvider.ts`
-  - UI panel: `src/renderer/components/AIModels/panels/ClaudeCodePanel.tsx`
-  - Installation manager: `src/renderer/components/AIModels/services/CLIInstaller.ts`
-  - Requires separate installation of `@anthropic-ai/claude-agent-sdk` package
-  - Dynamically loads SDK from user's installation
-
-### Provider Factory
-- Location: `packages/runtime/src/ai/server/ProviderFactory.ts`
-- Creates and manages provider instances based on type
-- Provider types: `claude`, `claude-code`, `openai`, `openai-codex`, `lmstudio`
-- Each provider is cached per session for efficiency
+- **Renderer panels**: `src/renderer/components/AIModels/panels/ClaudePanel.tsx`, `ClaudeCodePanel.tsx`
+- **Claude Code installer**: `src/renderer/components/AIModels/services/CLIInstaller.ts` (manages local installation of `@anthropic-ai/claude-agent-sdk`)
 
 ## macOS Code Signing & Notarization
 
-The Electron app supports notarized distribution for macOS:
-
-- **Signing configuration**: Uses Developer ID Application certificate
-- **Build scripts**: `npm run build:mac:notarized` for notarized build, `build:mac:local` for local testing
-- **Binary handling**: Properly signs ripgrep and other bundled tools
-- **JAR exclusion**: Automatically removes JAR files that can't be notarized
-- **Entitlements**: Configured for hardened runtime with necessary exceptions
+- **Certificate**: Developer ID Application
+- **Builds**: `npm run build:mac:notarized` (notarized), `build:mac:local` (local testing)
+- **Bundled tools**: ripgrep is signed; JAR files are excluded automatically (can't be notarized)
+- **Entitlements**: hardened runtime with necessary exceptions
 
 ## Git Worktree Integration
 
-Nimbalyst supports creating git worktrees for isolated AI coding sessions. See [/docs/WORKTREES.md](/docs/WORKTREES.md) for comprehensive documentation.
-
-### Database Schema
-- `worktrees` table: Stores worktree metadata (id, workspace_id, name, path, branch, base_branch)
-- `ai_sessions.worktree_id`: Foreign key linking sessions to worktrees (nullable)
-
-### IPC Channels
-- `worktree:create` - Create new worktree
-- `worktree:get-status` - Get git status (ahead/behind, uncommitted changes)
-- `worktree:delete` - Delete worktree
-- `worktree:list` - List all worktrees for workspace
-- `worktree:get` - Get single worktree by ID
-
-## Testing
-
-E2E tests use Playwright. See `/docs/E2E_TESTING.md` for comprehensive testing documentation.
-
-**Key testing patterns:**
-- Always create test files BEFORE launching the app
-- Use manual save utilities instead of keyboard shortcuts
-- Use AI Tool Simulator utilities for testing AI features
-- Add `data-testid` attributes to new UI components
+Nimbalyst creates git worktrees for isolated AI coding sessions. See [/docs/WORKTREES.md](/docs/WORKTREES.md). The `worktrees` table stores metadata; `ai_sessions.worktree_id` links sessions to worktrees. IPC channels: `worktree:create`, `worktree:get-status`, `worktree:delete`, `worktree:list`, `worktree:get`.
 
 ## Analytics
 
-See `/docs/ANALYTICS_GUIDE.md` for details on adding anonymous usage analytics.
-
-**IMPORTANT**: When adding, modifying, or removing PostHog events, you MUST update `/docs/POSTHOG_EVENTS.md` with the event name, file location, trigger, and properties.
+See [/docs/ANALYTICS_GUIDE.md](/docs/ANALYTICS_GUIDE.md). **When adding, modifying, or removing PostHog events, update [/docs/POSTHOG_EVENTS.md](/docs/POSTHOG_EVENTS.md).**

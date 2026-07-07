@@ -8,7 +8,7 @@
  * EditorMode, AgentMode, and TrackerMode.
  */
 
-import React, { useCallback, useState, useEffect, useRef, useMemo } from 'react';
+import React, { useCallback, useState, useEffect, useRef, useMemo, forwardRef, useImperativeHandle } from 'react';
 import { useAtomValue } from 'jotai';
 import { store } from '@nimbalyst/runtime/store';
 import { CollabSidebar } from './CollabSidebar';
@@ -16,8 +16,14 @@ import { TabsProvider, useTabsActions, useTabs, type TabData } from '../../conte
 import { TabManager } from '../TabManager/TabManager';
 import { TabContent } from '../TabContent/TabContent';
 import { ChatSidebar } from '../ChatSidebar';
+import { useEditorMaximize } from '../../hooks/useEditorMaximize';
 import { openCollabDocumentViaIPC } from '../../utils/collabDocumentOpener';
-import { initSharedDocuments, destroyTeamSync, pendingCollabDocumentAtom, sharedDocumentsAtom, type SharedDocument } from '../../store/atoms/collabDocuments';
+import {
+  loadOpenCollabDocs,
+  persistOpenCollabDocs,
+  type PersistedCollabEntry,
+} from '../../utils/collabOpenDocsPersistence';
+import { initSharedDocuments, pendingCollabDocumentAtom, sharedDocumentsAtom, type SharedDocument } from '../../store/atoms/collabDocuments';
 import { isCollabUri, parseCollabUri } from '../../utils/collabUri';
 import { MaterialSymbol } from '@nimbalyst/runtime';
 import { getCollabNodeName } from './collabTree';
@@ -30,19 +36,31 @@ interface CollabModeProps {
   onFileOpen: (path: string) => void;
 }
 
-export const CollabMode: React.FC<CollabModeProps> = ({
+export interface CollabModeRef {
+  closeActiveTab: () => void;
+  reopenLastClosedTab: () => Promise<void>;
+  getActiveDocumentPath: () => string | null;
+  toggleSidebarCollapsed: () => void;
+}
+
+export const CollabMode = forwardRef<CollabModeRef, CollabModeProps>(function CollabMode({
   workspacePath,
   isActive,
   onFileOpen,
-}) => {
+}, ref) {
   // Initialize shared documents sync from TeamRoom.
   // Retry when user activates collab mode, in case the initial attempt
   // failed (e.g., encryption key not yet available, admin hadn't shared keys).
+  //
+  // Multi-project rail switching re-mounts CollabMode whenever the visible
+  // `workspacePath` changes, but the team-sync provider is keyed by path
+  // in `providersByPath` and must stay connected while the project is warm
+  // — tearing it down on every switch would lose pending writes. The
+  // explicit close path (`closeOpenProjectAtom` → workspaceStatePruner →
+  // `pruneCollabDocumentsWorkspaceState`) is the one that destroys the
+  // provider when the user actually closes the project.
   useEffect(() => {
     initSharedDocuments(workspacePath);
-    return () => {
-      destroyTeamSync();
-    };
   }, [workspacePath]);
 
   useEffect(() => {
@@ -54,13 +72,14 @@ export const CollabMode: React.FC<CollabModeProps> = ({
   return (
     <TabsProvider workspacePath={workspacePath} disablePersistence>
       <CollabModeInner
+        ref={ref}
         workspacePath={workspacePath}
         isActive={isActive}
         onFileOpen={onFileOpen}
       />
     </TabsProvider>
   );
-};
+});
 
 // ---------------------------------------------------------------------------
 // Persist open collab document IDs and layout in workspace state.
@@ -74,27 +93,8 @@ const COLLAB_CHAT_DEFAULT = 350;
 interface CollabLayout {
   sidebarWidth: number;
   chatWidth: number;
-}
-
-/** Save the list of open collab document IDs to workspace state. */
-async function persistOpenCollabDocs(workspacePath: string, documentIds: string[]): Promise<void> {
-  try {
-    await window.electronAPI?.invoke?.('workspace:update-state', workspacePath, {
-      openCollabDocumentIds: documentIds,
-    });
-  } catch (err) {
-    console.warn('[CollabMode] Failed to persist open collab docs:', err);
-  }
-}
-
-/** Load the list of open collab document IDs from workspace state. */
-async function loadOpenCollabDocs(workspacePath: string): Promise<string[]> {
-  try {
-    const state = await window.electronAPI?.invoke?.('workspace:get-state', workspacePath);
-    return state?.openCollabDocumentIds ?? [];
-  } catch {
-    return [];
-  }
+  sidebarCollapsed: boolean;
+  chatCollapsed: boolean;
 }
 
 let layoutPersistTimer: ReturnType<typeof setTimeout> | null = null;
@@ -120,29 +120,38 @@ async function loadCollabLayout(workspacePath: string): Promise<CollabLayout> {
     return {
       sidebarWidth: state?.collabLayout?.sidebarWidth ?? COLLAB_SIDEBAR_DEFAULT,
       chatWidth: state?.collabLayout?.chatWidth ?? COLLAB_CHAT_DEFAULT,
+      sidebarCollapsed: state?.collabLayout?.sidebarCollapsed ?? false,
+      chatCollapsed: state?.collabLayout?.chatCollapsed ?? false,
     };
   } catch {
-    return { sidebarWidth: COLLAB_SIDEBAR_DEFAULT, chatWidth: COLLAB_CHAT_DEFAULT };
+    return {
+      sidebarWidth: COLLAB_SIDEBAR_DEFAULT,
+      chatWidth: COLLAB_CHAT_DEFAULT,
+      sidebarCollapsed: false,
+      chatCollapsed: false,
+    };
   }
 }
 
 /**
  * Inner component that has access to TabsProvider context.
  */
-const CollabModeInner: React.FC<CollabModeProps> = ({
+const CollabModeInner = forwardRef<CollabModeRef, CollabModeProps>(function CollabModeInner({
   workspacePath,
   isActive,
   onFileOpen,
-}) => {
+}, ref) {
   const tabsActions = useTabsActions();
   const { tabs, activeTabId } = useTabs();
   const pendingDoc = useAtomValue(pendingCollabDocumentAtom);
   const sharedDocuments = useAtomValue(sharedDocumentsAtom);
   const [restored, setRestored] = useState(false);
 
-  // --- Resizable panel state ---
+  // --- Resizable / collapsible panel state ---
   const [sidebarWidth, setSidebarWidth] = useState(COLLAB_SIDEBAR_DEFAULT);
   const [chatWidth, setChatWidth] = useState(COLLAB_CHAT_DEFAULT);
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
+  const [chatCollapsed, setChatCollapsed] = useState(false);
 
   // Refs for sidebar resize drag (avoids re-renders during drag)
   const sidebarDragRef = useRef({ isDragging: false, startX: 0, startWidth: 0 });
@@ -229,6 +238,8 @@ const CollabModeInner: React.FC<CollabModeProps> = ({
       if (cancelled) return;
       setSidebarWidth(layout.sidebarWidth);
       setChatWidth(layout.chatWidth);
+      setSidebarCollapsed(layout.sidebarCollapsed);
+      setChatCollapsed(layout.chatCollapsed);
     });
     return () => { cancelled = true; };
   }, [workspacePath]);
@@ -254,20 +265,63 @@ const CollabModeInner: React.FC<CollabModeProps> = ({
       document.removeEventListener('mouseup', handleMouseUp);
       // Persist after drag ends
       setSidebarWidth((w) => {
-        persistCollabLayout(workspacePath, { sidebarWidth: w, chatWidth });
+        persistCollabLayout(workspacePath, { sidebarWidth: w, chatWidth, sidebarCollapsed, chatCollapsed });
         return w;
       });
     };
 
     document.addEventListener('mousemove', handleMouseMove);
     document.addEventListener('mouseup', handleMouseUp);
-  }, [sidebarWidth, chatWidth, workspacePath]);
+  }, [sidebarWidth, chatWidth, sidebarCollapsed, chatCollapsed, workspacePath]);
 
   // --- Chat sidebar resize handler (via ChatSidebar's onWidthChange) ---
   const handleChatWidthChange = useCallback((newWidth: number) => {
     setChatWidth(newWidth);
-    persistCollabLayout(workspacePath, { sidebarWidth, chatWidth: newWidth });
-  }, [workspacePath, sidebarWidth]);
+    persistCollabLayout(workspacePath, { sidebarWidth, chatWidth: newWidth, sidebarCollapsed, chatCollapsed });
+  }, [workspacePath, sidebarWidth, sidebarCollapsed, chatCollapsed]);
+
+  // --- Collapse toggles (left document tree + right chat panel) ---
+  const toggleSidebarCollapsed = useCallback(() => {
+    setSidebarCollapsed((prev) => {
+      const next = !prev;
+      persistCollabLayout(workspacePath, { sidebarWidth, chatWidth, sidebarCollapsed: next, chatCollapsed });
+      return next;
+    });
+  }, [workspacePath, sidebarWidth, chatWidth, chatCollapsed]);
+
+  const toggleChatCollapsed = useCallback(() => {
+    setChatCollapsed((prev) => {
+      const next = !prev;
+      persistCollabLayout(workspacePath, { sidebarWidth, chatWidth, sidebarCollapsed, chatCollapsed: next });
+      return next;
+    });
+  }, [workspacePath, sidebarWidth, chatWidth, sidebarCollapsed]);
+
+  // Double-click a tab to maximize the editor (collapse doc list + AI chat).
+  // Second double-click restores the exact prior collapse state.
+  const { isMaximized: isEditorMaximized, toggle: toggleEditorMaximized, clearMaximize: clearEditorMaximized } =
+    useEditorMaximize<{ sidebar: boolean; chat: boolean }>({
+      scopeKey: workspacePath,
+      snapshot: () => ({ sidebar: sidebarCollapsed, chat: chatCollapsed }),
+      maximize: () => {
+        setSidebarCollapsed(true);
+        setChatCollapsed(true);
+        persistCollabLayout(workspacePath, { sidebarWidth, chatWidth, sidebarCollapsed: true, chatCollapsed: true });
+      },
+      restore: (snap) => {
+        setSidebarCollapsed(snap.sidebar);
+        setChatCollapsed(snap.chat);
+        persistCollabLayout(workspacePath, { sidebarWidth, chatWidth, sidebarCollapsed: snap.sidebar, chatCollapsed: snap.chat });
+      },
+    });
+
+  // If the user manually reopens a panel while maximized, drop the stale
+  // restore snapshot so the next double-click re-maximizes from scratch.
+  useEffect(() => {
+    if (isEditorMaximized && !(sidebarCollapsed && chatCollapsed)) {
+      clearEditorMaximized();
+    }
+  }, [isEditorMaximized, sidebarCollapsed, chatCollapsed, clearEditorMaximized]);
 
   const handleDocumentSelect = useCallback(async (doc: SharedDocument, initialContent?: string) => {
     // Check if already open as a tab
@@ -294,6 +348,7 @@ const CollabModeInner: React.FC<CollabModeProps> = ({
         workspacePath,
         documentId: doc.documentId,
         title: doc.title,
+        documentType: doc.documentType,
         initialContent,
         addTab: tabsActions.addTab,
       });
@@ -346,43 +401,58 @@ const CollabModeInner: React.FC<CollabModeProps> = ({
     }
   }, [sharedDocuments, tabs, tabsActions]);
 
-  // Persist open document IDs whenever tabs change
+  // Persist open document entries (id + documentType) whenever tabs change.
+  // documentType is required at restore time so the right editor is mounted;
+  // without it CollaborativeTabEditor falls back to markdown for everything
+  // and renders an Excalidraw / mockup Y.Doc as blank.
   useEffect(() => {
     if (!restored) return; // Don't persist until we've finished restoring
-    const docIds = tabs
-      .filter(t => isCollabUri(t.filePath))
-      .map(t => {
-        try { return parseCollabUri(t.filePath).documentId; }
-        catch { return null; }
+    const docsById = new Map<string, SharedDocument>();
+    for (const d of sharedDocuments) docsById.set(d.documentId, d);
+
+    const entries: PersistedCollabEntry[] = tabs
+      .filter((t) => isCollabUri(t.filePath))
+      .map((t) => {
+        try {
+          const { documentId } = parseCollabUri(t.filePath);
+          return {
+            documentId,
+            documentType: docsById.get(documentId)?.documentType ?? 'markdown',
+          };
+        } catch {
+          return null;
+        }
       })
-      .filter((id): id is string => id !== null);
-    persistOpenCollabDocs(workspacePath, docIds);
-  }, [tabs, workspacePath, restored]);
+      .filter((entry): entry is PersistedCollabEntry => entry !== null);
+    persistOpenCollabDocs(workspacePath, entries);
+  }, [tabs, sharedDocuments, workspacePath, restored]);
 
   // Restore previously open collab documents on mount
   useEffect(() => {
     let cancelled = false;
     (async () => {
-      const savedDocIds = await loadOpenCollabDocs(workspacePath);
-      if (cancelled || savedDocIds.length === 0) {
+      const savedEntries = await loadOpenCollabDocs(workspacePath);
+      if (cancelled || savedEntries.length === 0) {
         setRestored(true);
         return;
       }
 
       // Open each saved document. We don't need to wait for sharedDocumentsAtom
       // because openCollabDocumentViaIPC resolves auth/keys via IPC directly.
-      // Use the documentId as both documentId and title (title is only for display).
-      for (const docId of savedDocIds) {
+      // Use the documentId as both documentId and title (title is only for display);
+      // the title atom gets repopulated from the shared-docs sync afterwards.
+      for (const entry of savedEntries) {
         if (cancelled) break;
         try {
           await openCollabDocumentViaIPC({
             workspacePath,
-            documentId: docId,
-            title: docId,
+            documentId: entry.documentId,
+            title: entry.documentId,
+            documentType: entry.documentType,
             addTab: tabsActions.addTab,
           });
         } catch (err) {
-          console.warn('[CollabMode] Failed to restore collab document:', docId, err);
+          console.warn('[CollabMode] Failed to restore collab document:', entry.documentId, err);
         }
       }
       setRestored(true);
@@ -391,44 +461,79 @@ const CollabModeInner: React.FC<CollabModeProps> = ({
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [workspacePath]); // Only run on mount (tabsActions is stable ref-based)
 
-  // Auto-open a pending document (set by "Share to Team" action)
+  // Auto-open a pending document. Set by "Share to Team" (carries title +
+  // initialContent for first-share seeding) and by deep links (documentId
+  // only -- title arrives later via the shared-docs sync, which the
+  // sharedDocuments rename effect picks up).
   useEffect(() => {
     if (!pendingDoc || !isActive) return;
 
-    // Find the document in the shared documents atom
     const docs = store.get(sharedDocumentsAtom);
-    const doc = docs.find(d => d.documentId === pendingDoc.documentId);
-    if (doc) {
-      // Clear the pending flag before opening to avoid re-triggering
-      store.set(pendingCollabDocumentAtom, null);
-      handleDocumentSelect(doc, pendingDoc.initialContent);
-    }
+    const found = docs.find(d => d.documentId === pendingDoc.documentId);
+
+    // Prefer the synced doc (it has the canonical title), but fall back to
+    // a synthetic doc so cold-start deep links still open immediately.
+    const docToOpen: SharedDocument = found
+      ? (pendingDoc.documentType ? { ...found, documentType: pendingDoc.documentType } : found)
+      : {
+          documentId: pendingDoc.documentId,
+          title: pendingDoc.documentId,
+          documentType: pendingDoc.documentType ?? 'markdown',
+          createdBy: '',
+          createdAt: Date.now(),
+          updatedAt: Date.now(),
+        };
+
+    store.set(pendingCollabDocumentAtom, null);
+    handleDocumentSelect(docToOpen, pendingDoc.initialContent);
   }, [pendingDoc, isActive, handleDocumentSelect]);
 
   const handleTabClose = useCallback((tabId: string) => {
     tabsActions.removeTab(tabId);
   }, [tabsActions]);
 
+  useImperativeHandle(ref, () => ({
+    closeActiveTab: () => {
+      if (activeTabId) {
+        tabsActions.removeTab(activeTabId);
+      }
+    },
+    reopenLastClosedTab: async () => {
+      await tabsActions.reopenLastClosedTab(async () => {});
+    },
+    getActiveDocumentPath: () => {
+      if (!activeTabId) return null;
+      const activeTab = tabs.find((tab) => tab.id === activeTabId);
+      return activeTab?.filePath ?? null;
+    },
+    toggleSidebarCollapsed,
+  }), [activeTabId, tabs, tabsActions, toggleSidebarCollapsed]);
+
   const hasTabs = tabs.length > 0;
 
   return (
     <div className="collab-mode flex-1 flex flex-row overflow-hidden min-h-0">
-      {/* Left: Document sidebar (resizable) */}
-      <div style={{ width: sidebarWidth, minWidth: COLLAB_SIDEBAR_MIN, maxWidth: COLLAB_SIDEBAR_MAX }} className="shrink-0">
-        <CollabSidebar
-          workspacePath={workspacePath}
-          onDocumentSelect={handleDocumentSelect}
-          activeDocumentId={activeCollabDocumentId}
-        />
-      </div>
+      {/* Left: Document sidebar (resizable; hidden when collapsed via the
+          Shared Docs nav-gutter icon, matching Files/Agent modes) */}
+      {!sidebarCollapsed && (
+        <>
+          <div style={{ width: sidebarWidth, minWidth: COLLAB_SIDEBAR_MIN, maxWidth: COLLAB_SIDEBAR_MAX }} className="shrink-0">
+            <CollabSidebar
+              workspacePath={workspacePath}
+              onDocumentSelect={handleDocumentSelect}
+              activeDocumentId={activeCollabDocumentId}
+            />
+          </div>
 
-      {/* Left resize handle */}
-      <div
-        onMouseDown={handleSidebarMouseDown}
-        className="w-1 cursor-col-resize shrink-0 relative z-10 bg-nim-secondary"
-      >
-        <div className="w-0.5 h-full mx-auto bg-nim-border transition-colors duration-200 hover:bg-nim-accent" />
-      </div>
+          {/* Left resize handle */}
+          <div
+            onMouseDown={handleSidebarMouseDown}
+            className="w-1 cursor-col-resize shrink-0 relative z-10 bg-nim-secondary"
+          >
+            <div className="w-0.5 h-full mx-auto bg-nim-border transition-colors duration-200 hover:bg-nim-accent" />
+          </div>
+        </>
+      )}
 
       {/* Center: Tabs + editor */}
       <div className="flex-1 flex flex-col overflow-hidden min-h-0">
@@ -437,8 +542,12 @@ const CollabModeInner: React.FC<CollabModeProps> = ({
             onTabClose={handleTabClose}
             onNewTab={() => {}}
             isActive={isActive}
+            onToggleAIChat={toggleChatCollapsed}
+            isAIChatCollapsed={chatCollapsed}
+            onTabDoubleClick={toggleEditorMaximized}
           >
             <TabContent
+              workspaceId={workspacePath}
               onTabClose={handleTabClose}
               onGetContentReady={handleGetContentReady}
             />
@@ -457,10 +566,13 @@ const CollabModeInner: React.FC<CollabModeProps> = ({
         )}
       </div>
 
-      {/* Right: AI Chat sidebar (resizable via ChatSidebar built-in handle) */}
+      {/* Right: AI Chat sidebar (resizable via ChatSidebar built-in handle, collapsible) */}
       {hasTabs && (
         <ChatSidebar
           workspacePath={workspacePath}
+          isActive={isActive}
+          isCollapsed={chatCollapsed}
+          onToggleCollapse={toggleChatCollapsed}
           getDocumentContext={getDocumentContext}
           onFileOpen={async (filePath) => onFileOpen(filePath)}
           width={chatWidth}
@@ -469,4 +581,4 @@ const CollabModeInner: React.FC<CollabModeProps> = ({
       )}
     </div>
   );
-};
+});

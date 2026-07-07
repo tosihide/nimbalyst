@@ -6,6 +6,7 @@ public struct SettingsView: View {
     @ObservedObject private var notificationManager = NotificationManager.shared
     @State private var analyticsEnabled = AnalyticsManager.shared.isEnabled
     @State private var showUnpairConfirmation = false
+    @State private var showSignOutConfirmation = false
     @State private var showDeleteAccountConfirmation = false
     @State private var isDeletingAccount = false
     @State private var deleteAccountError: String?
@@ -155,8 +156,11 @@ public struct SettingsView: View {
     // MARK: - Voice Mode
 
     #if os(iOS)
+    // Full GA Realtime voice list (desktop parity); marin and cedar are the
+    // gpt-realtime-2 flagship voices.
     private static let voiceOptions = [
         "alloy", "ash", "ballad", "coral", "echo", "sage", "shimmer", "verse",
+        "marin", "cedar",
     ]
 
     private var voiceModeSection: some View {
@@ -259,6 +263,35 @@ public struct SettingsView: View {
 
     private var dangerSection: some View {
         Section {
+            // Sign out -- clears Stytch auth but keeps the device pairing and
+            // encryption seed in Keychain. Routes the user to LoginView where
+            // they can sign in again without re-pairing. Use this when sync
+            // fails with auth errors that don't auto-recover (e.g. JWT signed
+            // with a now-rotated key).
+            if appState.authManager.isAuthenticated {
+                Button {
+                    showSignOutConfirmation = true
+                } label: {
+                    HStack {
+                        Image(systemName: "rectangle.portrait.and.arrow.right")
+                        Text("Sign Out")
+                    }
+                }
+                .confirmationDialog(
+                    "Sign out?",
+                    isPresented: $showSignOutConfirmation,
+                    titleVisibility: .visible
+                ) {
+                    Button("Sign Out", role: .destructive) {
+                        appState.syncManager?.disconnect()
+                        appState.authManager.logout()
+                    }
+                    Button("Cancel", role: .cancel) {}
+                } message: {
+                    Text("You'll need to sign in again. Pairing and synced data are kept on this device.")
+                }
+            }
+
             Button(role: .destructive) {
                 showUnpairConfirmation = true
             } label: {

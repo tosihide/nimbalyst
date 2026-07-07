@@ -43,26 +43,38 @@ When the user types `/launch-new-session [task description]`:
    separately from the current session — e.g. "isolated bugs", "fix and commit
    separately", "without polluting this workstream", "as its own session".
 
-3. **Decide on `useWorktree`.** Default to `false` (same workspace). Only set
-   `true` when the user's phrasing implies the new session needs its own branch /
-   working directory — e.g. "in a new worktree", "in parallel without conflicts",
-   "without touching my current branch". Note: `isolated` and `useWorktree` are
-   independent — isolated alone keeps the same working directory but separates
-   the session record; combine with `useWorktree: true` for a fully separate
-   branch.
+3. **Decide on `useWorktree`.** Default to `false`. The default already inherits
+   the caller's working directory: if the current session is running in a
+   worktree, the spawned session runs in that same worktree (its edits land
+   where the user is looking). Only set `true` when the user's phrasing implies
+   the new session needs its OWN new branch / working directory — e.g. "in a
+   new worktree", "in parallel without conflicts", "without touching my current
+   branch". Note: `isolated` and `useWorktree` are independent — isolated alone
+   still inherits the caller's working directory but separates the session
+   record; combine with `useWorktree: true` to also branch off into a fresh
+   worktree.
 
 4. **Decide on `notifyOnComplete`.** Default to `false` (fire-and-forget). Only
    set `true` if the user's phrasing implies they want the result back in this
    session ("...and tell me when it's done", "...and bring back the answer").
 
-5. **Call `spawn_session`** with:
+5. **Decide on model.** By default the new session uses the app's global default
+   model. Override only when the user asks for it:
+   - If the user names a model ("...with opus", "...using sonnet"), pass that as
+     `model` (e.g. `model: "claude-code:opus"`).
+   - If the user says "same model", "keep the current model", or similar, pass
+     `inheritModel: true` so the new session uses the caller's model.
+   - `model` wins over `inheritModel` when both are set.
+
+6. **Call `spawn_session`** with:
    - `prompt`: the handoff brief from step 1
    - `title`: a short descriptive title (e.g. "Finish auth tests")
    - `isolated`: per step 2 (omit to use the default)
    - `useWorktree`: per step 3
    - `notifyOnComplete`: per step 4 (omit to use the default)
+   - `model` / `inheritModel`: per step 5 (omit both to use the global default)
 
-6. **Report back to the user** with:
+7. **Report back to the user** with:
    - The new session id
    - A one-line summary of what was handed off
    - The mode used: "sibling under workstream X", "isolated top-level session",

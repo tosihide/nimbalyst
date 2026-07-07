@@ -15,14 +15,21 @@ import { useEffect, useRef, useCallback, useState, useMemo } from 'react';
 import { RevoGrid, type RevoGridCustomEvent, type ColumnRegular } from '@revolist/react-datagrid';
 import type { RevoGridElement } from '../revogrid-types';
 import type { EditorHostProps, NormalizedSelectionRange, ColumnFormat, DiffState, CellDiff } from '../types';
-import { useEditorLifecycle, readClipboard, type DiffConfig } from '@nimbalyst/extension-sdk';
+import {
+  useEditorLifecycle,
+  useCollaborativeEditor,
+  readClipboard,
+  type DiffConfig,
+} from '@nimbalyst/extension-sdk';
+import { CsvBinding } from '../collab/csvBinding';
+import { isCsvYDocEmpty, seedCsvYDoc, getYCsv } from '../collab/seed';
 import { useSpreadsheetMetadata } from '../hooks/useSpreadsheetMetadata';
 import { createGridOperations, type GridOperations } from '../utils/gridOperations';
 import { UndoRedoPlugin } from '../plugins/UndoRedoPlugin';
 import { columnIndexToLetter, columnLetterToIndex, generateColumnHeaders, parseCSV } from '../utils/csvParser';
 import { computeDiff, getCellDiffClass, getCellPreviousValue } from '../utils/diffCompute';
 import { isFormula } from '../utils/formulaEngine';
-import { getColumnTypeName } from '../utils/formatters';
+import { formatCellValue, getColumnTypeName } from '../utils/formatters';
 import { FormulaBar, type FormulaBarHandle } from './FormulaBar';
 import { ContextMenu, type ContextMenuItem } from './ContextMenu';
 import { ColumnFormatDialog } from './ColumnFormatDialog';
@@ -84,12 +91,26 @@ function generateColumns(
     const alignClass = getColumnAlignmentClass(format);
     const width = columnWidths[index] ?? DEFAULT_COLUMN_WIDTH;
 
+    const needsDisplayFormat =
+      format && (format.type === 'currency' || format.type === 'percentage' || format.type === 'number');
+
     return {
       prop: letter,
       name: letter,
       size: width,
       editor: 'sheets',
       ...(index < frozenColumnCount ? { pin: 'colPinStart' as const } : {}),
+      ...(needsDisplayFormat
+        ? {
+            // Format display only; edit mode reads the raw source value via editCell.val,
+            // so source data is unchanged and double-click editing shows the unformatted number.
+            cellTemplate: (h, props) => {
+              const raw = props.model?.[props.prop as string];
+              const value = typeof raw === 'string' || typeof raw === 'number' ? raw : null;
+              return h('span', {}, formatCellValue(value, format));
+            },
+          }
+        : {}),
       cellProperties: (cellData: { model: Record<string, unknown>; rowIndex: number }) => {
         const classes: Record<string, boolean> = {};
 
@@ -149,6 +170,18 @@ function normalizeRange(
 export function SpreadsheetEditor({ host }: EditorHostProps) {
   const { filePath, isActive } = host;
 
+  // Reactive read-only state. In read-only mode (inline embeds, share
+  // viewer) we hide the formula-bar toolbar, suppress the right-click
+  // editing context menu, and pass `readonly` through to RevoGrid so cells
+  // can't be edited. Selection, scrolling, and copy still work.
+  const [readOnly, setReadOnly] = useState<boolean>(host.readOnly ?? false);
+  useEffect(() => {
+    setReadOnly(host.readOnly ?? false);
+    return host.onReadOnlyChanged?.((next) => {
+      setReadOnly(next);
+    });
+  }, [host]);
+
   // Metadata hook (manages headers, frozen cols, formats - NOT cell data)
   const spreadsheetMeta = useSpreadsheetMetadata('', filePath, {
     onDirtyChange: host.setDirty,
@@ -175,6 +208,7 @@ export function SpreadsheetEditor({ host }: EditorHostProps) {
   // This avoids React props overwriting RevoGrid's internal state on re-renders
   const pendingDataRef = useRef<{ source: Record<string, string | number>[]; pinnedTop: Record<string, string | number>[] } | null>(null);
   const dataLoadedRef = useRef(false);
+  const loadedCsvContentRef = useRef('');
 
   // Context menu state
   const [contextMenu, setContextMenu] = useState<{
@@ -208,6 +242,7 @@ export function SpreadsheetEditor({ host }: EditorHostProps) {
   // ---- EditorHost lifecycle (loading, echo detection, file changes, save, theme) ----
   const { isLoading, error: loadError, theme, markDirty: _markDirty } = useEditorLifecycle(host, {
     applyContent: (content: string) => {
+      loadedCsvContentRef.current = content;
       // Parse CSV and set RevoGrid source imperatively
       const { data } = parseCSV(content);
       const gridData = convertToGridSource(data.rows, data.headerRowCount);
@@ -378,6 +413,113 @@ export function SpreadsheetEditor({ host }: EditorHostProps) {
       }
     },
   });
+
+  // ---- Collaborative wiring (no-op when host.collaboration is undefined) ---
+  // CSV uses a single Y.Text for the whole document (see csvBinding.ts for
+  // the reasoning). Local edits are pushed via a debounced poll because
+  // RevoGrid lacks a single "any mutation" event to hook into. Remote
+  // Y.Text changes flow back through the existing applyContent path so
+  // every existing format/header/metadata invariant is preserved.
+  const collabBindingRef = useRef<CsvBinding | null>(null);
+  const collabActiveRef = useRef(false);
+  const { isCollaborative: isCollabActive } = useCollaborativeEditor(host, {
+    isEmpty: isCsvYDocEmpty,
+    initializeFromContent: seedCsvYDoc,
+    createBinding: ({ yDoc, awareness }) => {
+      const applyCsvContent = (content: string) => {
+        loadedCsvContentRef.current = content;
+        const { data } = parseCSV(content);
+        const gridData = convertToGridSource(data.rows, data.headerRowCount);
+        // Stash for the deferred ref-callback path. The collab createBinding
+        // can fire applyCsvContent before the grid is mounted -- if so, the
+        // ref callback's pendingDataRef branch is what populates the grid on
+        // mount. Without this, an earlier lifecycle applyContent('') wins by
+        // leaving an empty pendingDataRef in place and the reopened tab
+        // comes back blank.
+        pendingDataRef.current = gridData;
+        const grid = revoGridRef.current;
+        if (grid) {
+          grid.source = gridData.source;
+          grid.pinnedTopSource = gridData.pinnedTop;
+          dataLoadedRef.current = true;
+        }
+        spreadsheetMetaRef.current.loadFromCSV(content);
+        spreadsheetMetaRef.current.markClean();
+      };
+
+      // Initial baseline = whatever Y.Text already has (the seed we just
+      // wrote OR the content sync'd from another client).
+      const initial = getYCsv(yDoc).toString();
+      const binding = new CsvBinding(
+        yDoc,
+        initial,
+        {
+          getCurrentCsv: async () => {
+            const gridOps = gridOpsRef.current;
+            if (!gridOps) return loadedCsvContentRef.current || initial;
+            return await gridOps.toCSV();
+          },
+          onRemoteContent: (content: string) => {
+            // Route through the same applyContent path the host uses for
+            // external file changes. The grid is reloaded; metadata gets
+            // re-parsed; selection survives if the cell still exists.
+            applyCsvContent(content);
+            collabBindingRef.current?.noteAppliedRemote(content);
+          },
+        },
+        awareness,
+      );
+      collabBindingRef.current = binding;
+      // Recipient opens commonly mount with `host.loadContent() === ''` and
+      // rely on the already-synced Y.Text as the first real payload. Consume
+      // that snapshot immediately; otherwise there may be no subsequent remote
+      // change event to wake the grid up from its blank local fallback.
+      if (initial.length > 0) {
+        applyCsvContent(initial);
+        binding.noteAppliedRemote(initial);
+      } else if (loadedCsvContentRef.current.length > 0) {
+        // First-share opens can render from host.loadContent() before the Y.Text
+        // has been populated. Push that already-loaded local CSV immediately so a
+        // close/reopen does not depend on the poll interval or unmount flush.
+        void binding.syncNow().catch((error) => {
+          console.error('[SpreadsheetEditor] Failed to push initial local CSV to collab doc:', error);
+        });
+      }
+      collabActiveRef.current = true;
+      return {
+        destroy: () => {
+          // Flush any pending sync so a closing tab doesn't drop the last
+          // edit. Fire-and-forget; the binding is about to be destroyed
+          // either way.
+          void binding.syncNow().catch(() => {});
+          binding.destroy();
+          collabBindingRef.current = null;
+          collabActiveRef.current = false;
+        },
+      };
+    },
+  });
+
+  // Forward local edits into the Y.Text. RevoGrid has no single "data
+  // mutation" event we can hook, so we poll on a 1s cadence. The binding's
+  // internal diff check is the actual sync gate -- when content hasn't
+  // changed, syncNow is a quick string-compare + no Y.Text writes.
+  useEffect(() => {
+    if (!isCollabActive) return;
+    const id = setInterval(() => {
+      collabBindingRef.current?.scheduleSync();
+    }, 1000);
+    return () => clearInterval(id);
+  }, [isCollabActive]);
+
+  // Publish selection/edit cell to awareness.
+  useEffect(() => {
+    if (!isCollabActive) return;
+    const binding = collabBindingRef.current;
+    if (!binding) return;
+    const sel = selectedCellRef.current ?? null;
+    binding.setLocalAwareness({ selectedCell: sel, editingCell: sel });
+  }, [isCollabActive]);
 
   // Stable editors object
   const editors = useMemo(() => ({ sheets: SheetsTextEditor }), []);
@@ -879,6 +1021,10 @@ export function SpreadsheetEditor({ host }: EditorHostProps) {
 
   // Context menu handler
   const handleContextMenu = useCallback((event: React.MouseEvent) => {
+    // In read-only mode the editing context menu (insert / delete row,
+    // format column, etc.) is meaningless -- let the browser's default
+    // selection / copy menu through instead.
+    if (readOnly) return;
     event.preventDefault();
     const container = gridContainerRef.current;
     if (!container) return;
@@ -962,7 +1108,7 @@ export function SpreadsheetEditor({ host }: EditorHostProps) {
       isColumnHeader: false,
       colIndex: null,
     });
-  }, [spreadsheetMeta.metadata.columnCount, updateSelection]);
+  }, [spreadsheetMeta.metadata.columnCount, updateSelection, readOnly]);
 
   const handleCloseContextMenu = useCallback(() => {
     setContextMenu(null);
@@ -1435,21 +1581,23 @@ export function SpreadsheetEditor({ host }: EditorHostProps) {
       onKeyDown={handleKeyDown}
       tabIndex={0}
     >
-      <div className="flex items-center gap-2 bg-nim-secondary border-b border-nim">
-        <FormulaBar
-          ref={formulaBarRef}
-          onChange={handleFormulaChange}
-        />
-        {host.supportsSourceMode && (
-          <button
-            className="px-3 py-1.5 mr-3 text-[13px] font-medium bg-nim-tertiary border border-nim rounded text-nim-muted cursor-pointer transition-all whitespace-nowrap hover:bg-nim-hover hover:text-nim active:bg-nim"
-            onClick={() => host.toggleSourceMode?.()}
-            title="View raw CSV source"
-          >
-            View Source
-          </button>
-        )}
-      </div>
+      {!readOnly && (
+        <div className="flex items-center gap-2 bg-nim-secondary border-b border-nim">
+          <FormulaBar
+            ref={formulaBarRef}
+            onChange={handleFormulaChange}
+          />
+          {host.supportsSourceMode && (
+            <button
+              className="px-3 py-1.5 mr-3 text-[13px] font-medium bg-nim-tertiary border border-nim rounded text-nim-muted cursor-pointer transition-all whitespace-nowrap hover:bg-nim-hover hover:text-nim active:bg-nim"
+              onClick={() => host.toggleSourceMode?.()}
+              title="View raw CSV source"
+            >
+              View Source
+            </button>
+          )}
+        </div>
+      )}
       <div
         ref={gridContainerRef}
         className="flex-1 overflow-hidden relative"
@@ -1477,7 +1625,7 @@ export function SpreadsheetEditor({ host }: EditorHostProps) {
           applyOnClose={true}
           editors={editors}
           rowClass="_rowClass"
-          readonly={diffState?.isActive}
+          readonly={readOnly || diffState?.isActive}
           onAfteredit={handleAfterEdit}
           onAfterfocus={handleFocusCell}
           // @ts-expect-error onSetrange exists but not in React type defs

@@ -21,6 +21,8 @@ import {
   setExtensionEnabled,
   getClaudePluginEnabled,
   setClaudePluginEnabled,
+  getAgentWorkflowsEnabled,
+  setAgentWorkflowsEnabled,
   getExtensionConfiguration,
   setExtensionConfiguration,
   setExtensionConfigurationBulk,
@@ -30,8 +32,87 @@ import {
   getReleaseChannel,
 } from '../utils/store';
 import { registerFileExtension, clearRegisteredExtensions } from '../extensions/RegisteredFileTypes';
+import { getBuiltinExtensionsDirectory } from '../extensions/builtinExtensionsDirectory';
+import {
+  startExtensionBackendModules,
+  stopExtensionBackendModules,
+  getDefaultBackendModuleLifecycleDeps,
+} from '../extensions/backendModuleLifecycle';
+import { validateBackendModules } from '@nimbalyst/extension-sdk';
+import { ModelIdentifier } from '@nimbalyst/runtime/ai/server/types';
 import type { ReleaseChannel } from '../utils/store';
 import { buildExtensionFindFilesPlan } from './extensionFindFilesPlan';
+import { database } from '../database/PGLiteDatabaseWorker';
+import {
+  isAllowedToContributeBackendModules,
+  type BackendModuleAllowResult,
+} from '../extensions/backendModuleAllowlist';
+import { getAgentProviderRegistry } from '../extensions/AgentProviderRegistry';
+import type {
+  AiAgentProviderContribution,
+  BackendModuleContribution,
+  ExtensionManifest,
+} from '@nimbalyst/extension-sdk';
+
+/**
+ * Validate `contributions.backendModules` on a parsed manifest, then apply
+ * the backend-module allowlist policy. If either step refuses the manifest,
+ * strips the field so downstream code never sees the declaration (the rest
+ * of the extension's contributions still load).
+ *
+ * Mutates the manifest in place. Returns true if backendModules survived;
+ * false if it was stripped.
+ */
+function validateAndScrubBackendModules(
+  manifest: Record<string, unknown>,
+  extensionId: string,
+  context: { isBuiltin: boolean; isSymlink: boolean }
+): boolean {
+  const contributions = manifest?.contributions as Record<string, unknown> | undefined;
+  if (!contributions || contributions.backendModules === undefined) {
+    return true;
+  }
+
+  // Step 1: shape validation. Warnings are non-fatal (legacy deprecated
+  // permission ids are dropped silently by the SDK validator).
+  const issues = validateBackendModules(contributions.backendModules);
+  const errors = issues.filter((i) => i.severity !== 'warning');
+  const warnings = issues.filter((i) => i.severity === 'warning');
+  if (warnings.length > 0) {
+    logger.main.warn(
+      `[ExtensionHandlers] Extension ${extensionId} backendModules has warnings:`,
+      warnings
+    );
+  }
+  if (errors.length > 0) {
+    logger.main.error(
+      `[ExtensionHandlers] Extension ${extensionId} has invalid backendModules; ` +
+        `stripping the field so it cannot load privileged capabilities. Issues:`,
+      errors
+    );
+    delete contributions.backendModules;
+    return false;
+  }
+
+  // Step 2: allowlist policy. Backend modules can run arbitrary native code;
+  // restrict who is permitted to ship them.
+  const decision: BackendModuleAllowResult = isAllowedToContributeBackendModules({
+    extensionId,
+    isBuiltin: context.isBuiltin,
+    isSymlink: context.isSymlink,
+  });
+  if (!decision.allowed) {
+    logger.main.warn(
+      `[ExtensionHandlers] Extension ${extensionId} is not allowlisted to ship backend modules ` +
+        `(reason: ${decision.reason}). Dropping contributions.backendModules. ` +
+        (decision.detail ?? '')
+    );
+    delete contributions.backendModules;
+    return false;
+  }
+
+  return true;
+}
 
 /**
  * Check if an extension should be visible for the current release channel.
@@ -71,7 +152,10 @@ export async function initializeExtensionFileTypes(): Promise<void> {
     const extensionDirs = await getAllExtensionDirectories();
     const currentChannel = getReleaseChannel();
 
-    for (const extensionsDir of extensionDirs) {
+    for (let dirIndex = 0; dirIndex < extensionDirs.length; dirIndex++) {
+      const extensionsDir = extensionDirs[dirIndex];
+      // extensionDirs[0] is the user extensions dir; the rest are built-in.
+      const isBuiltinDir = dirIndex > 0;
       let subdirs;
       try {
         subdirs = await fs.readdir(extensionsDir, { withFileTypes: true });
@@ -80,8 +164,9 @@ export async function initializeExtensionFileTypes(): Promise<void> {
       }
 
       for (const subdir of subdirs) {
+        const isSymlink = subdir.isSymbolicLink();
         let isDir = subdir.isDirectory();
-        if (!isDir && subdir.isSymbolicLink()) {
+        if (!isDir && isSymlink) {
           try {
             const targetPath = path.join(extensionsDir, subdir.name);
             const stat = await fs.stat(targetPath);
@@ -119,6 +204,24 @@ export async function initializeExtensionFileTypes(): Promise<void> {
               }
             }
           }
+
+          // Catalog aiAgentProviders into the AgentProviderRegistry here too,
+          // so the catalog is populated at boot and after every install /
+          // uninstall (this function is the shared rescan hook), not only when
+          // the renderer happens to invoke extensions:list-installed. Without
+          // this an installed agent-provider extension stays invisible to the
+          // model picker until a list-installed call lands. register() is
+          // idempotent and preserves consent status, so re-running is safe.
+          const agentExtensionId = manifest.id || subdir.name;
+          validateAndScrubBackendModules(manifest, agentExtensionId, {
+            isBuiltin: isBuiltinDir,
+            isSymlink,
+          });
+          registerAgentProviderContributions(
+            manifest as ExtensionManifest,
+            agentExtensionId,
+            extensionPath
+          );
         } catch {
           // Skip directories without valid manifest
         }
@@ -154,44 +257,9 @@ export async function getUserExtensionsDirectory(): Promise<string> {
 }
 
 /**
- * Get the path to the built-in extensions directory.
- * Returns null if the directory doesn't exist.
- */
-async function getBuiltinExtensionsDirectory(): Promise<string | null> {
-  // In production, built-in extensions are in resources/extensions
-  // In development, they're in packages/extensions relative to the electron package
-  const possiblePaths = app.isPackaged
-    ? [
-        path.join(process.resourcesPath, 'extensions'),
-        path.join(process.resourcesPath, 'app.asar.unpacked', 'extensions'),
-      ]
-    : [
-        // Development: relative to __dirname (out/main/chunks in vite build)
-        // Go up 4 levels to packages/, then into extensions/
-        path.join(__dirname, '..', '..', '..', '..', 'extensions'),
-        // Fallback: if __dirname is out/main (no chunks)
-        path.join(__dirname, '..', '..', '..', 'extensions'),
-        path.join(__dirname, '..', '..', 'resources', 'extensions'),
-      ];
-
-  for (const possiblePath of possiblePaths) {
-    try {
-      await fs.access(possiblePath);
-      logger.main.debug('[ExtensionHandlers] Built-in extensions directory:', possiblePath);
-      return possiblePath;
-    } catch {
-      // Path doesn't exist, try next
-    }
-  }
-
-  logger.main.debug('[ExtensionHandlers] No built-in extensions directory found');
-  return null;
-}
-
-/**
  * Get all extension directories (both user and built-in).
  */
-async function getAllExtensionDirectories(): Promise<string[]> {
+export async function getAllExtensionDirectories(): Promise<string[]> {
   const dirs: string[] = [];
 
   // Always include user extensions directory
@@ -204,6 +272,114 @@ async function getAllExtensionDirectories(): Promise<string[]> {
   }
 
   return dirs;
+}
+
+/**
+ * An extension's surviving (post validate + allowlist scrub) backend-module
+ * declarations, plus the disk path the entry file resolves against. Returned
+ * by the backend-module scan that the start-on-enable lifecycle consumes.
+ */
+export interface ResolvedExtensionBackendModules {
+  extensionId: string;
+  extensionName: string;
+  extensionPath: string;
+  modules: BackendModuleContribution[];
+  /**
+   * Module ids referenced by this extension's `aiAgentProviders` contributions
+   * (each provider's `backendModuleId`). The backend-module lifecycle skips these
+   * for eager auto-start — they start lazily via the extensionAgentBridge on
+   * first use of the provider.
+   */
+  agentProviderModuleIds: string[];
+}
+
+/**
+ * Scan every extension directory (user first, then built-in) and return, for
+ * each extension that declares backend modules surviving the validate +
+ * allowlist scrub and is visible for the current release channel, its resolved
+ * path + module list. Does NOT consult enabled-state — the lifecycle caller
+ * filters on `getExtensionEnabled`. Mirrors the `extensions:list-installed`
+ * scan but only retains backend-module-bearing extensions.
+ */
+export async function listExtensionBackendModules(): Promise<ResolvedExtensionBackendModules[]> {
+  const out: ResolvedExtensionBackendModules[] = [];
+  const seenExtensionIds = new Set<string>();
+  const currentChannel = getReleaseChannel();
+  const extensionDirs = await getAllExtensionDirectories();
+
+  for (let i = 0; i < extensionDirs.length; i++) {
+    const extensionsDir = extensionDirs[i];
+    const isBuiltinDir = i > 0; // First directory is user extensions
+    let subdirs;
+    try {
+      subdirs = await fs.readdir(extensionsDir, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+
+    for (const subdir of subdirs) {
+      let isDir = subdir.isDirectory();
+      const isSymlink = subdir.isSymbolicLink();
+      if (!isDir && isSymlink) {
+        try {
+          isDir = (await fs.stat(path.join(extensionsDir, subdir.name))).isDirectory();
+        } catch {
+          continue;
+        }
+      }
+      if (!isDir) continue;
+
+      const extensionPath = path.join(extensionsDir, subdir.name);
+      try {
+        const manifest = JSON.parse(
+          await fs.readFile(path.join(extensionPath, 'manifest.json'), 'utf-8')
+        ) as ExtensionManifest & { id?: string; name?: string };
+        const extensionId = manifest.id || subdir.name;
+        if (seenExtensionIds.has(extensionId)) continue;
+        seenExtensionIds.add(extensionId);
+        if (!isExtensionVisibleForChannel(manifest, currentChannel)) continue;
+
+        // Strip invalid / disallowed backend modules in place, exactly as the
+        // list-installed scan does, so we only start what is actually allowed.
+        validateAndScrubBackendModules(manifest as unknown as Record<string, unknown>, extensionId, {
+          isBuiltin: isBuiltinDir,
+          isSymlink,
+        });
+
+        const modules = (manifest.contributions?.backendModules ?? []) as BackendModuleContribution[];
+        if (modules.length === 0) continue;
+
+        const agentProviderModuleIds = (
+          (manifest.contributions?.aiAgentProviders ?? []) as Array<{ backendModuleId?: string }>
+        )
+          .map((p) => p.backendModuleId)
+          .filter((id): id is string => typeof id === 'string' && id.length > 0);
+
+        out.push({
+          extensionId,
+          extensionName: manifest.name || extensionId,
+          extensionPath,
+          modules,
+          agentProviderModuleIds,
+        });
+      } catch {
+        // Skip directories without a valid manifest
+      }
+    }
+  }
+
+  return out;
+}
+
+/**
+ * Resolve the surviving backend modules for a single extension id, or null if
+ * the extension is not installed / declares none.
+ */
+export async function resolveExtensionBackendModules(
+  extensionId: string
+): Promise<ResolvedExtensionBackendModules | null> {
+  const all = await listExtensionBackendModules();
+  return all.find((e) => e.extensionId === extensionId) ?? null;
 }
 
 /**
@@ -553,7 +729,7 @@ async function getClaudeCliPluginPaths(workspacePath?: string): Promise<Array<{ 
  * @param workspacePath - If provided, includes project-scoped CLI plugins for this workspace
  * @returns Paths in the format expected by the Claude Agent SDK: { type: 'local', path: string }
  */
-export async function getClaudePluginPaths(workspacePath?: string): Promise<Array<{ type: 'local'; path: string }>> {
+export async function getNativeClaudePluginPaths(workspacePath?: string): Promise<Array<{ type: 'local'; path: string }>> {
   try {
     const plugins: Array<{ type: 'local'; path: string }> = [];
     const seenExtensionIds = new Set<string>();
@@ -586,6 +762,63 @@ export async function getClaudePluginPaths(workspacePath?: string): Promise<Arra
   } catch (error) {
     logger.main.error('[ExtensionHandlers] Failed to get Claude plugin paths:', error);
     return [];
+  }
+}
+
+export async function getClaudePluginPaths(workspacePath?: string): Promise<Array<{ type: 'local'; path: string }>> {
+  return getNativeClaudePluginPaths(workspacePath);
+}
+
+/**
+ * Register each `aiAgentProviders` contribution from a parsed manifest into
+ * the AgentProviderRegistry. Skips contributions whose `backendModuleId`
+ * doesn't point at a surviving `backendModules` entry -- a contribution that
+ * lost its backing module (because validation stripped it, or it was never
+ * declared) is dead weight; hiding it from the dropdown is correct.
+ *
+ * Called from the list-installed scan AFTER validateAndScrubBackendModules
+ * has run so `manifest.contributions.backendModules` reflects what actually
+ * survived.
+ */
+function registerAgentProviderContributions(
+  manifest: ExtensionManifest,
+  extensionId: string,
+  extensionPath: string
+): void {
+  const contributions = manifest.contributions as
+    | { backendModules?: BackendModuleContribution[]; aiAgentProviders?: AiAgentProviderContribution[] }
+    | undefined;
+  const providers = contributions?.aiAgentProviders;
+  if (!providers || providers.length === 0) return;
+
+  const surviving = new Set<string>(
+    (contributions?.backendModules ?? []).map((m) => m.id)
+  );
+  const registry = getAgentProviderRegistry();
+  for (const provider of providers) {
+    if (!surviving.has(provider.backendModuleId)) {
+      logger.main.warn(
+        `[ExtensionHandlers] Extension ${extensionId} aiAgentProviders[${provider.id}] ` +
+          `references backendModuleId "${provider.backendModuleId}" which is not a surviving ` +
+          `backend module. Hiding the provider from the dropdown.`
+      );
+      continue;
+    }
+    registry.register({
+      extensionId,
+      contributionId: provider.id,
+      manifest,
+      contribution: provider,
+      backendModuleId: provider.backendModuleId,
+      extensionPath,
+    });
+    logger.main.info(
+      `[ExtensionHandlers] Registered agent provider: ${provider.id} (from ${extensionId})`
+    );
+    // Teach ModelIdentifier this provider id so provider-from-model derivation
+    // (sessions:create, sessionHistoryActions, etc.) resolves it instead of
+    // falling back to claude-code.
+    ModelIdentifier.registerExtensionProvider(provider.id);
   }
 }
 
@@ -809,7 +1042,8 @@ export function registerExtensionHandlers(): void {
         for (const subdir of subdirs) {
           // Handle both directories and symlinks to directories
           let isDir = subdir.isDirectory();
-          if (!isDir && subdir.isSymbolicLink()) {
+          const isSymlink = subdir.isSymbolicLink();
+          if (!isDir && isSymlink) {
             try {
               const targetPath = path.join(extensionsDir, subdir.name);
               const stat = await fs.stat(targetPath);
@@ -839,6 +1073,24 @@ export function registerExtensionHandlers(): void {
               logger.main.debug(`[ExtensionHandlers] Skipping extension ${extensionId} from list (requires ${manifest.requiredReleaseChannel} channel)`);
               continue;
             }
+
+            // Validate privileged-capability contributions and enforce the
+            // backend-module allowlist. Invalid or disallowed declarations
+            // are stripped so the rest of the extension still loads.
+            validateAndScrubBackendModules(manifest, extensionId, {
+              isBuiltin: isBuiltinDir,
+              isSymlink,
+            });
+
+            // Catalog any `aiAgentProviders` whose backing backend module
+            // survived. The registry entry is metadata only; the host won't
+            // spawn the runtime until a session targeting this provider
+            // triggers the first-use consent flow.
+            registerAgentProviderContributions(
+              manifest as ExtensionManifest,
+              extensionId,
+              extensionPath
+            );
 
             // Register file patterns from customEditors
             if (manifest.contributions?.customEditors) {
@@ -875,6 +1127,30 @@ export function registerExtensionHandlers(): void {
     }
   });
 
+  // List registered extension-contributed AI agent providers for the renderer
+  // (Settings AGENT PROVIDERS panel). Returns provider metadata from the
+  // AgentProviderRegistry; denied entries are hidden. The model picker gets
+  // models via ai:getModels; this is the provider-level listing.
+  safeHandle('agent-providers:list', async () => {
+    try {
+      const data = getAgentProviderRegistry()
+        .list()
+        .filter((entry) => entry.status !== 'denied')
+        .map((entry) => ({
+          id: entry.contributionId,
+          extensionId: entry.extensionId,
+          name: entry.contribution.displayName || entry.contributionId,
+          icon: entry.contribution.icon,
+          status: entry.status,
+          models: (entry.contribution.models ?? []).map((m) => ({ id: m.id, name: m.name })),
+        }));
+      return { success: true, data };
+    } catch (error) {
+      logger.main.error('[ExtensionHandlers] Failed to list agent providers:', error);
+      return { success: false, error: String(error), data: [] };
+    }
+  });
+
   // Get Claude plugin commands from all enabled extensions
   // Used to populate slash command suggestions in the UI
   safeHandle('extensions:get-claude-plugin-commands', async () => {
@@ -907,6 +1183,21 @@ export function registerExtensionHandlers(): void {
     try {
       setExtensionEnabled(extensionId, enabled);
       logger.main.info(`[ExtensionHandlers] Extension ${extensionId} ${enabled ? 'enabled' : 'disabled'}`);
+
+      // Start/stop any backend modules the extension declares. Fire-and-forget so
+      // the toggle returns promptly (startModule awaits utility-process readiness,
+      // up to 15s); errors are logged, not surfaced to the toggle.
+      const lifecycleDeps = getDefaultBackendModuleLifecycleDeps();
+      if (enabled) {
+        void startExtensionBackendModules(extensionId, lifecycleDeps).catch((err) =>
+          logger.main.error(`[ExtensionHandlers] backend-module start failed for ${extensionId}:`, err)
+        );
+      } else {
+        void stopExtensionBackendModules(extensionId, lifecycleDeps).catch((err) =>
+          logger.main.error(`[ExtensionHandlers] backend-module stop failed for ${extensionId}:`, err)
+        );
+      }
+
       return { success: true };
     } catch (error) {
       logger.main.error(`[ExtensionHandlers] Failed to set enabled state for ${extensionId}:`, error);
@@ -922,6 +1213,17 @@ export function registerExtensionHandlers(): void {
       return { success: true };
     } catch (error) {
       logger.main.error(`[ExtensionHandlers] Failed to set Claude plugin state for ${extensionId}:`, error);
+      return { success: false, error: String(error) };
+    }
+  });
+
+  safeHandle('extensions:set-agent-workflows-enabled', async (_event, extensionId: string, enabled: boolean) => {
+    try {
+      setAgentWorkflowsEnabled(extensionId, enabled);
+      logger.main.info(`[ExtensionHandlers] Agent workflows for ${extensionId} ${enabled ? 'enabled' : 'disabled'}`);
+      return { success: true };
+    } catch (error) {
+      logger.main.error(`[ExtensionHandlers] Failed to set agent workflow state for ${extensionId}:`, error);
       return { success: false, error: String(error) };
     }
   });
@@ -1044,6 +1346,10 @@ export function registerExtensionHandlers(): void {
           if (manifest.id === extensionId) {
             // Found it - remove the symlink/directory
             await fs.rm(entryPath, { recursive: true, force: true });
+            // Evict any aiAgentProviders the extension had registered so
+            // the dropdown stops listing them. The PrivilegedExtensionHost
+            // handles its own teardown via handleExtensionUninstalled.
+            getAgentProviderRegistry().clearAll(extensionId);
             logger.main.info(`[ExtensionHandlers] Removed dev extension: ${extensionId} at ${entryPath}`);
             return { success: true };
           }
@@ -1115,37 +1421,8 @@ export function registerExtensionHandlers(): void {
   }) => {
     const { extensionId, command, cwd, timeout = 60000, env, maxBuffer = 10 * 1024 * 1024 } = params;
 
-    // Find extension manifest by scanning extension directories
-    let hasFilesystemPermission = false;
-    const extensionDirs = await getAllExtensionDirectories();
-    for (const extDir of extensionDirs) {
-      let subdirs;
-      try {
-        subdirs = await fs.readdir(extDir, { withFileTypes: true });
-      } catch {
-        continue;
-      }
-      for (const subdir of subdirs) {
-        let isDir = subdir.isDirectory();
-        if (!isDir && subdir.isSymbolicLink()) {
-          try {
-            const stat = await fs.stat(path.join(extDir, subdir.name));
-            isDir = stat.isDirectory();
-          } catch { continue; }
-        }
-        if (!isDir) continue;
-        const manifestPath = path.join(extDir, subdir.name, 'manifest.json');
-        try {
-          const manifestJson = await fs.readFile(manifestPath, 'utf-8');
-          const manifest = JSON.parse(manifestJson);
-          if (manifest.id === extensionId) {
-            hasFilesystemPermission = !!manifest.permissions?.filesystem;
-            break;
-          }
-        } catch { continue; }
-      }
-      if (hasFilesystemPermission) break;
-    }
+    const manifest = await readExtensionManifest(extensionId);
+    const hasFilesystemPermission = !!manifest?.permissions?.filesystem;
 
     if (!hasFilesystemPermission) {
       return { success: false, stdout: '', stderr: `Extension ${extensionId} not found or lacks filesystem permission`, exitCode: -1 };
@@ -1288,7 +1565,116 @@ export function registerExtensionHandlers(): void {
     return { usedBytes, limitBytes };
   });
 
+  // ============================================================================
+  // Extension Database Access (read-only PGLite query)
+  // ============================================================================
+
+  // Run a read-only SQL query against PGLite on behalf of an extension. The
+  // query is wrapped in BEGIN; SET TRANSACTION READ ONLY; SET LOCAL
+  // statement_timeout; <sql>; COMMIT -- DML/DDL is rejected by the planner.
+  // Requires the extension to declare 'nimbalyst-database-read' in
+  // manifest.permissions.catalog. Errors surface PG's native message so
+  // extension authors can debug their SQL.
+  safeHandle('extension:database:query', async (_event, params: {
+    extensionId: string;
+    sql: string;
+    params?: unknown[];
+  }) => {
+    if (!params || typeof params.extensionId !== 'string' || params.extensionId.length === 0) {
+      throw new Error('extension:database:query requires extensionId');
+    }
+    if (typeof params.sql !== 'string' || params.sql.length === 0) {
+      throw new Error('extension:database:query requires non-empty sql');
+    }
+
+    const granted = await extensionHasCatalogPermission(
+      params.extensionId,
+      'nimbalyst-database-read'
+    );
+    if (!granted) {
+      throw new Error(
+        `Extension ${params.extensionId} is not authorized for database access. ` +
+        `Declare "nimbalyst-database-read" in manifest.permissions.catalog.`
+      );
+    }
+
+    const queryParams = Array.isArray(params.params) ? params.params : undefined;
+    const result = await database.queryReadOnly(params.sql, queryParams as any[] | undefined);
+    return { rows: result.rows };
+  });
+
   logger.main.info('[ExtensionHandlers] Extension handlers registered');
+}
+
+/**
+ * Shape of the bits of an extension manifest we read for permission gating.
+ * `permissions.filesystem` / `network` / `ai` are the legacy boolean object;
+ * `permissions.catalog` is the catalog ids the renderer-side surface uses.
+ */
+interface ManifestForGating {
+  id?: string;
+  permissions?: {
+    filesystem?: boolean;
+    ai?: boolean;
+    network?: boolean;
+    catalog?: string[];
+  };
+}
+
+/**
+ * Read the manifest for a given extension id by scanning user and built-in
+ * extension directories (in that order). Returns the parsed manifest or null
+ * if no matching extension is found. Used by permission-gated IPC handlers
+ * to verify the caller declared the capability they're asking for.
+ */
+async function readExtensionManifest(
+  extensionId: string
+): Promise<ManifestForGating | null> {
+  const extensionDirs = await getAllExtensionDirectories();
+  for (const extDir of extensionDirs) {
+    let subdirs;
+    try {
+      subdirs = await fs.readdir(extDir, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+    for (const subdir of subdirs) {
+      let isDir = subdir.isDirectory();
+      if (!isDir && subdir.isSymbolicLink()) {
+        try {
+          const stat = await fs.stat(path.join(extDir, subdir.name));
+          isDir = stat.isDirectory();
+        } catch { continue; }
+      }
+      if (!isDir) continue;
+      const manifestPath = path.join(extDir, subdir.name, 'manifest.json');
+      try {
+        const manifestJson = await fs.readFile(manifestPath, 'utf-8');
+        const manifest = JSON.parse(manifestJson) as ManifestForGating;
+        if (manifest.id === extensionId) {
+          return manifest;
+        }
+      } catch { continue; }
+    }
+  }
+  return null;
+}
+
+/**
+ * Check whether `extensionId` declares the given catalog permission in
+ * `manifest.permissions.catalog`. Currently the manifest declaration IS the
+ * gate for renderer-side catalog permissions -- there's no separate consent
+ * prompt for panel extensions, since the user already had to install and
+ * enable the extension. Backend-module permissions go through the consent
+ * flow in PrivilegedExtensionHost.
+ */
+async function extensionHasCatalogPermission(
+  extensionId: string,
+  permissionId: string
+): Promise<boolean> {
+  const manifest = await readExtensionManifest(extensionId);
+  const catalog = manifest?.permissions?.catalog;
+  return Array.isArray(catalog) && catalog.includes(permissionId);
 }
 
 // ============================================================================

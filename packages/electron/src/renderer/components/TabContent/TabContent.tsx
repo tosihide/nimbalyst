@@ -28,6 +28,7 @@ import {
   removeCollabConfig,
   resolveCollabConfigForUri,
 } from '../../utils/collabDocumentOpener';
+import { getPersistedCollabDocType } from '../../utils/collabOpenDocsPersistence';
 import { store, editorDirtyAtom, editorHasUnacceptedChangesAtom, makeEditorKey } from '@nimbalyst/runtime/store';
 import { clearMockupAnnotationsForFile, getMockupFilePath } from '../UnifiedAI/MockupAnnotationIndicator';
 
@@ -124,11 +125,21 @@ const TabContentComponent: React.FC<TabContentProps> = ({
         }
         try {
           const { documentId } = parseCollabUri(filePath);
+          // Persisted documentType is the only source of truth on a cold
+          // restore: the in-memory collabConfigRegistry is empty and
+          // sharedDocumentsAtom hasn't synced yet. Without it, the open
+          // routes a shared .excalidraw / .mockup.html Y.Doc through the
+          // markdown editor and the canvas comes back blank.
+          const documentType = await getPersistedCollabDocType(
+            propsRef.current.workspaceId,
+            documentId,
+          );
           await resolveCollabConfigForUri(
             propsRef.current.workspaceId,
             filePath,
             documentId,
             title,
+            documentType,
           );
         } catch (error) {
           logger.ui.error('[TabContent] Failed to resolve collab config:', error);
@@ -257,6 +268,9 @@ const TabContentComponent: React.FC<TabContentProps> = ({
       store.set(editorDirtyAtom(editorKey), isDirty);
       // Also notify the legacy subscription system (for backwards compat with save-on-close)
       notifyDirtyStateChange(tab.id, isDirty);
+      // Let the main process know so personal docs sync won't overwrite an
+      // editor's unsaved buffer with a remote copy (NIM-853, Layer 4).
+      window.electronAPI?.send?.('editor:dirty-changed', { filePath: tab.filePath, isDirty });
     };
 
     // Always pass isActive={true} since visibility is controlled by the wrapper element's display style

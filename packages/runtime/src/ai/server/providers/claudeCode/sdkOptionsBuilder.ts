@@ -13,7 +13,7 @@ import { ClaudeCodeDeps } from './dependencyInjection';
 import { resolveClaudeAgentCliPath } from './cliPathResolver';
 import { DEFAULT_EFFORT_LEVEL } from '../../effortLevels';
 
-type SessionMode = 'planning' | 'agent' | undefined;
+type SessionMode = 'planning' | 'agent' | 'auto' | undefined;
 
 type SDKUserMessage = {
   type: 'user';
@@ -25,7 +25,11 @@ export interface BuildSdkOptionsDeps {
   resolveModelVariant: () => string;
   mcpConfigService: { getMcpServersConfig: (params: { sessionId?: string; workspacePath: string }) => Promise<Record<string, any>> };
   createCanUseToolHandler: (sessionId?: string, workspacePath?: string, permissionsPath?: string) => any;
-  toolHooksService: { createPreToolUseHook: () => any; createPostToolUseHook: () => any };
+  toolHooksService: {
+    createPreToolUseHook: () => any;
+    createPostToolUseHook: () => any;
+    createPermissionDeniedHook: () => any;
+  };
   teammateManager: {
     lastUsedCwd?: string | undefined;
     lastUsedSessionId?: string | undefined;
@@ -54,10 +58,87 @@ export interface BuildSdkOptionsParams {
   isMetaAgent?: boolean;
 }
 
+/**
+ * Controls the lifetime of the prompt AsyncIterable so the SDK keeps the
+ * binary's stdin pipe open for the duration of the turn. Calling end() lets
+ * the generator return, which in turn lets the SDK call transport.endInput()
+ * and close stdin normally.
+ *
+ * We always use an AsyncIterable prompt (never a bare string) so the SDK
+ * sets isSingleUserTurn=false and does NOT preemptively close stdin when
+ * `type: 'result'` arrives -- that forced close is the root cause of the
+ * "Tool permission request failed: Error: Stream closed" errors on turns
+ * where the binary emits a late can_use_tool after result.
+ *
+ * See nimbalyst-local/plans/stream-closed-native-binary-investigation.md
+ * for full root cause and history of the previous reverted attempt.
+ */
+export interface PromptStreamController {
+  end(reason: string): void;
+  isEnded(): boolean;
+}
+
 export interface BuildSdkOptionsResult {
   options: any;
-  promptInput: string | AsyncIterable<SDKUserMessage>;
+  promptInput: AsyncIterable<SDKUserMessage>;
+  promptController: PromptStreamController;
   helperMethod: 'native' | 'custom';
+}
+
+export function createPersistentPromptStream(
+  initialMessage: SDKUserMessage,
+): { iterable: AsyncIterable<SDKUserMessage>; controller: PromptStreamController } {
+  let ended = false;
+  let endResolve: (() => void) | null = null;
+  const endPromise = new Promise<void>((resolve) => {
+    endResolve = () => {
+      ended = true;
+      resolve();
+    };
+  });
+
+  async function* generator(): AsyncGenerator<SDKUserMessage> {
+    yield initialMessage;
+    // Block here so the SDK's streamInput() doesn't finish iterating and
+    // doesn't call transport.endInput() to close the binary's stdin. The
+    // ClaudeCodeProvider arms a grace-period timer on the first `result`
+    // chunk and calls controller.end() to release us; safety nets in
+    // sendMessage's finally block and abort() ensure we always exit.
+    await endPromise;
+  }
+
+  return {
+    iterable: generator(),
+    controller: {
+      end: (reason: string) => {
+        if (!ended && endResolve) {
+          // console.log(`[CLAUDE-CODE] PromptStreamController.end(reason="${reason}")`);
+          endResolve();
+        }
+      },
+      isEnded: () => ended,
+    },
+  };
+}
+
+/**
+ * Resolve the SDK `permissionMode` from the session mode.
+ *
+ * - `planning` -> `plan` (SDK enforces read-only planning, scoped to plan file)
+ * - `auto` -> `auto` (SDK classifier approves safe ops silently and escalates
+ *   destructive or uncertain ones through `canUseTool` to the regular
+ *   permission prompt; silent auto-deny only fires for SDK-level deny rules
+ *   or `dontAsk` mode, not as the classifier's default response to risky tools)
+ * - everything else (incl. `agent` and `undefined`) -> `default`
+ *
+ * See issue #371 and @anthropic-ai/claude-agent-sdk PermissionMode.
+ */
+export function resolvePermissionMode(
+  currentMode: SessionMode
+): 'plan' | 'auto' | 'default' {
+  if (currentMode === 'planning') return 'plan';
+  if (currentMode === 'auto') return 'auto';
+  return 'default';
 }
 
 export async function buildSdkOptions(
@@ -112,10 +193,11 @@ export async function buildSdkOptions(
     settingSources = ['user', 'project', 'local'];
   }
 
-  const resolvedBinaryPath = await resolveClaudeAgentCliPath().catch(() => undefined);
+  const enhancedPath = ClaudeCodeDeps.enhancedPathLoader?.() || undefined;
+  const resolvedBinaryPath = await resolveClaudeAgentCliPath(enhancedPath).catch(() => undefined);
   const customPath = ClaudeCodeDeps.customClaudeCodePathLoader?.(workspacePath) || '';
   const effectivePath = customPath || resolvedBinaryPath;
-  console.log(`[CLAUDE-CODE] Binary path: custom=${customPath || '(none)'} resolved=${resolvedBinaryPath ?? '(none)'} effective=${effectivePath ?? '(none)'}`);
+  // console.log(`[CLAUDE-CODE] Binary path: custom=${customPath || '(none)'} resolved=${resolvedBinaryPath ?? '(none)'} effective=${effectivePath ?? '(none)'}`);
 
   const options: any = {
     pathToClaudeCodeExecutable: effectivePath,
@@ -134,7 +216,16 @@ export async function buildSdkOptions(
     // IMPORTANT: Do NOT add manual tool restrictions or prompt injections for plan mode here.
     // The SDK's `permissionMode: 'plan'` natively enforces planning restrictions (scopes
     // Write to the plan file only). Manual filtering was removed in favour of this approach.
-    permissionMode: currentMode === 'planning' ? 'plan' : 'default',
+    //
+    // `permissionMode: 'auto'` delegates decisions to the SDK's classifier. The
+    // classifier approves safe operations silently and ESCALATES destructive or
+    // uncertain ones to `canUseTool` (which renders the normal permission prompt
+    // for the user). It does not silently deny destructive tools by default --
+    // silent auto-deny is reserved for SDK-level deny rules / dontAsk mode.
+    // Because escalation still hits `canUseTool`, Nimbalyst's workspace rules
+    // (allow-all / bypass-all in immediateToolDecision.ts) continue to apply on
+    // the escalation path.
+    permissionMode: resolvePermissionMode(currentMode),
     // When plan tracking is enabled, direct plan files to the project's plans folder
     // (relative to cwd). This applies whenever the agent enters plan mode, even mid-session.
     settings: {
@@ -144,11 +235,20 @@ export async function buildSdkOptions(
     hooks: {
       'PreToolUse': [{ hooks: [toolHooksService.createPreToolUseHook()] }],
       'PostToolUse': [{ hooks: [toolHooksService.createPostToolUseHook()] }],
+      // PermissionDenied fires when the SDK denies a tool call without
+      // escalating through canUseTool (auto-mode classifier confident deny,
+      // headless auto-deny, deny rules, dontAsk mode). In auto-mode sessions
+      // we mirror the Claude Code CLI behaviour and re-prompt the user
+      // instead of leaving the call dead -- returning `retry: true` from the
+      // hook causes the SDK to re-run the original tool call.
+      'PermissionDenied': [{ hooks: [toolHooksService.createPermissionDeniedHook()] }],
     },
   };
 
   if (currentMode === 'planning') {
     console.log('[CLAUDE-CODE] Plan mode active: delegating tool restrictions to SDK permissionMode=plan');
+  } else if (currentMode === 'auto') {
+    console.log('[CLAUDE-CODE] Auto mode active: SDK classifier handling permission decisions');
   }
 
   // Capture lead config for teammate spawning
@@ -187,11 +287,11 @@ export async function buildSdkOptions(
   // personal Anthropic account $100+.
   //
   // Defense-in-depth: the main-process bootstrap already deletes these from
-  // process.env before any code runs, but claude-agent-sdk 0.2.111 changed
-  // options.env from "replaces process.env" to "overlays process.env". We
-  // therefore also strip from every composed source and explicitly set the
-  // key from config.apiKey (or empty string) at the end, so nothing the SDK
-  // may inject from its own view of process.env can leak through.
+  // process.env before any code runs, and we also strip them from shell/settings
+  // overlays here. Do not set ANTHROPIC_API_KEY='' for login-based sessions:
+  // the Claude native binary treats the mere presence of that variable as an
+  // API-key auth signal, which can shadow a valid OAuth/CLI login and produce
+  // "Authentication failed" even though accountInfo() succeeds in settings.
   const { ANTHROPIC_API_KEY: _envAnthropicKey, OPENAI_API_KEY: _envOpenaiKey, ...sanitizedProcessEnv } = process.env;
   const { ANTHROPIC_API_KEY: _shellAnthropicKey, OPENAI_API_KEY: _shellOpenaiKey, ...sanitizedShellEnv } = shellEnv;
   const { ANTHROPIC_API_KEY: _settingsAnthropicKey, OPENAI_API_KEY: _settingsOpenaiKey, ...sanitizedSettingsEnv } = settingsEnv;
@@ -206,14 +306,41 @@ export async function buildSdkOptions(
     // ~100K tokens of tool descriptions are still loaded upfront — we saw
     // ~112K baseline usage on new sessions. `auto:2` (20K on 1M, 4K on 200K)
     // matches the previous lazy-loading behavior we had under Sonnet 4.6.
-    ENABLE_TOOL_SEARCH: 'auto:2',
-    // Explicitly force-clear in case the SDK overlays its own process.env view.
-    // These will be re-set from config.apiKey below if the user has configured one.
-    ANTHROPIC_API_KEY: '',
-    OPENAI_API_KEY: '',
+    // Default only — a user-set ENABLE_TOOL_SEARCH (settings env vars, shell,
+    // or process env) must win, otherwise the `ENABLE_TOOL_SEARCH = false`
+    // remediation that buildBedrockToolErrorGuidance tells users to apply is
+    // silently clobbered. (NIM-1475)
+    ...(sanitizedProcessEnv.ENABLE_TOOL_SEARCH == null &&
+      sanitizedShellEnv.ENABLE_TOOL_SEARCH == null &&
+      sanitizedSettingsEnv.ENABLE_TOOL_SEARCH == null && {
+        ENABLE_TOOL_SEARCH: 'auto:2',
+      }),
+    // The bundled SDK at assistant.mjs sets CLAUDE_CODE_ENTRYPOINT to "sdk-ts"
+    // when not already set in the environment. Anthropic's backend treats
+    // `cli` traffic as first-party and `sdk-ts` traffic as third-party,
+    // which puts the latter into a deprioritized lane that gets throttled
+    // first under load. Users on Pro/Max OAuth report rate-limit errors when
+    // running Nimbalyst alongside the standalone Claude Code CLI even at low
+    // usage; setting this to `cli` aligns Nimbalyst's classification with
+    // the official CLI and removes that asymmetry. The user can still
+    // override via their own env var if they want the original sdk-ts label.
+    ...(process.env.CLAUDE_CODE_ENTRYPOINT == null && { CLAUDE_CODE_ENTRYPOINT: 'cli' }),
     ...(config.effortLevel && config.effortLevel !== DEFAULT_EFFORT_LEVEL && {
       CLAUDE_CODE_EFFORT_LEVEL: config.effortLevel
     }),
+    // The bundled claude binary runs a per-tool idle-timeout watchdog (default
+    // 300s) over MCP servers whose transport is http/sse/ws. ALL Nimbalyst
+    // in-app MCP servers use SSE, and the interactive input tools
+    // (PromptForUserInput, AskUserQuestion) block indefinitely waiting for the
+    // human — so the watchdog aborts them at 300s and the prompt collapses
+    // (#758). Our SSE servers are local in-process, so a "hung" tool is our own
+    // bug rather than a flaky network the watchdog guards against; disable it
+    // by default. A user-set value (settings/shell/process env) still wins.
+    ...(sanitizedProcessEnv.CLAUDE_CODE_MCP_TOOL_IDLE_TIMEOUT == null &&
+      sanitizedShellEnv.CLAUDE_CODE_MCP_TOOL_IDLE_TIMEOUT == null &&
+      sanitizedSettingsEnv.CLAUDE_CODE_MCP_TOOL_IDLE_TIMEOUT == null && {
+        CLAUDE_CODE_MCP_TOOL_IDLE_TIMEOUT: '0',
+      }),
   };
 
   // NIM-376: Overlay enhanced PATH so the Claude Code SDK can find stdio MCP
@@ -222,7 +349,6 @@ export async function buildSdkOptions(
   // (/usr/bin:/bin:/usr/sbin:/sbin) that doesn't include Homebrew/nvm/volta,
   // and CLIManager's cachedShellEnvironment deliberately strips PATH so
   // shellEnv can't contribute it either.
-  const enhancedPath = ClaudeCodeDeps.enhancedPathLoader?.();
   if (enhancedPath) {
     env.PATH = enhancedPath;
   }
@@ -309,29 +435,27 @@ export async function buildSdkOptions(
     }
   }
 
-  // Build prompt input
-  let promptInput: string | AsyncIterable<SDKUserMessage>;
+  // Build prompt input. Always use a persistent AsyncIterable (never a bare
+  // string) so isSingleUserTurn=false in the SDK -- this prevents the SDK
+  // from closing the binary's stdin pipe on `type: 'result'` and avoids the
+  // "Stream closed" tool permission errors on long turns.
   const hasAttachmentBlocks = imageContentBlocks.length > 0 || documentContentBlocks.length > 0;
+  const userContent: string | ContentBlockParam[] = hasAttachmentBlocks
+    ? [
+        ...imageContentBlocks,
+        ...documentContentBlocks,
+        { type: 'text', text: message } as TextBlockParam,
+      ]
+    : message;
 
-  if (hasAttachmentBlocks) {
-    const contentBlocks: ContentBlockParam[] = [
-      ...imageContentBlocks,
-      ...documentContentBlocks,
-      { type: 'text', text: message } as TextBlockParam
-    ];
+  const initialMessage: SDKUserMessage = {
+    type: 'user',
+    message: { role: 'user', content: userContent as any },
+    parent_tool_use_id: null,
+  };
 
-    async function* createStreamingInput(): AsyncGenerator<SDKUserMessage> {
-      yield {
-        type: 'user',
-        message: { role: 'user', content: contentBlocks },
-        parent_tool_use_id: null
-      };
-    }
+  const { iterable: promptInput, controller: promptController } =
+    createPersistentPromptStream(initialMessage);
 
-    promptInput = createStreamingInput();
-  } else {
-    promptInput = message;
-  }
-
-  return { options, promptInput, helperMethod };
+  return { options, promptInput, promptController, helperMethod };
 }

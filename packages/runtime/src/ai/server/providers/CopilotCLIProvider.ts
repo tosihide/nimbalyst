@@ -14,6 +14,9 @@
  */
 
 import { execFileSync } from 'child_process';
+import fs from 'fs';
+import os from 'os';
+import path from 'path';
 import { BaseAgentProvider } from './BaseAgentProvider';
 import { buildUserMessageAddition } from './documentContextUtils';
 import { buildClaudeCodeSystemPrompt } from '../../prompt';
@@ -29,6 +32,7 @@ import {
 import { CopilotACPProtocol } from '../protocols/CopilotACPProtocol';
 import { ProtocolEvent, ProtocolSession } from '../protocols/ProtocolInterface';
 import { McpConfigService } from '../services/McpConfigService';
+import { getMcpConfigService, isInternalMcpServerEnabled } from '../services/mcpServerConfig';
 import { MCPServerConfig } from '../../../types/MCPServerConfig';
 import { safeJSONSerialize } from '../../../utils/serialization';
 import { AgentProtocolTranscriptAdapter } from './agentProtocol/AgentProtocolTranscriptAdapter';
@@ -37,6 +41,61 @@ import { TranscriptMigrationRepository } from '../../../storage/repositories/Tra
 
 interface CopilotCLIProviderDeps {
   protocol?: CopilotACPProtocol;
+}
+
+function splitPathEntries(pathValue: string | undefined): string[] {
+  if (!pathValue) return [];
+  return pathValue
+    .split(path.delimiter)
+    .map((entry) => entry.trim().replace(/^"(.*)"$/, '$1'))
+    .filter(Boolean);
+}
+
+function findExecutableInPathEntries(
+  executableNames: string[],
+  pathValue: string | undefined
+): string | undefined {
+  for (const entry of splitPathEntries(pathValue)) {
+    for (const executableName of executableNames) {
+      const candidate = path.join(entry, executableName);
+      if (fs.existsSync(candidate)) {
+        return candidate;
+      }
+    }
+  }
+  return undefined;
+}
+
+function getSystemCopilotExecutableCandidates(pathValue?: string): string[] {
+  const platform = process.platform;
+  const homeDir = os.homedir();
+  const pathModule = platform === 'win32' ? path.win32 : path;
+  const seen = new Set<string>();
+  const candidates: string[] = [];
+  const addCandidate = (candidate: string | undefined) => {
+    if (!candidate) return;
+    const normalized = pathModule.normalize(candidate);
+    if (seen.has(normalized)) return;
+    seen.add(normalized);
+    candidates.push(candidate);
+  };
+
+  if (platform === 'win32') {
+    const appData = process.env.APPDATA || path.win32.join(homeDir, 'AppData', 'Roaming');
+    addCandidate(path.win32.join(appData, 'npm', 'copilot.cmd'));
+    addCandidate(path.win32.join(homeDir, 'AppData', 'Roaming', 'npm', 'copilot.cmd'));
+    addCandidate(findExecutableInPathEntries(['copilot.cmd', 'copilot.exe'], pathValue ?? process.env.PATH));
+    addCandidate('copilot');
+    return candidates;
+  }
+
+  addCandidate(path.join(homeDir, '.local', 'bin', 'copilot'));
+  addCandidate(path.join(homeDir, '.npm-global', 'bin', 'copilot'));
+  addCandidate('/usr/local/bin/copilot');
+  addCandidate('/opt/homebrew/bin/copilot');
+  addCandidate(findExecutableInPathEntries(['copilot'], pathValue ?? process.env.PATH));
+  addCandidate('copilot');
+  return candidates;
 }
 
 export class CopilotCLIProvider extends BaseAgentProvider {
@@ -51,12 +110,8 @@ export class CopilotCLIProvider extends BaseAgentProvider {
     isResumedSession: boolean;
   } | null = null;
 
-  private static mcpServerPort: number | null = null;
-  private static sessionNamingServerPort: number | null = null;
-  private static extensionDevServerPort: number | null = null;
-  private static sessionContextServerPort: number | null = null;
-  private static metaAgentServerPort: number | null = null;
-
+  // Internal MCP-server enablement (ports, kill-switches, extension/tracker
+  // loaders, auth token) lives in the shared `mcpServerConfig` registry now.
   private static mcpConfigLoader: ((workspacePath?: string) => Promise<Record<string, MCPServerConfig>>) | null = null;
   private static shellEnvironmentLoader: (() => Record<string, string> | null) | null = null;
   private static enhancedPathLoader: (() => string) | null = null;
@@ -67,15 +122,8 @@ export class CopilotCLIProvider extends BaseAgentProvider {
 
     this.protocol = deps?.protocol || new CopilotACPProtocol();
 
-    this.mcpConfigService = new McpConfigService({
-      mcpServerPort: CopilotCLIProvider.mcpServerPort,
-      sessionNamingServerPort: CopilotCLIProvider.sessionNamingServerPort,
-      extensionDevServerPort: CopilotCLIProvider.extensionDevServerPort,
-      superLoopProgressServerPort: null,
-      sessionContextServerPort: CopilotCLIProvider.sessionContextServerPort,
-      metaAgentServerPort: CopilotCLIProvider.metaAgentServerPort,
+    this.mcpConfigService = getMcpConfigService({
       mcpConfigLoader: CopilotCLIProvider.mcpConfigLoader,
-      extensionPluginsLoader: null,
       claudeSettingsEnvLoader: null,
       shellEnvironmentLoader: CopilotCLIProvider.shellEnvironmentLoader,
     });
@@ -90,26 +138,8 @@ export class CopilotCLIProvider extends BaseAgentProvider {
   }
 
   // --- Static injection setters (called from electron main process at startup) ---
-
-  public static setMcpServerPort(port: number | null): void {
-    CopilotCLIProvider.mcpServerPort = port;
-  }
-
-  public static setSessionNamingServerPort(port: number | null): void {
-    CopilotCLIProvider.sessionNamingServerPort = port;
-  }
-
-  public static setExtensionDevServerPort(port: number | null): void {
-    CopilotCLIProvider.extensionDevServerPort = port;
-  }
-
-  public static setSessionContextServerPort(port: number | null): void {
-    CopilotCLIProvider.sessionContextServerPort = port;
-  }
-
-  public static setMetaAgentServerPort(port: number | null): void {
-    CopilotCLIProvider.metaAgentServerPort = port;
-  }
+  // Internal MCP-server ports / kill-switches / loaders / auth token are
+  // configured once via `configureMcpServers` (shared registry).
 
   public static setMCPConfigLoader(loader: ((workspacePath?: string) => Promise<Record<string, MCPServerConfig>>) | null): void {
     CopilotCLIProvider.mcpConfigLoader = loader;
@@ -125,6 +155,23 @@ export class CopilotCLIProvider extends BaseAgentProvider {
 
   public static setCopilotPathLoader(loader: (() => string | null) | null): void {
     CopilotCLIProvider.copilotPathLoader = loader;
+  }
+
+  private static resolveCopilotExecutableForRuntime(pathValue?: string): string | undefined {
+    if (CopilotCLIProvider.copilotPathLoader) {
+      const customPath = CopilotCLIProvider.copilotPathLoader();
+      if (customPath) {
+        return customPath;
+      }
+    }
+
+    for (const candidate of getSystemCopilotExecutableCandidates(pathValue)) {
+      if (candidate === 'copilot' || fs.existsSync(candidate)) {
+        return candidate;
+      }
+    }
+
+    return undefined;
   }
 
   // --- Model discovery ---
@@ -377,7 +424,7 @@ export class CopilotCLIProvider extends BaseAgentProvider {
   }
 
   protected buildSystemPrompt(documentContext?: DocumentContext): string {
-    const hasSessionNaming = CopilotCLIProvider.sessionNamingServerPort !== null;
+    const hasSessionNaming = isInternalMcpServerEnabled();
     const worktreePath = documentContext?.worktreePath;
 
     return buildClaudeCodeSystemPrompt({
@@ -390,7 +437,9 @@ export class CopilotCLIProvider extends BaseAgentProvider {
   }
 
   private static isCopilotInstalled(): boolean {
-    const command = CopilotCLIProvider.copilotPathLoader?.() || 'copilot';
+    const command = CopilotCLIProvider.resolveCopilotExecutableForRuntime(
+      CopilotCLIProvider.enhancedPathLoader?.() || process.env.PATH
+    ) || 'copilot';
     // Use the enhanced PATH (Homebrew, npm-global, etc.) so the runtime
     // check matches what the settings panel sees. A packaged macOS app
     // launched from Finder/Dock has only /usr/bin:/bin:/usr/sbin:/sbin in
@@ -415,9 +464,11 @@ export class CopilotCLIProvider extends BaseAgentProvider {
   }
 
   private configureProtocol(): void {
-    const customPath = CopilotCLIProvider.copilotPathLoader?.();
-    if (customPath) {
-      this.protocol.setCopilotPath(customPath);
+    const resolvedPath = CopilotCLIProvider.resolveCopilotExecutableForRuntime(
+      CopilotCLIProvider.enhancedPathLoader?.() || process.env.PATH
+    );
+    if (resolvedPath) {
+      this.protocol.setCopilotPath(resolvedPath);
     }
     // Default: `copilot --acp --stdio` (from @github/copilot npm package)
 

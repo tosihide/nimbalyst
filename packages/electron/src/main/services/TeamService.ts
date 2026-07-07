@@ -24,7 +24,9 @@ import { createHash } from 'crypto';
 import { safeHandle } from '../utils/ipcRegistry';
 import { logger } from '../utils/logger';
 import { getNormalizedGitRemote } from '../utils/gitUtils';
-import { getSessionSyncConfig } from '../utils/store';
+import { resolveTeamForRemoteHash } from './teamProjectResolver';
+import { getCollabSyncHttpUrl } from '../utils/collabSyncUrl';
+import { assertJwtMatchesOrg, getJwtExp, AuthContextMismatchError } from './jwtOrg';
 import {
   getAccounts,
   getSessionJwt,
@@ -36,7 +38,26 @@ import {
   refreshSessionForAccount,
   onAuthStateChange,
   updateSessionToken,
+  getStytchUserId,
+  getUserEmail,
+  getPersonalOrgId,
+  getPersonalUserId,
 } from './StytchAuthService';
+import { getDatabase } from '../database/initialize';
+import {
+  backfillProjection,
+  applyMemberUpserted,
+  applyMemberRemoved,
+  applyMemberRoleChanged,
+  applyProjectGrant,
+  applyProjectRevoke,
+  upsertProject,
+  type OrgWithRoster,
+  type MemberInput,
+  type ProjectionDb,
+  type ProjectRole,
+} from './OrgProjectionService';
+import { canAccess, type CanAccessInput, type AccessDatabase } from './OrgAccessResolver';
 import {
   getOrCreateIdentityKeyPair,
   uploadIdentityKeyToOrg,
@@ -53,27 +74,27 @@ import {
   fetchOwnEnvelope,
   getOrgKeyFingerprint,
   clearOrgKey,
+  getMemberTrustStatus,
+  markMemberVerified,
+  fingerprintIdentityKey,
+  fetchTeamKeyStatus,
 } from './OrgKeyService';
 import { performKeyRotation, cleanupOrphanedDocuments, reEncryptTrackerFromLocal } from './KeyRotationService';
+// TrackerSyncManager already imports from this module (findTeamForWorkspace).
+// The cycle is safe because both sides only reference the imported symbols
+// inside function bodies, never at module-init time -- by the time
+// autoMatchTeamForWorkspace runs, both modules are fully loaded.
+import { ensureTrackerSyncForWorkspace } from './TrackerSyncManager';
 
 // ============================================================================
 // Server URL Helper
 // ============================================================================
 
-const PRODUCTION_COLLAB_URL = 'https://sync.nimbalyst.com';
-const DEVELOPMENT_COLLAB_URL = 'http://localhost:8790';
-
-/**
- * Derive the collab server HTTP URL from environment.
- * Unlike SyncManager, this does NOT require sync to be enabled --
- * team operations should work as long as the user is authenticated.
- */
-function getCollabServerUrl(): string {
-  const config = getSessionSyncConfig();
-  const isDev = process.env.NODE_ENV !== 'production';
-  const env = isDev ? config?.environment : undefined;
-  return env === 'development' ? DEVELOPMENT_COLLAB_URL : PRODUCTION_COLLAB_URL;
-}
+// Team operations resolve to the same host the renderer's DocumentSync /
+// TrackerSync use; the canonical helper is `getCollabSyncHttpUrl` in
+// utils/collabSyncUrl.ts. Re-exported under the original name so this
+// module's many callers (and any external imports) don't churn.
+const getCollabServerUrl = getCollabSyncHttpUrl;
 
 // ============================================================================
 // Types
@@ -83,10 +104,81 @@ interface TeamDetails {
   orgId: string;
   name: string;
   gitRemoteHash: string | null;
+  /**
+   * Server-minted UUID that names this team's tracker room
+   * (tracker-sync-redesign D8 / NIM-404). May be null for snapshots from
+   * old worker versions that predate the field; the tracker host adapter
+   * fails closed in that case rather than falling back to gitRemoteHash.
+   */
+  teamProjectId?: string | null;
   createdAt: string;
   role: string;
   /** Stytch membership type: active_member, pending_member, or invited_member */
   membershipType?: string;
+  /**
+   * Epic H3 P0/A: the full project registry for this org. The server returns
+   * every project (primary + secondary), each with its own tracker-room routing
+   * key (`teamProjectId`) and `gitRemoteHash`. Used to resolve a workspace whose
+   * git remote matches a SECONDARY project, not just the primary one. May be
+   * absent for snapshots from worker versions predating the registry.
+   */
+  projects?: TeamProjectSummary[];
+}
+
+/**
+ * Epic H3 P0/A: one project in an org's registry. `teamProjectId` names the
+ * project's tracker room (`org:{orgId}:tracker:{teamProjectId}`); `projectId` is
+ * the stable id used for grants / discovery.
+ */
+export interface TeamProjectSummary {
+  projectId: string;
+  teamProjectId: string;
+  gitRemoteHash: string | null;
+  slug: string | null;
+  name: string | null;
+}
+
+/** Epic H3 P3: per-member row in the move wizard's pre-flight preview. */
+export interface MovePreviewMember {
+  email: string | null;
+  projectRole: string;
+  inDest: boolean;     // already a member of the destination org
+  willInvite: boolean; // not in dest -> will be invited as a paid seat
+}
+
+/** Epic H3 P3: move-project pre-flight (read-only). */
+export interface MovePreview {
+  projectId: string;
+  slug: string | null;
+  slugCollision: boolean; // dest already has a project with this slug
+  custodyBlocked: boolean; // either org still legacy-e2e -> route to H2 first
+  members: MovePreviewMember[];
+  seatDelta: number; // # of members who'll be invited (new paid seats)
+}
+
+/** Epic H3 P1/P2: move-project result. */
+export interface MoveResultSummary {
+  projectId: string;
+  destOrgId: string;
+  destTeamProjectId: string;
+  movedDocuments: number;
+  grantsTransferred: number;
+  grantsPending: number;
+  grantsDropped: number;
+  grantsSkipped: number;
+}
+
+/** Epic H3 P4: merge-orgs result. */
+export interface MergeResultSummary {
+  survivorOrgId: string;
+  drainedOrgId: string;
+  movedProjects: Array<{ projectId: string; destTeamProjectId: string }>;
+  rosterElevated: number;
+  rosterToInvite: number;
+  drainedDeleted: boolean;
+  partial: boolean;
+  failedProjectId?: string;
+  error?: string;
 }
 
 interface TeamMember {
@@ -114,31 +206,28 @@ const orgJwtCache = new Map<string, CachedOrgJwt>();
 const JWT_REFRESH_BUFFER_MS = 60 * 1000;
 
 /**
- * Extract the `exp` claim from a JWT without verifying it.
- * Returns epoch seconds, or null if parsing fails.
- */
-function getJwtExp(jwt: string): number | null {
-  try {
-    const parts = jwt.split('.');
-    if (parts.length !== 3) return null;
-    const payload = JSON.parse(Buffer.from(parts[1], 'base64url').toString());
-    return typeof payload.exp === 'number' ? payload.exp : null;
-  } catch {
-    return null;
-  }
-}
-
-/**
  * Get an org-scoped JWT via session exchange. Caches per-org.
  * This does NOT touch the global auth state -- the personal org session is preserved.
  *
  * Cache TTL is derived from the actual JWT `exp` claim (minus a 60s buffer)
  * so we never serve an expired token.
+ *
+ * NIM-949: the exchanged token is asserted to actually be scoped to `orgId`
+ * (its `organization_id` claim). A session refresh can demote a team session
+ * toward the personal org, in which case `/switch` may hand back a personal-org
+ * token; serving that for a team document room causes the room to reject the ws
+ * upgrade (400) and the doc renders blank. We throw AuthContextMismatchError
+ * rather than cache/serve a wrong-org token. Pass `forceRefresh` to bypass the
+ * cache and re-exchange (used by reconnect after an auth-style rejection).
  */
-export async function getOrgScopedJwt(orgId: string, accountOrgId?: string): Promise<string> {
+export async function getOrgScopedJwt(
+  orgId: string,
+  accountOrgId?: string,
+  forceRefresh = false,
+): Promise<string> {
   // Check cache
   const cached = orgJwtCache.get(orgId);
-  if (cached && cached.expiresAt > Date.now()) {
+  if (!forceRefresh && cached && cached.expiresAt > Date.now()) {
     return cached.jwt;
   }
   // logger.main.info(`[TeamService] Org JWT cache miss for ${orgId}, exchanging session...`);
@@ -178,7 +267,7 @@ export async function getOrgScopedJwt(orgId: string, accountOrgId?: string): Pro
   // The personal JWT expires after ~5 minutes; reconnecting tracker sync
   // after a WebSocket drop hits this path routinely.
   if (response.status === 401) {
-    logger.main.info(`[TeamService] getOrgScopedJwt: 401 for ${orgId}, refreshing session...`);
+    // logger.main.info(`[TeamService] getOrgScopedJwt: 401 for ${orgId}, refreshing session...`);
     let refreshed = false;
     try {
       if (accountOrgId) {
@@ -217,6 +306,22 @@ export async function getOrgScopedJwt(orgId: string, accountOrgId?: string): Pro
     throw new Error('Session exchange returned no JWT');
   }
 
+  // NIM-949: never cache/serve a token scoped to a different org than requested.
+  // A demoted (personal-org) token here is the root cause of server-only docs
+  // rendering blank: the team room rejects it on the ws upgrade.
+  try {
+    assertJwtMatchesOrg(data.sessionJwt, orgId);
+  } catch (err) {
+    if (err instanceof AuthContextMismatchError) {
+      orgJwtCache.delete(orgId);
+      logger.main.warn(
+        `[TeamService] getOrgScopedJwt: exchange returned wrong-org token for ${orgId} ` +
+          `(token org: ${err.tokenOrgId ?? '(none)'}); refusing to serve it`,
+      );
+    }
+    throw err;
+  }
+
   // Stytch session exchange replaces the session token -- the old one is now
   // invalid. We MUST persist the new token so that refreshSession() and
   // getSessionToken() continue to work.
@@ -249,6 +354,16 @@ export async function getOrgScopedJwt(orgId: string, accountOrgId?: string): Pro
 // ============================================================================
 
 /**
+ * Per-request deadline for `fetchTeamApi`. `net.fetch` has no default
+ * timeout, so without this an unresponsive worker (e.g. the Stytch B2B
+ * JWKS outage on 2026-05-20) can hang IPC handlers indefinitely. NIM-638
+ * was a stuck tracker editor caused by `team:list-members` waiting on
+ * such a hung request forever. 15s is generous for these calls -- a
+ * healthy worker responds in under a second.
+ */
+const TEAM_API_TIMEOUT_MS = 15_000;
+
+/**
  * Make an authenticated REST call to the collabv3 team API.
  * Uses the personal org JWT for team-listing endpoints.
  * Uses org-scoped JWT when orgId is provided (for member operations).
@@ -267,11 +382,35 @@ async function fetchTeamApi(path: string, method: string, body?: unknown, orgId?
     if (body !== undefined) {
       headers['Content-Type'] = 'application/json';
     }
-    return net.fetch(`${httpUrl}${path}`, {
-      method,
-      headers,
-      body: body !== undefined ? JSON.stringify(body) : undefined,
-    });
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), TEAM_API_TIMEOUT_MS);
+    const reqStart = Date.now();
+    try {
+      const resp = await net.fetch(`${httpUrl}${path}`, {
+        method,
+        headers,
+        body: body !== undefined ? JSON.stringify(body) : undefined,
+        signal: controller.signal,
+      });
+      const reqMs = Date.now() - reqStart;
+      // Log slow (and any non-2xx) responses so a degraded team API surfaces
+      // before it hits the 15s timeout. The happy-path 200s under 500ms stay
+      // silent.
+      if (reqMs >= 500 || !resp.ok) {
+        logger.main.info(`[TeamService] ${method} ${path} -> ${resp.status} in ${reqMs}ms (jwt: ${jwtSource})`);
+      }
+      return resp;
+    } catch (err) {
+      const reqMs = Date.now() - reqStart;
+      if ((err as { name?: string })?.name === 'AbortError') {
+        logger.main.warn(`[TeamService] ${method} ${path} timed out after ${reqMs}ms (jwt: ${jwtSource})`);
+        throw new Error(`Team API timeout after ${TEAM_API_TIMEOUT_MS}ms: ${method} ${path}`);
+      }
+      logger.main.warn(`[TeamService] ${method} ${path} threw after ${reqMs}ms (jwt: ${jwtSource}):`, err);
+      throw err;
+    } finally {
+      clearTimeout(timer);
+    }
   };
 
   // Use org-scoped JWT if orgId provided, otherwise personal JWT
@@ -382,42 +521,69 @@ function getMemberIdFromJwt(jwt: string): string | null {
  * List all teams the current user belongs to, across all signed-in accounts.
  * Queries each account's teams and deduplicates by orgId.
  */
+// Short-TTL cache: findTeamForWorkspace is fanned out from many sites
+// (workspace open, sync init, tracker init, body-doc service, etc.) and each
+// listTeams call hits /api/teams once per signed-in account. Without this,
+// opening a workspace can trigger a parallel HTTP storm and the same call
+// repeats every few hundred ms during init.
+let listTeamsCache: { promise: Promise<TeamDetails[]>; expiresAt: number } | null = null;
+const LIST_TEAMS_TTL_MS = 5000;
+
+export function invalidateListTeamsCache(): void {
+  listTeamsCache = null;
+}
+
 async function listTeams(): Promise<TeamDetails[]> {
   if (!isAuthenticated()) {
     logger.main.info('[TeamService] listTeams: not authenticated, skipping');
     return [];
   }
 
-  const allAccounts = getAccounts();
-  const seenOrgIds = new Set<string>();
-  const allTeams: TeamDetails[] = [];
+  const now = Date.now();
+  if (listTeamsCache && listTeamsCache.expiresAt > now) {
+    return listTeamsCache.promise;
+  }
 
-  // Query teams for each signed-in account in parallel
-  const results = await Promise.allSettled(
-    allAccounts.map(async (account) => {
-      try {
-        const data = await fetchTeamApi('/api/teams', 'GET', undefined, undefined, account.personalOrgId) as { teams: TeamDetails[] };
-        return data.teams || [];
-      } catch (err) {
-        logger.main.error(`[TeamService] listTeams error for account ${account.email}:`, err);
-        return [];
-      }
-    })
-  );
+  const promise = (async (): Promise<TeamDetails[]> => {
+    const allAccounts = getAccounts();
+    const seenOrgIds = new Set<string>();
+    const allTeams: TeamDetails[] = [];
 
-  for (const result of results) {
-    if (result.status === 'fulfilled') {
-      for (const team of result.value) {
-        if (!seenOrgIds.has(team.orgId)) {
-          seenOrgIds.add(team.orgId);
-          allTeams.push(team);
+    // Query teams for each signed-in account in parallel
+    const results = await Promise.allSettled(
+      allAccounts.map(async (account) => {
+        try {
+          const data = await fetchTeamApi('/api/teams', 'GET', undefined, undefined, account.personalOrgId) as { teams: TeamDetails[] };
+          return data.teams || [];
+        } catch (err) {
+          logger.main.error(`[TeamService] listTeams error for account ${account.email}:`, err);
+          return [];
+        }
+      })
+    );
+
+    for (const result of results) {
+      if (result.status === 'fulfilled') {
+        for (const team of result.value) {
+          if (!seenOrgIds.has(team.orgId)) {
+            seenOrgIds.add(team.orgId);
+            allTeams.push(team);
+          }
         }
       }
     }
-  }
 
-  // logger.main.info(`[TeamService] listTeams: found ${allTeams.length} team(s)`, allTeams.map(t => ({ orgId: t.orgId, name: t.name, hash: t.gitRemoteHash?.substring(0, 8) })));
-  return allTeams;
+    return allTeams;
+  })();
+
+  listTeamsCache = { promise, expiresAt: now + LIST_TEAMS_TTL_MS };
+  // Drop the cache on rejection so the next caller retries instead of pinning
+  // a failed promise for the TTL window.
+  promise.catch(() => {
+    if (listTeamsCache?.promise === promise) listTeamsCache = null;
+  });
+
+  return promise;
 }
 
 /**
@@ -455,16 +621,23 @@ export async function findTeamForWorkspace(workspacePath: string, precomputedRem
 
   try {
     const teams = await listTeams();
-    // Only match teams where the user is an active member -- never auto-join
-    // invited or pending teams without explicit user consent.
-    const activeTeams = teams.filter(t => !t.membershipType || t.membershipType === 'active_member');
-    const match = activeTeams.find(t => t.gitRemoteHash === remoteHash) || null;
+    // Epic H3 P0/A: resolve across ALL projects in each org (primary + secondary),
+    // so a workspace whose remote matches a SECONDARY project routes to that
+    // project's tracker room. The project registry rides along on listTeams
+    // (cached), so this adds no extra fetch. See teamProjectResolver.ts.
+    const match = resolveTeamForRemoteHash(teams, remoteHash);
     if (match) {
-      // logger.main.info('[TeamService] findTeamForWorkspace: matched team:', match.name, 'orgId:', match.orgId, 'for workspace:', workspacePath);
-    } else if (teams.length > 0) {
-      logger.main.info('[TeamService] findTeamForWorkspace: no hash match. workspace hash:', remoteHash, 'team hashes:', teams.map(t => ({ orgId: t.orgId, name: t.name, hash: t.gitRemoteHash, membership: t.membershipType })));
+      // logger.main.info('[TeamService] findTeamForWorkspace: matched', match.orgId, match.teamProjectId);
+      return match;
     }
-    return match;
+
+    if (teams.length > 0) {
+      // Don't dump the full team list on every miss -- this is on a hot path
+      // (called from many sites during workspace init) and the full dump was
+      // burning measurable CPU on JSON.stringify alone.
+      logger.main.debug('[TeamService] findTeamForWorkspace: no hash match', { remoteHash, teamCount: teams.length });
+    }
+    return null;
   } catch (err) {
     logger.main.error('[TeamService] findTeamForWorkspace error:', err);
     return null;
@@ -555,6 +728,112 @@ async function createTeam(name: string, workspacePath?: string, accountOrgId?: s
     createdAt: new Date().toISOString(),
     role: 'admin',
   };
+}
+
+/**
+ * Add a project to an EXISTING org (Epic H3 P0) — distinct from createTeam,
+ * which mints a brand-new Stytch org + primary project. This adds a second
+ * (third, …) project under an org the caller already administers, with no
+ * Stytch round trip: the server DO mints a fresh tracker-room routing key and
+ * the org's existing DEK already covers the new project's data.
+ *
+ * Returns the new project's ids; also mirrors a local `projects` row so the
+ * client projection (migration 0013 tables) reflects the new project.
+ */
+async function addProjectToOrg(
+  orgId: string,
+  workspacePath?: string,
+  name?: string,
+): Promise<{ projectId: string; teamProjectId: string }> {
+  let gitRemoteHash: string | undefined;
+  if (workspacePath) {
+    const remote = await getNormalizedGitRemote(workspacePath);
+    if (remote) {
+      gitRemoteHash = hashGitRemote(remote);
+    }
+  }
+
+  const result = await fetchTeamApi(`/api/teams/${orgId}/projects`, 'POST', {
+    name: name ?? null,
+    gitRemoteHash,
+  }, orgId) as { projectId: string; teamProjectId: string };
+
+  logger.main.info('[TeamService] Project added to org:', orgId, 'project:', result.projectId);
+
+  // Mirror into the local projection so canAccess + UI see the new project
+  // without waiting for a full re-sync. Best-effort (server is authoritative).
+  try {
+    const db = getDatabase() as ProjectionDb | null;
+    if (db) {
+      await upsertProject(db, {
+        projectId: result.teamProjectId,
+        orgId,
+        slug: name,
+        gitOriginHash: gitRemoteHash ?? null,
+      });
+    }
+  } catch (err) {
+    logger.main.warn('[TeamService] Local projection upsert for new project failed (non-fatal):', err);
+  }
+
+  return result;
+}
+
+/**
+ * List every project in an org (Epic H3 P0/A). Member-gated on the server; any
+ * member can read the registry. Used by the UI to enumerate projects in an org
+ * (e.g. an Organization → Projects management surface).
+ */
+async function listProjectsForOrg(orgId: string): Promise<TeamProjectSummary[]> {
+  const result = await fetchTeamApi(`/api/teams/${orgId}/projects`, 'GET', undefined, orgId) as {
+    projects: TeamProjectSummary[];
+  };
+  return result.projects || [];
+}
+
+/** Epic H3 P3: read-only pre-flight for the "Move to another org" wizard.
+ *  Admin on BOTH orgs (server-enforced). */
+async function previewMoveProject(
+  srcOrgId: string, projectId: string, destOrgId: string,
+): Promise<MovePreview> {
+  return await fetchTeamApi(
+    `/api/teams/${srcOrgId}/move-project/preview?projectId=${encodeURIComponent(projectId)}&destOrgId=${encodeURIComponent(destOrgId)}`,
+    'GET', undefined, srcOrgId,
+  ) as MovePreview;
+}
+
+/**
+ * Epic H3 P1/P2: move a project (its trackers + docs + grants) into another org.
+ * Admin on BOTH orgs (server-enforced). `dropMemberEmails` opts individual
+ * members out of the grant transfer (§12 #3). On success the server has flipped
+ * D1 routing; we drop the listTeams cache so the project re-resolves into the
+ * destination org on the next workspace open / sync re-init.
+ */
+async function moveProjectToOrg(
+  srcOrgId: string, projectId: string, destOrgId: string, dropMemberEmails?: string[],
+): Promise<MoveResultSummary> {
+  const result = await fetchTeamApi(`/api/teams/${srcOrgId}/move-project`, 'POST', {
+    projectId, destOrgId, dropMemberEmails,
+  }, srcOrgId) as MoveResultSummary;
+  logger.main.info('[TeamService] Project moved:', projectId, srcOrgId, '->', destOrgId, result);
+  invalidateListTeamsCache();
+  return result;
+}
+
+/**
+ * Epic H3 P4: merge one org into another — move ALL of the drained org's
+ * projects into the survivor, union the rosters, optionally delete the drained
+ * org. Admin on BOTH (server-enforced). Composes the move engine server-side.
+ */
+async function mergeOrg(
+  drainedOrgId: string, survivorOrgId: string, deleteDrained: boolean, dropMemberEmails?: string[],
+): Promise<MergeResultSummary> {
+  const result = await fetchTeamApi(`/api/teams/${drainedOrgId}/merge-into`, 'POST', {
+    survivorOrgId, deleteDrained, dropMemberEmails,
+  }, drainedOrgId) as MergeResultSummary;
+  logger.main.info('[TeamService] Org merged:', drainedOrgId, '->', survivorOrgId, result);
+  invalidateListTeamsCache();
+  return result;
 }
 
 /**
@@ -675,6 +954,38 @@ async function setProjectIdentity(orgId: string, gitRemoteHash: string): Promise
  */
 async function clearProjectIdentity(orgId: string): Promise<void> {
   await fetchTeamApi(`/api/teams/${orgId}/project-identity`, 'DELETE', undefined, orgId);
+}
+
+// ============================================================================
+// Epic H1: project-access grant management (admin only). These call the new
+// collab REST endpoints, which forward to the TeamRoom DO project_access table.
+// ============================================================================
+
+/** Grant a member a project-scoped role. Admin only. */
+async function grantProjectAccess(
+  orgId: string, projectId: string, userId: string, projectRole: string,
+): Promise<void> {
+  await fetchTeamApi(
+    `/api/teams/${orgId}/project-access`, 'POST',
+    { projectId, userId, projectRole }, orgId,
+  );
+}
+
+/** Revoke a member's access to a project. Admin only. */
+async function revokeProjectAccess(orgId: string, projectId: string, userId: string): Promise<void> {
+  const qp = `projectId=${encodeURIComponent(projectId)}&userId=${encodeURIComponent(userId)}`;
+  await fetchTeamApi(`/api/teams/${orgId}/project-access?${qp}`, 'DELETE', undefined, orgId);
+}
+
+/** List the grants for a project. Admin only. */
+async function listProjectAccess(
+  orgId: string, projectId: string,
+): Promise<Array<{ userId: string; projectRole: string }>> {
+  const qp = `projectId=${encodeURIComponent(projectId)}`;
+  const data = await fetchTeamApi(
+    `/api/teams/${orgId}/project-access?${qp}`, 'GET', undefined, orgId,
+  ) as { grants?: Array<{ userId: string; projectRole: string }> };
+  return data.grants || [];
 }
 
 /**
@@ -885,6 +1196,19 @@ function startAutoWrapPolling(orgId: string): void {
       return;
     }
 
+    // Epic H2: stop polling for server-managed teams -- they have no key
+    // envelopes, so autoWrapForNewMembers is a no-op every iteration.
+    try {
+      const orgJwt = await getOrgScopedJwt(orgId);
+      if ((await fetchTeamKeyStatus(orgId, orgJwt)).mode === 'server-managed') {
+        clearInterval(interval);
+        autoWrapIntervals.delete(orgId);
+        return;
+      }
+    } catch {
+      // Could not determine mode -- continue with legacy wrapping below.
+    }
+
     try {
       await autoWrapForNewMembers(orgId);
     } catch (err) {
@@ -936,6 +1260,12 @@ export async function autoMatchTeamForWorkspace(workspacePath: string): Promise<
         startAutoWrapPolling(result.team.orgId);
       }
 
+      // Epic H1: refresh the local org/project/membership projection so the
+      // canAccess resolver has this team's roster + grants. Best-effort.
+      syncOrgProjectionFromServer().catch(err => {
+        logger.main.warn('[TeamService] post-match org projection sync failed:', err);
+      });
+
       // Notify all renderer windows about the team match
       const { BrowserWindow } = await import('electron');
       for (const win of BrowserWindow.getAllWindows()) {
@@ -946,6 +1276,19 @@ export async function autoMatchTeamForWorkspace(workspacePath: string): Promise<
           hasKey: result.hasKey,
         });
       }
+
+      // Why: callers run autoMatch and initializeTrackerSync in parallel
+      // (WorkspaceManagerWindow, index.ts CLI open, RepositoryManager
+      // auth-change reinit). The parallel init typically races ahead, finds
+      // no team yet via findTeamForWorkspace, and bails at a debug-level
+      // log line that never makes it to main.log. We use the race-safe
+      // ensureTrackerSyncForWorkspace here: if the parallel call is still
+      // inflight, we share its promise; if it already bailed silently or
+      // bails when our shared promise resolves, ensure retries once more
+      // with a fresh init so the engine actually starts.
+      ensureTrackerSyncForWorkspace(workspacePath).catch(err => {
+        logger.main.warn('[TeamService] post-match ensureTrackerSyncForWorkspace failed for', workspacePath, err);
+      });
     }
   } catch (err) {
     // Fire-and-forget -- never block workspace open
@@ -964,6 +1307,18 @@ export async function autoWrapForNewMembers(orgId: string): Promise<void> {
   if (!localFp) return; // No local key at all
 
   const orgJwt = await getOrgScopedJwt(orgId);
+
+  // Epic H2: server-managed teams have no per-member key envelopes -- the server
+  // holds the per-team DEK and sync paths skip the ECDH unwrap entirely. Wrapping
+  // org keys for members is dead work here (and noisily fails with "Public key not
+  // found" for members who never uploaded an identity key). Skip it.
+  try {
+    if ((await fetchTeamKeyStatus(orgId, orgJwt)).mode === 'server-managed') {
+      return;
+    }
+  } catch {
+    // Could not determine custody mode -- fall through to legacy wrapping (safe default).
+  }
 
   try {
     const fpResp = await fetchTeamApi(`/api/teams/${orgId}/org-key-fingerprint`, 'GET', undefined, orgId) as { fingerprint: string | null };
@@ -994,8 +1349,27 @@ export async function autoWrapForNewMembers(orgId: string): Promise<void> {
   for (const member of unwrappedMembers) {
     try {
       const memberPubKey = await fetchMemberPublicKey(member.memberId, orgJwt);
+      // Trust gate (security review Issue 2): only wrap if we haven't
+      // recorded a different fingerprint for this member. `unverified` is
+      // TOFU on first contact -- we wrap and record the fingerprint so the
+      // next swap (member rotates their device key, or server lies about
+      // which key belongs to them) is caught as `fingerprint-changed` and
+      // skipped until the admin manually re-verifies via the trust UI.
+      const memberFingerprint = await fingerprintIdentityKey(memberPubKey);
+      const trustStatus = getMemberTrustStatus(orgId, member.memberId, memberFingerprint);
+      if (trustStatus === 'fingerprint-changed') {
+        logger.main.warn(
+          '[TeamService] Skipping auto-wrap for', member.email || member.memberId,
+          '-- identity key fingerprint changed; manual re-verification required',
+        );
+        continue;
+      }
+
       const envelope = await wrapOrgKeyForMember(orgId, memberPubKey);
       await uploadEnvelope(orgId, member.memberId, envelope, orgJwt);
+      if (trustStatus === 'unverified') {
+        markMemberVerified(orgId, member.memberId, memberFingerprint);
+      }
       logger.main.info('[TeamService] Wrapped org key for member:', member.email || member.memberId);
     } catch (err) {
       // Member may not have uploaded their public key yet - that's OK
@@ -1004,11 +1378,271 @@ export async function autoWrapForNewMembers(orgId: string): Promise<void> {
   }
 }
 
+/**
+ * NIM-913: repair stranded members by FORCE re-wrapping the CURRENT org key for
+ * EVERY active member, overwriting any stale envelope.
+ *
+ * Unlike `autoWrapForNewMembers` (which only wraps members with NO envelope),
+ * this re-wraps members who already have an envelope but on the WRONG epoch —
+ * the exact case left behind when a key rotation's per-member re-wrap failed for
+ * someone, stranding them on the old key so they can't decrypt current-epoch
+ * data (e.g. shared doc-index titles).
+ *
+ * Must run from a device that HOLDS THE CURRENT key: it is gated on the local
+ * key matching the server's current fingerprint (wrapping a stale key for
+ * everyone would spread split-brain encryption), and `upload-envelope` is
+ * admin-gated server-side. The server upserts envelopes, so this safely
+ * overwrites. Returns per-member outcome counts.
+ */
+export async function rewrapOrgKeyForAllMembers(
+  orgId: string,
+): Promise<{ rewrapped: number; skipped: number; failed: string[] }> {
+  const localFp = getOrgKeyFingerprint(orgId);
+  if (!localFp) throw new Error('No local org key — open the workspace as a member who holds the team key.');
+
+  const orgJwt = await getOrgScopedJwt(orgId);
+
+  // Gate: only redistribute if OUR key is the server's current epoch. Otherwise
+  // we'd overwrite everyone's good envelopes with a stale key.
+  const fpResp = await fetchTeamApi(`/api/teams/${orgId}/org-key-fingerprint`, 'GET', undefined, orgId) as { fingerprint: string | null };
+  if (fpResp.fingerprint && fpResp.fingerprint !== localFp) {
+    throw new Error(
+      `This device holds a stale team key (${localFp.slice(0, 8)}…), not the current one (${fpResp.fingerprint.slice(0, 8)}…). ` +
+      'Run the repair from the admin device that performed the key rotation.',
+    );
+  }
+
+  const { members } = await listMembers(orgId);
+  const activeMembers = members.filter(m => m.status !== 'pending');
+
+  logger.main.info('[TeamService] NIM-913 re-wrap: redistributing current org key to', activeMembers.length, 'active member(s)');
+
+  let rewrapped = 0;
+  let skipped = 0;
+  const failed: string[] = [];
+  for (const member of activeMembers) {
+    try {
+      const memberPubKey = await fetchMemberPublicKey(member.memberId, orgJwt);
+      const memberFingerprint = await fingerprintIdentityKey(memberPubKey);
+      const trustStatus = getMemberTrustStatus(orgId, member.memberId, memberFingerprint);
+      if (trustStatus === 'fingerprint-changed') {
+        logger.main.warn('[TeamService] NIM-913 re-wrap: skipping', member.email || member.memberId, '-- identity key changed; manual re-verification required');
+        skipped += 1;
+        continue;
+      }
+      const envelope = await wrapOrgKeyForMember(orgId, memberPubKey);
+      await uploadEnvelope(orgId, member.memberId, envelope, orgJwt);
+      if (trustStatus === 'unverified') markMemberVerified(orgId, member.memberId, memberFingerprint);
+      rewrapped += 1;
+    } catch (err) {
+      logger.main.warn('[TeamService] NIM-913 re-wrap failed for member:', member.memberId, err);
+      failed.push(member.email || member.memberId);
+    }
+  }
+  logger.main.info('[TeamService] NIM-913 re-wrap complete: rewrapped', rewrapped, 'skipped', skipped, 'failed', failed.length);
+  return { rewrapped, skipped, failed };
+}
+
 // ============================================================================
 // IPC Handler Registration
 // ============================================================================
 
+/**
+ * Epic H1: refresh the LOCAL org/project/membership projection from the
+ * server-authoritative roster. Mints/updates `orgs`/`projects`/`org_members`/
+ * `project_access` so the `canAccess` resolver can gate UX locally.
+ *
+ * Idempotent (upserts + DO NOTHING grant seeding) — safe to call on workspace
+ * team match, after team mutations, or periodically. Best-effort: a roster
+ * fetch failure for one team seeds that team with an empty roster rather than
+ * aborting the whole sync.
+ */
+export async function syncOrgProjectionFromServer(): Promise<{
+  success: boolean;
+  counts?: { orgs: number; projects: number; members: number; grants: number };
+  error?: string;
+}> {
+  if (!isAuthenticated()) return { success: false, error: 'not-authenticated' };
+  const db = getDatabase() as AccessDatabase | null;
+  if (!db) return { success: false, error: 'db-unavailable' };
+
+  try {
+    const orgs: OrgWithRoster[] = [];
+
+    // Personal org (solo owner) so personal-context access resolves locally.
+    const personalOrgId = getPersonalOrgId();
+    const personalUserId = getPersonalUserId();
+    if (personalOrgId && personalUserId) {
+      orgs.push({
+        org: { orgId: personalOrgId, name: 'Personal', flavor: 'personal' },
+        members: [{ userId: personalUserId, email: getUserEmail(), role: 'owner' }],
+      });
+    }
+
+    const teams = await listTeams();
+    for (const team of teams) {
+      let members: MemberInput[] = [];
+      try {
+        const data = await listMembers(team.orgId);
+        members = (data.members || []).map((m) => ({
+          userId: m.memberId,
+          email: m.email,
+          role: m.role,
+        }));
+      } catch (err) {
+        // Pending/invited teams (or transient failures) can't list members --
+        // seed the org row with an empty roster; a later sync fills it in.
+        logger.main.debug('[TeamService] projection sync: listMembers failed for', team.orgId, err);
+      }
+      orgs.push({
+        org: {
+          orgId: team.orgId,
+          name: team.name,
+          flavor: 'team',
+          teamProjectId: team.teamProjectId ?? null,
+          gitOriginHash: team.gitRemoteHash,
+        },
+        members,
+      });
+    }
+
+    const counts = await backfillProjection(db, orgs);
+    logger.main.info('[TeamService] org projection synced:', counts);
+    return { success: true, counts };
+  } catch (err) {
+    logger.main.error('[TeamService] syncOrgProjectionFromServer error:', err);
+    return { success: false, error: err instanceof Error ? err.message : String(err) };
+  }
+}
+
+/**
+ * Resolve the viewer's per-org member id (Stytch member ids are org-scoped) by
+ * matching the current user's email against the local roster, then run the
+ * `canAccess` resolver. Falls back to the current session's user id.
+ */
+async function canAccessForCurrentUser(input: CanAccessInput): Promise<{
+  allowed: boolean; orgRole: string | null; projectRole: string | null; reason: string;
+}> {
+  const db = getDatabase() as AccessDatabase | null;
+  if (!db) return { allowed: false, orgRole: null, projectRole: null, reason: 'db-unavailable' };
+
+  let viewerUserId = getStytchUserId() ?? getPersonalUserId() ?? '';
+  const email = getUserEmail();
+
+  // Resolve the org first (from projectId if needed), then map email -> member id.
+  let orgId = input.orgId ?? null;
+  if (!orgId && input.projectId) {
+    const pr = await db.query<{ org_id: string }>(`SELECT org_id FROM projects WHERE id = $1`, [input.projectId]);
+    orgId = pr.rows[0]?.org_id ?? null;
+  }
+  if (orgId && email) {
+    const r = await db.query<{ user_id: string }>(
+      `SELECT user_id FROM org_members WHERE org_id = $1 AND lower(email) = lower($2)`,
+      [orgId, email],
+    );
+    if (r.rows[0]?.user_id) viewerUserId = r.rows[0].user_id;
+  }
+
+  return canAccess(db, viewerUserId, input);
+}
+
 export function registerTeamHandlers(): void {
+  safeHandle('org:sync-projection', async () => {
+    return syncOrgProjectionFromServer();
+  });
+
+  safeHandle('org:can-access', async (_event, input: CanAccessInput) => {
+    try {
+      return await canAccessForCurrentUser(input);
+    } catch (error) {
+      return {
+        allowed: false, orgRole: null, projectRole: null,
+        reason: error instanceof Error ? error.message : String(error),
+      };
+    }
+  });
+
+  safeHandle('org:grant-project-access', async (_event, orgId: string, projectId: string, userId: string, projectRole: string) => {
+    try {
+      await grantProjectAccess(orgId, projectId, userId, projectRole);
+      // Reflect the grant in the local projection immediately.
+      await syncOrgProjectionFromServer();
+      return { success: true };
+    } catch (error) {
+      return { success: false, error: error instanceof Error ? error.message : String(error) };
+    }
+  });
+
+  safeHandle('org:revoke-project-access', async (_event, orgId: string, projectId: string, userId: string) => {
+    try {
+      await revokeProjectAccess(orgId, projectId, userId);
+      await syncOrgProjectionFromServer();
+      return { success: true };
+    } catch (error) {
+      return { success: false, error: error instanceof Error ? error.message : String(error) };
+    }
+  });
+
+  safeHandle('org:list-project-access', async (_event, orgId: string, projectId: string) => {
+    try {
+      const grants = await listProjectAccess(orgId, projectId);
+      return { success: true, grants };
+    } catch (error) {
+      return { success: false, error: error instanceof Error ? error.message : String(error) };
+    }
+  });
+
+  // Epic H1 live write-through: the renderer's TeamSync config forwards DO
+  // broadcasts here so the local projection (org_members / project_access)
+  // stays current without a full re-sync. Each is targeted + idempotent.
+  safeHandle('org:apply-project-access', async (_event, projectId: string, userId: string, projectRole: string | null) => {
+    try {
+      const db = getDatabase() as ProjectionDb | null;
+      if (!db) return { success: false, error: 'db-unavailable' };
+      if (projectRole) {
+        await applyProjectGrant(db, projectId, userId, projectRole as ProjectRole);
+      } else {
+        await applyProjectRevoke(db, projectId, userId);
+      }
+      return { success: true };
+    } catch (error) {
+      return { success: false, error: error instanceof Error ? error.message : String(error) };
+    }
+  });
+
+  safeHandle('org:apply-member-upserted', async (_event, orgId: string, userId: string, email: string | null, role: string) => {
+    try {
+      const db = getDatabase() as ProjectionDb | null;
+      if (!db) return { success: false, error: 'db-unavailable' };
+      await applyMemberUpserted(db, orgId, { userId, email, role });
+      return { success: true };
+    } catch (error) {
+      return { success: false, error: error instanceof Error ? error.message : String(error) };
+    }
+  });
+
+  safeHandle('org:apply-member-role-changed', async (_event, orgId: string, userId: string, role: string) => {
+    try {
+      const db = getDatabase() as ProjectionDb | null;
+      if (!db) return { success: false, error: 'db-unavailable' };
+      await applyMemberRoleChanged(db, orgId, userId, role);
+      return { success: true };
+    } catch (error) {
+      return { success: false, error: error instanceof Error ? error.message : String(error) };
+    }
+  });
+
+  safeHandle('org:apply-member-removed', async (_event, orgId: string, userId: string) => {
+    try {
+      const db = getDatabase() as ProjectionDb | null;
+      if (!db) return { success: false, error: 'db-unavailable' };
+      await applyMemberRemoved(db, orgId, userId);
+      return { success: true };
+    } catch (error) {
+      return { success: false, error: error instanceof Error ? error.message : String(error) };
+    }
+  });
+
   safeHandle('team:list', async () => {
     try {
       const teams = await listTeams();
@@ -1049,6 +1683,54 @@ export function registerTeamHandlers(): void {
     try {
       const team = await createTeam(name, workspacePath, accountOrgId);
       return { success: true, team };
+    } catch (error) {
+      return { success: false, error: error instanceof Error ? error.message : String(error) };
+    }
+  });
+
+  safeHandle('team:add-project', async (_event, orgId: string, workspacePath?: string, name?: string) => {
+    try {
+      const project = await addProjectToOrg(orgId, workspacePath, name);
+      // The new project changes the org's registry; drop the listTeams cache so
+      // findTeamForWorkspace can resolve the new project's room on the next open.
+      invalidateListTeamsCache();
+      return { success: true, project };
+    } catch (error) {
+      return { success: false, error: error instanceof Error ? error.message : String(error) };
+    }
+  });
+
+  safeHandle('team:list-projects', async (_event, orgId: string) => {
+    try {
+      const projects = await listProjectsForOrg(orgId);
+      return { success: true, projects };
+    } catch (error) {
+      return { success: false, error: error instanceof Error ? error.message : String(error) };
+    }
+  });
+
+  safeHandle('team:move-project-preview', async (_event, srcOrgId: string, projectId: string, destOrgId: string) => {
+    try {
+      const preview = await previewMoveProject(srcOrgId, projectId, destOrgId);
+      return { success: true, preview };
+    } catch (error) {
+      return { success: false, error: error instanceof Error ? error.message : String(error) };
+    }
+  });
+
+  safeHandle('team:move-project', async (_event, srcOrgId: string, projectId: string, destOrgId: string, dropMemberEmails?: string[]) => {
+    try {
+      const result = await moveProjectToOrg(srcOrgId, projectId, destOrgId, dropMemberEmails);
+      return { success: true, result };
+    } catch (error) {
+      return { success: false, error: error instanceof Error ? error.message : String(error) };
+    }
+  });
+
+  safeHandle('team:merge-org', async (_event, drainedOrgId: string, survivorOrgId: string, deleteDrained: boolean, dropMemberEmails?: string[]) => {
+    try {
+      const result = await mergeOrg(drainedOrgId, survivorOrgId, deleteDrained, dropMemberEmails);
+      return { success: true, result };
     } catch (error) {
       return { success: false, error: error instanceof Error ? error.message : String(error) };
     }
@@ -1167,6 +1849,19 @@ export function registerTeamHandlers(): void {
     }
   });
 
+  // NIM-913: admin repair — force re-wrap the current org key for ALL active
+  // members, fixing members stranded on a stale epoch by a failed rotation
+  // re-wrap. Must be run from a device holding the current key (gated inside).
+  safeHandle('team:rewrap-all-member-keys', async (_event, orgId: string) => {
+    if (!isAuthenticated()) return { success: false, error: 'Not authenticated' };
+    try {
+      const result = await rewrapOrgKeyForAllMembers(orgId);
+      return { success: true, ...result };
+    } catch (error) {
+      return { success: false, error: error instanceof Error ? error.message : String(error) };
+    }
+  });
+
   safeHandle('team:handle-org-key-rotated', async (_event, orgId: string, serverFingerprint: string) => {
     try {
       const localFp = getOrgKeyFingerprint(orgId);
@@ -1215,6 +1910,20 @@ export function registerTeamHandlers(): void {
       return { success: true, ...result };
     } catch (error) {
       return { success: false, error: error instanceof Error ? error.message : String(error) };
+    }
+  });
+
+  // Epic H1: populate the local org/project/membership projection independently
+  // of a workspace team match, so `canAccess` resolves correctly even before (or
+  // without) opening a matched workspace. Runs once now (no-op until auth + db
+  // are ready) and again whenever auth becomes available (login / token refresh
+  // on launch). Idempotent + best-effort.
+  syncOrgProjectionFromServer().catch(err =>
+    logger.main.warn('[TeamService] launch org projection sync failed:', err));
+  onAuthStateChange((authState) => {
+    if (authState.isAuthenticated) {
+      syncOrgProjectionFromServer().catch(err =>
+        logger.main.warn('[TeamService] auth-change org projection sync failed:', err));
     }
   });
 }

@@ -6,6 +6,7 @@
  *
  * Events handled:
  * - file-new-mockup -> newMockupRequestAtom
+ * - file-new-browser-tab -> newBrowserTabRequestAtom
  * - toggle-ai-chat-panel -> toggleAIChatPanelRequestAtom
  *
  * Call initAppCommandListeners() once at app startup.
@@ -18,6 +19,8 @@ import {
   confirmCloseUnsavedRequestAtom,
   extensionMarketplaceInstallRequestAtom,
   fileSaveRequestAtom,
+  marketplaceInstallProgressAtom,
+  newBrowserTabRequestAtom,
   navigationGoBackRequestAtom,
   navigationGoForwardRequestAtom,
   newMockupRequestAtom,
@@ -33,6 +36,7 @@ import {
   toggleAIChatPanelRequestAtom,
   unifiedOnboardingRequestAtom,
   windowsClaudeCodeWarningRequestAtom,
+  type InstallProgressStage,
 } from '../atoms/appCommands';
 
 let onboardingCounter = 0;
@@ -42,6 +46,7 @@ let setContentModeCounter = 0;
 let agentInsertPlanReferenceCounter = 0;
 let showProjectSelectionDialogCounter = 0;
 let showExtensionProjectIntroDialogCounter = 0;
+let marketplaceInstallProgressCounter = 0;
 
 let initialized = false;
 
@@ -57,6 +62,11 @@ export function initAppCommandListeners(): () => void {
     store.set(newMockupRequestAtom, (v) => v + 1);
   });
   if (typeof u1 === 'function') cleanups.push(u1);
+
+  const uBrowserTab = window.electronAPI?.on?.('file-new-browser-tab', () => {
+    store.set(newBrowserTabRequestAtom, (v) => v + 1);
+  });
+  if (typeof uBrowserTab === 'function') cleanups.push(uBrowserTab);
 
   const u2 = window.electronAPI?.on?.('toggle-ai-chat-panel', () => {
     store.set(toggleAIChatPanelRequestAtom, (v) => v + 1);
@@ -160,6 +170,19 @@ export function initAppCommandListeners(): () => void {
     },
   );
   if (typeof u11 === 'function') cleanups.push(u11);
+
+  const u12 = window.electronAPI?.on?.(
+    'extension-marketplace:install-progress',
+    (event: { stage: InstallProgressStage; message: string }) => {
+      marketplaceInstallProgressCounter += 1;
+      store.set(marketplaceInstallProgressAtom, {
+        version: marketplaceInstallProgressCounter,
+        stage: event.stage,
+        message: event.message,
+      });
+    },
+  );
+  if (typeof u12 === 'function') cleanups.push(u12);
 
   return () => {
     initialized = false;

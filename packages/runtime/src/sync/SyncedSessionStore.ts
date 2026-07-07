@@ -21,7 +21,8 @@ import type {
   ChatSession,
 } from '../ai/adapters/sessionStore';
 import type { AgentMessage } from '../ai/server/types';
-import type { SyncProvider, SessionChange } from './types';
+import type { SyncProvider, SessionChange, SyncedSessionMetadata } from './types';
+import { SYNC_RELEVANT_FIELDS, hasSortRelevantChange } from './syncableMetadata';
 
 export interface SyncedSessionStoreOptions {
   /** Auto-connect to sync when session is accessed */
@@ -34,6 +35,49 @@ export interface SyncedSessionStoreOptions {
 const DEFAULT_OPTIONS: SyncedSessionStoreOptions = {
   autoConnect: true,
 };
+
+/**
+ * Build the metadata payload for a `metadata_updated` sync event from a
+ * raw update / create payload. Only fields listed in SYNC_RELEVANT_FIELDS
+ * cross the wire; everything else (local-only caches, provider-internal
+ * columns, etc.) stays on the originating device.
+ *
+ * `forceUpdatedAt` is used by create() -- new sessions always carry a
+ * fresh updatedAt so iOS sorts them correctly even before any further
+ * activity. updateMetadata() only sets updatedAt when a sort-relevant
+ * column actually changed.
+ */
+function buildSyncPayload(
+  payload: Record<string, unknown>,
+  options: { forceUpdatedAt?: boolean } = {}
+): Record<string, unknown> {
+  const syncMetadata: Record<string, unknown> = {};
+
+  for (const field of SYNC_RELEVANT_FIELDS.columns) {
+    if (payload[field] !== undefined) {
+      syncMetadata[field] = payload[field];
+    }
+  }
+
+  const metadataBlob = payload.metadata as Record<string, unknown> | undefined;
+  if (metadataBlob) {
+    for (const key of SYNC_RELEVANT_FIELDS.metadataKeys) {
+      if (metadataBlob[key] !== undefined) {
+        syncMetadata[key] = metadataBlob[key];
+      }
+    }
+  }
+
+  if (Object.keys(syncMetadata).length === 0) {
+    return syncMetadata;
+  }
+
+  if (options.forceUpdatedAt || hasSortRelevantChange(payload)) {
+    syncMetadata.updatedAt = Date.now();
+  }
+
+  return syncMetadata;
+}
 
 /**
  * Creates a SessionStore wrapper that adds sync capabilities.
@@ -91,22 +135,27 @@ export function createSyncedSessionStore(
       // Create in base store first
       await baseStore.create(payload);
 
-      // Then connect sync and push initial metadata
+      // Push initial metadata immediately, but do not wait for the session-room
+      // WebSocket. metadata_updated can travel through the index channel, and
+      // first render for a new empty session should only depend on local persistence.
       if (shouldSync(payload.id, payload.workspaceId)) {
-        await ensureSyncConnected(payload.id);
-        const metadata = {
-          title: payload.title,
-          mode: payload.mode,
-          provider: payload.provider,
-          model: payload.model,
-          workspaceId: payload.workspaceId,
-          updatedAt: Date.now(),
-        };
-        // console.log('[SyncedSessionStore] Creating session with metadata:', payload.id, metadata);
+        const metadata = buildSyncPayload(payload as unknown as Record<string, unknown>, {
+          forceUpdatedAt: true,
+        });
+        // Workspace ID isn't on SYNC_RELEVANT_FIELDS.columns (it's set at create
+        // time and never changes), but iOS needs it to route the session into
+        // the right project on first sight.
+        if (payload.workspaceId !== undefined) {
+          metadata.workspaceId = payload.workspaceId;
+        }
         pushToSync(payload.id, {
           type: 'metadata_updated',
-          metadata,
+          metadata: metadata as unknown as SyncedSessionMetadata,
         });
+
+        // Keep the original per-session auto-connect behavior in the background
+        // so later room-scoped changes such as message_added can reuse it.
+        void ensureSyncConnected(payload.id);
       }
     },
 
@@ -117,40 +166,21 @@ export function createSyncedSessionStore(
       // Update base store
       await baseStore.updateMetadata(sessionId, metadata);
 
-      // Only sync metadata fields that are relevant for cross-device sync
-      // Don't push changes for fields like providerSessionId, etc.
-      // NOTE: queuedPrompts removed - now uses separate queued_prompts table for atomic operations
-      const syncableFields = ['title', 'mode', 'isArchived', 'provider', 'model', 'draftInput'];
-      const hasSyncableField = syncableFields.some(
-        (field) => (metadata as Record<string, unknown>)[field] !== undefined
-      );
+      // Build the sync payload from SYNC_RELEVANT_FIELDS. The store is the
+      // single source of truth for what reaches other devices -- callers do
+      // not (and should not) need to remember to follow updateMetadata with
+      // an explicit pushChange.
+      const syncMetadata = buildSyncPayload(metadata as unknown as Record<string, unknown>);
 
-      if (!hasSyncableField) {
-        // No syncable fields changed, skip sync update
-        return;
-      }
-
-      // Build sync metadata with only defined fields
-      // NOTE: Only bump updatedAt for fields that represent meaningful content changes
-      // (title, mode, archive state, provider, model). Draft input changes should NOT
-      // bump updatedAt -- they are ephemeral cross-device state, not content changes,
-      // and bumping the sort timestamp causes sessions to jump to the top of the iOS list.
-      const syncMetadata: Record<string, unknown> = {};
-      const sortRelevantFields = ['title', 'mode', 'isArchived', 'provider', 'model'];
-      const hasSortRelevantField = sortRelevantFields.some(
-        (field) => (metadata as Record<string, unknown>)[field] !== undefined
-      );
-      if (hasSortRelevantField) {
-        syncMetadata.updatedAt = Date.now();
-      }
-      if (metadata.title !== undefined) syncMetadata.title = metadata.title;
-      if (metadata.mode !== undefined) syncMetadata.mode = metadata.mode;
-      if (metadata.isArchived !== undefined) syncMetadata.isArchived = metadata.isArchived;
-      if ((metadata as any).provider !== undefined) syncMetadata.provider = (metadata as any).provider;
-      if ((metadata as any).model !== undefined) syncMetadata.model = (metadata as any).model;
+      // Draft input gets a separate freshness timestamp; bumping updatedAt
+      // here would cause the row to jump to the top on every keystroke.
       if (metadata.draftInput !== undefined) {
-        syncMetadata.draftInput = metadata.draftInput;
         syncMetadata.draftUpdatedAt = Date.now();
+      }
+
+      if (Object.keys(syncMetadata).length === 0) {
+        // No sync-relevant fields changed, skip sync update
+        return;
       }
 
       // NOTE: Do NOT call ensureSyncConnected here!
@@ -160,7 +190,7 @@ export function createSyncedSessionStore(
       // If the session isn't connected yet, the update will be synced when it is.
       pushToSync(sessionId, {
         type: 'metadata_updated',
-        metadata: syncMetadata as any,
+        metadata: syncMetadata as unknown as SyncedSessionMetadata,
       });
     },
 
@@ -237,6 +267,26 @@ export function createSyncedSessionStore(
  * repository pattern.
  */
 export function createMessageSyncHandler(syncProvider: SyncProvider) {
+  // Rate-limit the "Failed to connect session" log line. Without this, a
+  // single hung CollabV3 connection (e.g. JWT/userId mismatch) produces one
+  // error per agent message -- 1686 of 4986 main.log lines during a mobile
+  // build on 2026-05-21. One log per minute per session keeps the signal
+  // without the flood.
+  const LOG_INTERVAL_MS = 60_000;
+  const lastConnectErrorLogAt = new Map<string, number>();
+
+  function logConnectFailure(sessionId: string, error: unknown): void {
+    const now = Date.now();
+    const last = lastConnectErrorLogAt.get(sessionId) ?? 0;
+    if (now - last >= LOG_INTERVAL_MS) {
+      lastConnectErrorLogAt.set(sessionId, now);
+      console.error(
+        `[MessageSyncHandler] Failed to connect session ${sessionId}:`,
+        error,
+      );
+    }
+  }
+
   return {
     /**
      * Call this after a message is created to sync it.
@@ -244,6 +294,15 @@ export function createMessageSyncHandler(syncProvider: SyncProvider) {
      * @param sessionUpdatedAt Optional timestamp (ms) for session updated_at - MUST match local DB
      */
     async onMessageCreated(message: AgentMessage, sessionUpdatedAt?: number): Promise<void> {
+      // Provider-latched auth mismatch (JWT sub != configured userId) means
+      // the server will reject every connection until the user re-auths or
+      // settings change. Skip the connect attempt entirely; the latch
+      // clears on reconnectIndex() / disconnectAll() so legitimate auth
+      // refreshes still get through on the next message.
+      if (syncProvider.isAuthMismatched?.()) {
+        return;
+      }
+
       // Auto-connect session if not already connected
       if (!syncProvider.isConnected(message.sessionId)) {
         // console.log(`[MessageSyncHandler] Session ${message.sessionId} not connected, auto-connecting...`);
@@ -251,7 +310,7 @@ export function createMessageSyncHandler(syncProvider: SyncProvider) {
           await syncProvider.connect(message.sessionId);
           // console.log(`[MessageSyncHandler] Successfully connected session ${message.sessionId}`);
         } catch (error) {
-          console.error(`[MessageSyncHandler] Failed to connect session ${message.sessionId}:`, error);
+          logConnectFailure(message.sessionId, error);
           return;
         }
       }

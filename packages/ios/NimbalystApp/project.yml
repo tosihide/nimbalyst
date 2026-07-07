@@ -54,29 +54,40 @@ targets:
     preBuildScripts:
       - name: Build Transcript Web Bundle
         script: |
+          # Xcode build scripts run with a minimal PATH that excludes common
+          # node install locations (Homebrew, nvm). Augment PATH so `node` and
+          # the workspace-hoisted vite are resolvable.
+          export PATH="/opt/homebrew/bin:/usr/local/bin:$HOME/.nvm/versions/node/$(cat $HOME/.nvm/alias/default 2>/dev/null)/bin:$PATH"
           cd "${SRCROOT}/.."
-          if [ -f "node_modules/.bin/vite" ]; then
-            npx vite build --config vite.config.transcript.ts 2>&1 || echo "Warning: Vite build failed, using existing dist"
+          # npm workspaces hoist vite to the monorepo root node_modules. The
+          # previous package-local `node_modules/.bin/vite` check was always
+          # false here and silently shipped a stale dist on every rebuild.
+          # Invoke the hoisted binary directly and fail loudly if it's gone.
+          VITE_BIN="${SRCROOT}/../../../node_modules/.bin/vite"
+          if [ ! -x "$VITE_BIN" ]; then
+            echo "error: $VITE_BIN missing; run 'npm install' at the monorepo root" >&2
+            exit 1
           fi
+          "$VITE_BIN" build --config vite.config.transcript.ts
           # Copy transcript dist to Resources (clean first to remove stale hashed assets)
           rm -rf "${SRCROOT}/Resources/transcript-dist"
           mkdir -p "${SRCROOT}/Resources/transcript-dist"
-          if [ -d "dist-transcript" ]; then
-            cp dist-transcript/transcript.html "${SRCROOT}/Resources/transcript-dist/"
-            cp -R dist-transcript/assets "${SRCROOT}/Resources/transcript-dist/"
-          fi
+          cp dist-transcript/transcript.html "${SRCROOT}/Resources/transcript-dist/"
+          cp -R dist-transcript/assets "${SRCROOT}/Resources/transcript-dist/"
         basedOnDependencyAnalysis: false
       - name: Build Editor Web Bundle
         script: |
+          export PATH="/opt/homebrew/bin:/usr/local/bin:$HOME/.nvm/versions/node/$(cat $HOME/.nvm/alias/default 2>/dev/null)/bin:$PATH"
           cd "${SRCROOT}/.."
-          if [ -f "node_modules/.bin/vite" ]; then
-            npx vite build --config vite.config.editor.ts 2>&1 || echo "Warning: Vite build failed, using existing dist"
+          VITE_BIN="${SRCROOT}/../../../node_modules/.bin/vite"
+          if [ ! -x "$VITE_BIN" ]; then
+            echo "error: $VITE_BIN missing; run 'npm install' at the monorepo root" >&2
+            exit 1
           fi
+          "$VITE_BIN" build --config vite.config.editor.ts
           # Copy editor dist to Resources (clean first to remove stale hashed assets)
           rm -rf "${SRCROOT}/Resources/editor-dist"
           mkdir -p "${SRCROOT}/Resources/editor-dist"
-          if [ -d "dist-editor" ]; then
-            cp dist-editor/editor.html "${SRCROOT}/Resources/editor-dist/"
-            cp -R dist-editor/assets "${SRCROOT}/Resources/editor-dist/"
-          fi
+          cp dist-editor/editor.html "${SRCROOT}/Resources/editor-dist/"
+          cp -R dist-editor/assets "${SRCROOT}/Resources/editor-dist/"
         basedOnDependencyAnalysis: false

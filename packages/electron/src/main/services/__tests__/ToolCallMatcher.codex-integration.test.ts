@@ -36,6 +36,7 @@ vi.mock('../../utils/logger', () => ({
 import { parseToolCallWindows, scoreMatch, type ToolCallWindow } from '../ToolCallMatcher';
 
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
+const RUN_PROVIDER_TESTS = process.env.RUN_AI_PROVIDER_TESTS === 'true';
 
 /**
  * Helper: Check if a value is an async iterable.
@@ -161,6 +162,8 @@ describe('ToolCallMatcher Codex Integration', () => {
 
   const skipReason = !OPENAI_API_KEY
     ? 'OPENAI_API_KEY not set'
+    : !RUN_PROVIDER_TESTS
+      ? 'RUN_AI_PROVIDER_TESTS not enabled'
     : '';
 
   (skipReason ? it.skip : it)(

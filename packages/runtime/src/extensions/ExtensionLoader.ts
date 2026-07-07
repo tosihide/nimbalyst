@@ -37,9 +37,14 @@ import type {
   ChatCompletionStreamHandle,
   ChatCompletionStreamChunk,
   ExtensionAIModel,
+  VoiceContextProvider,
 } from './types';
+import type { CollabContentAdapter } from '@nimbalyst/extension-sdk';
+import { registerVoiceContextProvider } from './VoiceContextProviderRegistry';
+import { MONACO_BASE_THEMES } from '@nimbalyst/extension-sdk';
 import { getExtensionPlatformService } from './ExtensionPlatformService';
 import { registerThemeContribution } from '../editor/themes/registry';
+import { registerCollabContentAdapter } from '@nimbalyst/collab-adapters';
 
 const MANIFEST_FILENAME = 'manifest.json';
 
@@ -266,6 +271,28 @@ function validateManifest(
                 suggestion: 'Use "showDocumentHeader": true or false',
               });
             }
+            if (
+              editorRecord.supportsTranscriptEmbed !== undefined &&
+              typeof editorRecord.supportsTranscriptEmbed !== 'boolean'
+            ) {
+              errors.push({
+                error: `customEditors[${index}] has invalid 'supportsTranscriptEmbed'`,
+                field: `contributions.customEditors[${index}].supportsTranscriptEmbed`,
+                suggestion: 'Use "supportsTranscriptEmbed": true or false',
+              });
+            }
+            if (
+              editorRecord.transcriptEmbedHeight !== undefined &&
+              (typeof editorRecord.transcriptEmbedHeight !== 'number' ||
+                !Number.isFinite(editorRecord.transcriptEmbedHeight) ||
+                editorRecord.transcriptEmbedHeight <= 0)
+            ) {
+              errors.push({
+                error: `customEditors[${index}] has invalid 'transcriptEmbedHeight'`,
+                field: `contributions.customEditors[${index}].transcriptEmbedHeight`,
+                suggestion: 'Use a positive number of pixels, e.g., "transcriptEmbedHeight": 360',
+              });
+            }
           });
         }
       }
@@ -471,6 +498,33 @@ function validateManifest(
         }
       }
 
+      // Validate agentWorkflows
+      if (contributions.agentWorkflows !== undefined) {
+        const agentWorkflows = contributions.agentWorkflows as Record<string, unknown>;
+        if (typeof agentWorkflows !== 'object' || agentWorkflows === null) {
+          errors.push({
+            error: `Invalid 'contributions.agentWorkflows' - should be an object`,
+            field: 'contributions.agentWorkflows',
+            suggestion: 'Provide workflow metadata with at least "path" and "displayName"',
+          });
+        } else {
+          if (typeof agentWorkflows.path !== 'string' || !agentWorkflows.path) {
+            errors.push({
+              error: `agentWorkflows missing 'path'`,
+              field: 'contributions.agentWorkflows.path',
+              suggestion: 'Add the relative workflow directory path',
+            });
+          }
+          if (typeof agentWorkflows.displayName !== 'string' || !agentWorkflows.displayName) {
+            errors.push({
+              error: `agentWorkflows missing 'displayName'`,
+              field: 'contributions.agentWorkflows.displayName',
+              suggestion: 'Add a user-facing workflow collection name',
+            });
+          }
+        }
+      }
+
       // Validate panels
       if (contributions.panels !== undefined) {
         if (!Array.isArray(contributions.panels)) {
@@ -577,6 +631,79 @@ function validateManifest(
                 field: `contributions.themes[${index}].colors`,
                 suggestion: 'colors must be an object mapping color keys to color values',
               });
+            }
+            // Optional Monaco block: validates shape only -- token rules /
+            // editor color keys are passed through to Monaco verbatim.
+            if (themeRecord.monaco !== undefined) {
+              const monacoBlock = themeRecord.monaco as Record<string, unknown>;
+              if (
+                typeof monacoBlock !== 'object' ||
+                monacoBlock === null ||
+                Array.isArray(monacoBlock)
+              ) {
+                errors.push({
+                  error: `themes[${index}].monaco must be an object when present`,
+                  field: `contributions.themes[${index}].monaco`,
+                  suggestion: 'Provide { base, rules, colors } to define a Monaco theme',
+                });
+              } else {
+                if (typeof monacoBlock.base !== 'string' || !MONACO_BASE_THEMES.includes(monacoBlock.base as typeof MONACO_BASE_THEMES[number])) {
+                  errors.push({
+                    error: `themes[${index}].monaco.base must be one of ${MONACO_BASE_THEMES.join(', ')}`,
+                    field: `contributions.themes[${index}].monaco.base`,
+                    suggestion: 'Pick "vs" for light or "vs-dark" for dark base',
+                  });
+                }
+                if (monacoBlock.inherit !== undefined && typeof monacoBlock.inherit !== 'boolean') {
+                  errors.push({
+                    error: `themes[${index}].monaco.inherit must be boolean when present`,
+                    field: `contributions.themes[${index}].monaco.inherit`,
+                  });
+                }
+                if (!Array.isArray(monacoBlock.rules)) {
+                  errors.push({
+                    error: `themes[${index}].monaco.rules must be an array`,
+                    field: `contributions.themes[${index}].monaco.rules`,
+                    suggestion: 'Provide an array of { token, foreground?, background?, fontStyle? } rules',
+                  });
+                } else {
+                  monacoBlock.rules.forEach((rule, ruleIndex) => {
+                    if (!rule || typeof rule !== 'object' || Array.isArray(rule)) {
+                      errors.push({
+                        error: `themes[${index}].monaco.rules[${ruleIndex}] must be an object`,
+                        field: `contributions.themes[${index}].monaco.rules[${ruleIndex}]`,
+                      });
+                      return;
+                    }
+                    const ruleRecord = rule as Record<string, unknown>;
+                    if (typeof ruleRecord.token !== 'string' || !ruleRecord.token) {
+                      errors.push({
+                        error: `themes[${index}].monaco.rules[${ruleIndex}] missing 'token'`,
+                        field: `contributions.themes[${index}].monaco.rules[${ruleIndex}].token`,
+                      });
+                    }
+                    for (const optKey of ['foreground', 'background', 'fontStyle'] as const) {
+                      if (ruleRecord[optKey] !== undefined && typeof ruleRecord[optKey] !== 'string') {
+                        errors.push({
+                          error: `themes[${index}].monaco.rules[${ruleIndex}].${optKey} must be a string when present`,
+                          field: `contributions.themes[${index}].monaco.rules[${ruleIndex}].${optKey}`,
+                        });
+                      }
+                    }
+                  });
+                }
+                if (
+                  typeof monacoBlock.colors !== 'object' ||
+                  monacoBlock.colors === null ||
+                  Array.isArray(monacoBlock.colors)
+                ) {
+                  errors.push({
+                    error: `themes[${index}].monaco.colors must be an object`,
+                    field: `contributions.themes[${index}].monaco.colors`,
+                    suggestion: 'Map Monaco color ids (e.g. "editor.background") to color strings',
+                  });
+                }
+              }
             }
           });
         }
@@ -725,6 +852,16 @@ function createExtensionContext(
         console.error(`[${manifest.name}] ${message}`);
       },
     },
+    collab: {
+      registerContentAdapter: (adapter: CollabContentAdapter) => {
+        const registration = registerCollabContentAdapter(adapter);
+        const disposable: Disposable = {
+          dispose: () => registration.unregister(),
+        };
+        subscriptions.push(disposable);
+        return disposable;
+      },
+    },
   };
 
   // Add AI service if extension has ai permission
@@ -754,6 +891,14 @@ function createExtensionContext(
           },
         };
       },
+      registerVoiceContextProvider: (provider: VoiceContextProvider): Disposable => {
+        // Core hook 2: contributes text to the voice agent's session context at
+        // start. The disposable is tracked in subscriptions so it's removed when
+        // the extension is unloaded/disabled.
+        const disposable = registerVoiceContextProvider(provider, manifest.id);
+        subscriptions.push(disposable);
+        return disposable;
+      },
       sendPrompt: async (options: {
         prompt: string;
         sessionName?: string;
@@ -765,6 +910,31 @@ function createExtensionContext(
           throw new Error('electronAPI not available for sendPrompt');
         }
         return electronAPI.invoke('extensions:ai-send-prompt', options);
+      },
+      getTaskStatus: async (workspacePath?: string) => {
+        const electronAPI = (window as any).electronAPI;
+        if (!electronAPI) {
+          throw new Error('electronAPI not available for getTaskStatus');
+        }
+        return electronAPI.invoke('extensions:ai-get-task-status', { workspacePath });
+      },
+      callBackendTool: async (
+        toolName: string,
+        args?: Record<string, unknown>,
+        workspacePath?: string
+      ) => {
+        const electronAPI = (window as any).electronAPI;
+        if (!electronAPI) {
+          throw new Error('electronAPI not available for callBackendTool');
+        }
+        return electronAPI.invoke('extensions:ai-call-backend-tool', {
+          toolName,
+          args: args ?? {},
+          workspacePath,
+          // Host-injected caller identity (not from extension code) so main can
+          // enforce the tool belongs to THIS extension's backend module.
+          callerExtensionId: manifest.id,
+        });
       },
       listModels: async (): Promise<ExtensionAIModel[]> => {
         const electronAPI = (window as any).electronAPI;
@@ -1511,6 +1681,55 @@ export class ExtensionLoader {
     }
 
     return transformers;
+  }
+
+  /**
+   * Get all `LexicalExtension` contributions from loaded extensions.
+   *
+   * The host treats the value as opaque (`unknown`) at this layer so the
+   * loader does not have to pin a specific version of
+   * `@lexical/extension`. The consumer (e.g. `NimbalystEditor`) feeds the
+   * values directly into `LexicalExtensionComposer`'s dependency graph,
+   * which performs the actual runtime validation.
+   *
+   * Skips disabled extensions and extensions that declare a name in
+   * `contributions.lexicalExtensions` without a matching export on
+   * `module.lexicalExtensions` (a warning is logged instead).
+   */
+  getLexicalExtensions(): Array<{
+    extensionId: string;
+    name: string;
+    extension: unknown;
+  }> {
+    const result: Array<{
+      extensionId: string;
+      name: string;
+      extension: unknown;
+    }> = [];
+
+    for (const loaded of this.loadedExtensions.values()) {
+      if (!loaded.enabled) continue;
+
+      const names = loaded.manifest.contributions?.lexicalExtensions || [];
+      const exports = loaded.module.lexicalExtensions || {};
+
+      for (const name of names) {
+        const extension = exports[name];
+        if (extension) {
+          result.push({
+            extensionId: loaded.manifest.id,
+            name,
+            extension,
+          });
+        } else {
+          console.warn(
+            `[ExtensionLoader] Extension ${loaded.manifest.id} declares lexicalExtension '${name}' but does not export it`,
+          );
+        }
+      }
+    }
+
+    return result;
   }
 
   /**

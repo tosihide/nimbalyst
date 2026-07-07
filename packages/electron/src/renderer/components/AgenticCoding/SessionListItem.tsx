@@ -2,7 +2,7 @@ import React, { useState, useCallback, useEffect, useRef, useMemo, memo } from '
 import { useAtomValue, useSetAtom } from 'jotai';
 import { MaterialSymbol, ProviderIcon } from '@nimbalyst/runtime';
 import { getRelativeTimeString } from '../../utils/dateFormatting';
-import { sessionOrChildProcessingAtom, sessionUnreadAtom, sessionPendingPromptAtom, sessionHasPendingInteractivePromptAtom, reparentSessionAtom, refreshSessionListAtom, sessionShareAtom, sessionWakeupAtom } from '../../store';
+import { sessionOrChildProcessingAtom, sessionUnreadAtom, sessionPendingPromptAtom, sessionHasPendingInteractivePromptAtom, reparentSessionAtom, refreshSessionListAtom, sessionShareAtom, sessionWakeupAtom, sessionLastActivityAtom } from '../../store';
 import { convertToWorkstreamAtom } from '../../store/atoms/sessions';
 import { SessionContextMenu } from './SessionContextMenu';
 
@@ -388,8 +388,16 @@ export const SessionListItem = memo<SessionListItemProps>(({
     ? displayTitle.substring(0, 40) + '...'
     : displayTitle;
 
+  // Per-session live activity. Bumped on every `ai:message-logged`; only
+  // this list item re-renders when its own activity ticks, instead of the
+  // whole SessionHistory + 705 siblings. Fall back to the registry's
+  // `updatedAt` (set at DB refresh / on terminal session events) when no
+  // activity has been recorded since mount.
+  const liveActivity = useAtomValue(sessionLastActivityAtom(id));
+  const effectiveUpdatedAt = liveActivity > 0 ? liveActivity : updatedAt;
+
   // Show timestamp based on current sort order
-  const timestamp = sortBy === 'updated' ? (updatedAt || createdAt) : createdAt;
+  const timestamp = sortBy === 'updated' ? (effectiveUpdatedAt || createdAt) : createdAt;
   const timestampLabel = sortBy === 'updated' ? 'updated' : 'created';
 
   const { relativeTime, fullDateTime } = useMemo(() => ({
@@ -445,7 +453,7 @@ export const SessionListItem = memo<SessionListItemProps>(({
           onClick(e as unknown as React.MouseEvent);
         }
       }}
-      aria-label={`Session: ${truncatedTitle}, ${timestampLabel} ${relativeTime}${isLoaded ? ' (loaded in tab)' : ''}${isArchived ? ' (archived)' : ''}`}
+      aria-label={`Session: ${displayTitle}, ${timestampLabel} ${relativeTime}${isLoaded ? ' (loaded in tab)' : ''}${isArchived ? ' (archived)' : ''}`}
       aria-current={isActive ? 'page' : undefined}
     >
       <div className={`session-list-item-icon shrink-0 mt-0.5 text-[var(--nim-text-muted)] flex items-center relative ${isActive ? '[&]:text-[var(--nim-primary)] [&_svg]:text-[var(--nim-primary)]' : '[&_svg]:text-[var(--nim-text-muted)]'} ${isWorkstream ? 'workstream-icon' : ''} ${isWorktreeSession ? 'worktree-icon' : ''}`}>
@@ -504,7 +512,7 @@ export const SessionListItem = memo<SessionListItemProps>(({
           />
         ) : (
           <>
-            <div className={`session-list-item-title text-[0.8125rem] text-[var(--nim-text)] font-medium overflow-hidden text-ellipsis whitespace-nowrap mb-0.5 transition-colors duration-150 ${isActive ? 'font-semibold' : ''} ${isArchived ? 'text-[var(--nim-text-faint)]' : ''}`}>{truncatedTitle}</div>
+            <div title={displayTitle} className={`session-list-item-title text-[0.8125rem] text-[var(--nim-text)] font-medium overflow-hidden text-ellipsis whitespace-nowrap mb-0.5 transition-colors duration-150 ${isActive ? 'font-semibold' : ''} ${isArchived ? 'text-[var(--nim-text-faint)]' : ''}`}>{truncatedTitle}</div>
             <div className="session-list-item-meta flex gap-1.5 text-[0.6875rem] text-[var(--nim-text-faint)] items-center mt-0.5">
               <span className="session-list-item-datetime text-[0.6875rem] text-[var(--nim-text-faint)] whitespace-nowrap transition-colors duration-150" title={fullDateTime}>{relativeTime}</span>
               {displayModel && <span className="session-list-item-model overflow-hidden text-ellipsis whitespace-nowrap">{displayModel}</span>}

@@ -84,6 +84,28 @@ exports.default = async function(context) {
     }
   }
 
+  // Ensure node-pty's `spawn-helper` is executable in the packaged tree.
+  // node-pty ships via extraResources to resources/node-pty; the macOS/Linux
+  // PTY path execs prebuilds/<platform-arch>/spawn-helper, and the copy into
+  // the app bundle can drop the execute bit -> runtime `posix_spawnp failed`
+  // and the genuine `claude` CLI terminal never starts. chmod it back here.
+  // (Windows uses conpty/winpty and has no spawn-helper.)
+  if (platformName === 'darwin' || platformName === 'linux') {
+    const prebuildsDir = path.join(resourcesDir, 'node-pty/prebuilds');
+    let fixedCount = 0;
+    if (fs.existsSync(prebuildsDir)) {
+      for (const entry of fs.readdirSync(prebuildsDir, { withFileTypes: true })) {
+        if (!entry.isDirectory()) continue;
+        const helper = path.join(prebuildsDir, entry.name, 'spawn-helper');
+        if (fs.existsSync(helper)) {
+          fs.chmodSync(helper, 0o755);
+          fixedCount++;
+        }
+      }
+    }
+    console.log(`AfterPack: ensured execute bit on ${fixedCount} node-pty spawn-helper binary(ies)`);
+  }
+
   // Validate the packaged tree by exercising real ESM `import()` against
   // app.asar.unpacked/node_modules and verifying every native binary is
   // present + executable. Fails the build on any miss -- this is the gate
@@ -111,8 +133,65 @@ exports.default = async function(context) {
     );
   }
 
+  // Validate that the built-in extensions actually landed in the packaged
+  // tree. electron-builder's extraResources copy of packages/extensions is
+  // filter-driven and can silently produce NOTHING (e.g. the minimatch 10.2.3
+  // regression where `**/`-prefixed globs stopped partial-matching top-level
+  // dirs, so every extension dir was pruned). That shipped ~2.5 months of
+  // releases with zero bundled extensions. Assert the output here so it fails
+  // the build instead of silently shipping.
+  validateBundledExtensions(resourcesDir);
+
   console.log('AfterPack: Complete');
 };
+
+// Assert every buildable source extension made it into resources/extensions
+// with its manifest.json (and dist/ when the source has one). Throws on any
+// miss. Derives the expected set from packages/extensions so it auto-adapts
+// as extensions are added/removed -- no hardcoded id list to drift.
+exports.validateBundledExtensions = validateBundledExtensions;
+function validateBundledExtensions(resourcesDir) {
+  const sourceExtDir = path.join(__dirname, '..', '..', 'extensions');
+  const packagedExtDir = path.join(resourcesDir, 'extensions');
+
+  if (!fs.existsSync(sourceExtDir)) {
+    console.log('AfterPack: no packages/extensions source dir found, skipping bundled-extensions check');
+    return;
+  }
+
+  const expected = fs.readdirSync(sourceExtDir, { withFileTypes: true })
+    .filter((e) => e.isDirectory() && fs.existsSync(path.join(sourceExtDir, e.name, 'manifest.json')))
+    .map((e) => e.name);
+
+  if (expected.length === 0) {
+    console.log('AfterPack: no source extensions with a manifest.json, skipping bundled-extensions check');
+    return;
+  }
+
+  const missing = [];
+  for (const name of expected) {
+    const manifestOk = fs.existsSync(path.join(packagedExtDir, name, 'manifest.json'));
+    const sourceHasDist = fs.existsSync(path.join(sourceExtDir, name, 'dist'));
+    const distOk = !sourceHasDist || fs.existsSync(path.join(packagedExtDir, name, 'dist'));
+    if (!manifestOk || !distOk) {
+      missing.push(`${name}${!manifestOk ? ' (manifest.json)' : ''}${manifestOk && !distOk ? ' (dist/)' : ''}`);
+    }
+  }
+
+  if (missing.length > 0) {
+    throw new Error(
+      `AfterPack: ${missing.length} of ${expected.length} built-in extensions are missing from the packaged app ` +
+      `at ${packagedExtDir}. The build cannot continue -- shipping it would produce a release with broken/absent ` +
+      `extensions (e.g. Project Memory).\n` +
+      `Missing: ${missing.join(', ')}\n` +
+      `Likely cause: the extraResources copy of packages/extensions produced nothing or a partial set ` +
+      `(historically a minimatch version regression breaking '**/' glob partial-matching -- keep app-builder-lib's ` +
+      `minimatch pinned >= 10.2.5).`
+    );
+  }
+
+  console.log(`AfterPack: verified ${expected.length} built-in extensions bundled into ${path.basename(resourcesDir)}/extensions`);
+}
 
 function getDirSize(dirPath) {
   let size = 0;

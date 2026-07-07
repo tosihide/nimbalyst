@@ -219,9 +219,6 @@ export function useEditorLifecycle<T = string>(
   // Echo detection: stores the last serialized string we saved
   const lastSavedContentRef = useRef<string>('');
 
-  // Prevent double-loading
-  const loadedRef = useRef(false);
-
   // Track dirty state in a ref too (for use in callbacks without stale closure)
   const isDirtyRef = useRef(false);
 
@@ -265,11 +262,16 @@ export function useEditorLifecycle<T = string>(
   }, [host]);
 
   // ---- Initial load ----
-
+  // Note: do NOT use a ref-based "already loaded" guard here. React 18
+  // StrictMode in dev runs effects setup -> cleanup -> setup. A persistent
+  // ref makes the second setup early-return, while the first run's `mounted`
+  // closure has already been flipped to false by cleanup, so
+  // `setIsLoading(false)` is never called and the editor is stuck on the
+  // initial Loading state forever. The dep array (`[host, parseContent]`)
+  // already prevents re-loads when nothing has changed; the strict-mode
+  // double load is idempotent (same IPC + applyContent) and only happens in
+  // dev.
   useEffect(() => {
-    if (loadedRef.current) return;
-    loadedRef.current = true;
-
     let mounted = true;
 
     const doLoad = async () => {

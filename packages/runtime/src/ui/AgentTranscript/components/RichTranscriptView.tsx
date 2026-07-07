@@ -6,7 +6,7 @@ import { MessageSegment } from './MessageSegment';
 import { MarkdownRenderer } from './MarkdownRenderer';
 import { ProviderIcon } from '../../icons/ProviderIcons';
 import { MaterialSymbol } from '../../icons/MaterialSymbol';
-import { formatMessageTime, formatDuration } from '../../../utils/dateUtils';
+import { formatMessageTime, formatDuration, formatTurnFinishedAt } from '../../../utils/dateUtils';
 import { copyToClipboard } from '../../../utils/clipboard';
 import { JSONViewer } from './JSONViewer';
 import { formatToolArguments, extractFilePathFromArgs } from '../utils/pathResolver';
@@ -15,12 +15,25 @@ import { TranscriptSearchBar } from './TranscriptSearchBar';
 import { formatToolDisplayName } from '../utils/toolNameFormatter';
 import { isToolLikeMessage } from '../utils/messageTypeHelpers';
 import { getCustomToolWidget, ToolWidgetErrorBoundary, type ToolCallDiffResult } from './CustomToolWidgets';
+import { useTranscriptToolWidgetRegistryVersion } from '../contributions';
 import { ToolCallChanges } from './ToolCallChanges';
 import { setSessionIsAtBottom, getSessionIsAtBottom } from '../../../store/atoms/transcriptScroll';
+import { isAppleMobileWebKit } from '../../../utils/platform';
 
 // Per-session VList cache - survives component remounts so returning to a session
 // doesn't re-measure all items from scratch
 const vlistCacheMap = new Map<string, CacheSnapshot>();
+
+function summarizeRenderTeammates(
+  teammates: Array<{ agentId: string; status: 'running' | 'completed' | 'errored' | 'idle' }> | undefined
+): string {
+  if (!teammates || teammates.length === 0) return 'none';
+  return teammates.map(tm => `${tm.agentId}:${tm.status}`).join(', ');
+}
+
+function emitRichTranscriptRenderTrace(event: string, payload: Record<string, unknown>): void {
+  // console.info(`[RenderTrace][RichTranscriptView] ${event} ${JSON.stringify(payload)}`);
+}
 
 // Inject RichTranscriptView styles once (for animations, scrollbar, and complex selectors)
 const injectRichTranscriptStyles = () => {
@@ -181,11 +194,11 @@ const injectRichTranscriptStyles = () => {
     }
 
     /* Scroll-ready fade-in transition to prevent flash when switching sessions */
-    .rich-transcript-vlist-wrapper {
+    .rich-transcript-messages-wrapper {
       opacity: 0;
       transition: opacity 0.15s ease-out;
     }
-    .rich-transcript-vlist-wrapper.scroll-ready {
+    .rich-transcript-messages-wrapper.scroll-ready {
       opacity: 1;
     }
   `;
@@ -350,6 +363,52 @@ const PromptAdditionsInline: React.FC<{
 
 const REMINDER_KIND_LABELS: Record<string, string> = {
   session_naming: 'Session metadata reminder',
+  wakeup_resume: 'Resumed from scheduled wakeup',
+};
+
+// Keyed by the known PermissionDeniedReasonType values from the SDK. Typed
+// here as a partial record so an unknown value (forward-compatible SDK
+// addition) falls back to the raw string or "SDK" in the renderer.
+const REASON_TYPE_LABELS: Partial<Record<string, string>> = {
+  classifier: 'Auto-mode classifier',
+  mode: 'Permission mode',
+  rule: 'Permission rule',
+  asyncAgent: 'Async agent',
+};
+
+const PermissionDeniedCard: React.FC<{
+  message: TranscriptViewMessage;
+}> = ({ message }) => {
+  const payload = message.systemMessage;
+  const toolName = payload?.deniedToolName ?? 'unknown tool';
+  const reason = payload?.deniedReason;
+  const reasonType = payload?.deniedReasonType;
+  const reasonLabel = (reasonType && REASON_TYPE_LABELS[reasonType]) ?? reasonType ?? 'SDK';
+
+  return (
+    <div
+      data-testid="permission-denied-card"
+      className="permission-denied-card ml-6 mb-2 rounded-md border border-[var(--nim-error)] bg-[var(--nim-error-bg,rgba(239,68,68,0.08))] px-3 py-2"
+    >
+      <div className="flex items-center gap-2 text-xs text-[var(--nim-error)]">
+        <MaterialSymbol icon="block" size={14} />
+        <span className="font-semibold uppercase tracking-[0.08em]">Tool denied</span>
+        <span className="text-[var(--nim-text-muted)]">·</span>
+        <code className="text-[11px] font-mono text-[var(--nim-text)]">{toolName}</code>
+        <span className="ml-auto text-[10px] text-[var(--nim-text-faint)]">
+          {formatMessageTime(message.createdAt?.getTime() ?? 0)}
+        </span>
+      </div>
+      {reason && (
+        <p className="m-0 mt-1.5 text-[0.875rem] leading-relaxed text-[var(--nim-text-muted)] whitespace-normal break-words">
+          {reason}
+        </p>
+      )}
+      <p className="m-0 mt-1 text-[10px] uppercase tracking-wide text-[var(--nim-text-faint)]">
+        Source: {reasonLabel}
+      </p>
+    </div>
+  );
 };
 
 const SystemReminderCard: React.FC<{
@@ -418,6 +477,11 @@ interface RichTranscriptViewProps {
   workspacePath?: string;
   /** Optional: render additional content in the empty state (e.g., command suggestions) */
   renderEmptyExtra?: () => React.ReactNode;
+  /**
+   * If true, suppress the default "ready to assist with" help block in the
+   * empty state -- the host's `renderEmptyExtra` becomes the primary content.
+   */
+  hideEmptyHelp?: boolean;
   /** Optional: Read a file from the filesystem (for custom widgets that need to load persisted files) */
   readFile?: (filePath: string) => Promise<{ success: boolean; content?: string; error?: string }>;
   /** Optional: Open a file in the editor */
@@ -440,11 +504,30 @@ interface RichTranscriptViewProps {
   waitingForNoun?: string;
   /** Optional: App start time (epoch ms) for rendering restart indicator line (dev mode only) */
   appStartTime?: number;
-  /** Optional: Fetch file diffs caused by a specific tool call */
-  getToolCallDiffs?: (
-    toolCallItemId: string,
-    toolCallTimestamp?: number
-  ) => Promise<ToolCallDiffResult[] | null>;
+  /** Optional: Render a file using a host-provided embedded editor surface */
+  renderEmbeddedFile?: (params: { filePath: string; defaultExpanded?: boolean }) => React.ReactNode;
+  /**
+   * Optional: Predicate the host uses to declare whether a given file
+   * will be rendered by `renderEmbeddedFile`. Lets the runtime suppress
+   * the redundant diff/new-file view when an embedded preview will take
+   * over. The host owns the custom editor registry; this is how the
+   * runtime asks without crossing the package boundary.
+   */
+  canEmbedFile?: (filePath: string) => boolean;
+  /**
+   * Optional: callback fired when the transcript find-in-page search bar
+   * shows or hides. The parent uses this to shift `FloatingTranscriptActions`
+   * (which sits absolutely-positioned at top-right of the same container)
+   * down so the phase pill no longer overlaps the search bar's chevron / list
+   * / close buttons on narrow widths. See #309.
+   */
+  onSearchBarVisibilityChange?: (visible: boolean) => void;
+  /**
+   * Optional: persist at-bottom state in the global per-session atom.
+   * Disable for secondary transcript mounts like hover previews so they
+   * don't stomp the main transcript's scroll-follow state.
+   */
+  persistScrollState?: boolean;
   // Note: Interactive widgets read their host from interactiveWidgetHostAtom(sessionId)
 }
 
@@ -460,10 +543,29 @@ const defaultSettings: TranscriptSettings = {
 // 'applypatch'/'apply_patch' covers Codex ACP's apply_patch tool, which
 // emits its diff via a `changes: { [path]: { type, unified_diff } }` shape
 // (parsed in extractEditsFromToolMessage).
+// OpenAI Codex SDK's `file_change` tool is NOT in this set -- the raw
+// item.completed payload has no diff content, so its dispatch goes through
+// the main-process transcript enrichment path, which resolves fileDiffs before
+// the renderer sees the transcript row.
 const EDIT_TOOL_NAMES = new Set([
   'edit', 'write', 'multi-edit', 'multiedit', 'multi_edit',
   'applypatch', 'apply_patch',
 ]);
+
+const TRANSCRIPT_BOTTOM_THRESHOLD_PX = 50;
+const DESKTOP_TRANSCRIPT_BUFFER_PX = 10000;
+const MOBILE_TRANSCRIPT_BUFFER_PX = 800;
+
+export function isTranscriptAtBottom(distanceFromBottom: number): boolean {
+  return distanceFromBottom < TRANSCRIPT_BOTTOM_THRESHOLD_PX;
+}
+
+export function shouldAutoScrollTranscript(
+  wasAtBottom: boolean,
+  distanceFromBottom: number
+): boolean {
+  return wasAtBottom || isTranscriptAtBottom(distanceFromBottom);
+}
 
 const isEditToolName = (name?: string): boolean => {
   if (!name) return false;
@@ -475,6 +577,43 @@ const isEditToolName = (name?: string): boolean => {
 };
 
 const WRITE_TOOL_NAMES = new Set(['write', 'notebookedit']);
+
+/**
+ * Interactive tool widgets that require the user to act. These render even when
+ * `settings.showToolCalls` is false, so the user can still respond to prompts
+ * (permission grants, plan-mode exits, question answers, structured input
+ * prompts, commit proposals).
+ */
+const INTERACTIVE_WIDGET_TOOLS = new Set([
+  'ToolPermission',
+  'ExitPlanMode',
+  'AskUserQuestion',
+  'PromptForUserInput',
+  'RequestUserInput',
+  'GitCommitProposal',
+  'git_commit_proposal',
+  'developer_git_commit_proposal',
+  'developer.git_commit_proposal',
+]);
+
+/**
+ * MCP tools arrive as `mcp__<server>__<toolName>` (server name may contain
+ * dashes or underscores). When the tool was registered with a bare name like
+ * `AskUserQuestion` on the in-app MCP server, the SDK forwards it as
+ * `mcp__nimbalyst-mcp__AskUserQuestion`. Strict equality against the bare set
+ * misses, so the suppression / grouping logic below uses the un-prefixed name.
+ *
+ * Exported for tests; mirrored on the renderer in `sessions.ts`.
+ */
+export function stripMcpPrefix(toolName: string): string {
+  const match = toolName.match(/^mcp__[^_]+(?:_[^_]+)*__(.+)$/);
+  return match ? match[1] : toolName;
+}
+
+export function isInteractiveWidgetTool(toolName: string | null | undefined): boolean {
+  if (!toolName) return false;
+  return INTERACTIVE_WIDGET_TOOLS.has(stripMcpPrefix(toolName));
+}
 
 const isFileModifyingTool = (name?: string): boolean => {
   if (!name) return false;
@@ -559,6 +698,35 @@ const safeParseJson = (value: string): any | null => {
 const looksLikeJson = (value: string) => {
   const trimmed = value.trim();
   return (trimmed.startsWith('{') && trimmed.endsWith('}')) || (trimmed.startsWith('[') && trimmed.endsWith(']'));
+};
+
+const getTranscriptMessageKey = (
+  sessionId: string,
+  message: TranscriptViewMessage,
+  index: number
+): string => {
+  const stableId =
+    Number.isFinite(message.id) ? `id-${message.id}` :
+    Number.isFinite(message.sequence) ? `seq-${message.sequence}` :
+    `idx-${index}`;
+  return `${sessionId}-${stableId}`;
+};
+
+const getTranscriptToolKey = (
+  toolMsg: TranscriptViewMessage,
+  fallbackIndex: number,
+  depth: number
+): string => {
+  const stableId =
+    toolMsg.toolCall?.providerToolCallId ||
+    toolMsg.subagentId ||
+    (Number.isFinite(toolMsg.id) ? `id-${toolMsg.id}` : null) ||
+    (Number.isFinite(toolMsg.sequence) ? `seq-${toolMsg.sequence}` : null) ||
+    `idx-${fallbackIndex}`;
+  // Append fallbackIndex as a tiebreaker. Some providers report the same
+  // providerToolCallId for both a parent tool and a derived/echo row at the
+  // same depth, which would collide if we keyed by stableId alone.
+  return `tool-${depth}-${stableId}-i${fallbackIndex}`;
 };
 
 const stableSerialize = (value: unknown): string => {
@@ -684,6 +852,76 @@ const extractApplyPatchChanges = (changes: unknown): any[] => {
         replacements,
       });
     }
+  }
+  return out;
+};
+
+/**
+ * Map resolved `ToolCallDiffResult[]` into the edit-record shape
+ * EditToolResultCard expects. Used by transcript rows that are enriched in
+ * main before the renderer sees them (for example Codex `file_change`).
+ */
+export const toolCallDiffsToEdits = (diffs: any[]): any[] => {
+  const out: any[] = [];
+  for (const diff of diffs) {
+    if (!diff || typeof diff !== 'object') continue;
+    const filePath = typeof diff.filePath === 'string' ? diff.filePath : undefined;
+    if (!filePath) continue;
+    const operation = typeof diff.operation === 'string' ? diff.operation : 'edit';
+
+    if (operation === 'create') {
+      // Prefer the explicit `content` field when the matcher provided it
+      // (Write/Edit tools include the file body directly). For Codex
+      // `file_change` with kind='add', the matcher returns
+      // `diffs: [{ oldString: '', newString: <full body> }]` from its
+      // history-snapshot fallback because the SDK's FileChangeItem.changes
+      // doesn't carry content -- pull the body off newString in that case
+      // so NewFilePreview renders with the actual file contents instead
+      // of an empty preview.
+      let content = typeof diff.content === 'string' ? diff.content : '';
+      if (!content && Array.isArray(diff.diffs) && diff.diffs.length > 0) {
+        content = diff.diffs
+          .map((d: any) => (typeof d?.newString === 'string' ? d.newString : ''))
+          .join('');
+      }
+      out.push({
+        filePath,
+        type: 'add',
+        operation: 'create',
+        content,
+      });
+      continue;
+    }
+
+    const replacements = Array.isArray(diff.diffs)
+      ? diff.diffs
+          .filter((d: any) => d && typeof d === 'object')
+          .map((d: any) => ({
+            oldText: typeof d.oldString === 'string' ? d.oldString : '',
+            newText: typeof d.newString === 'string' ? d.newString : '',
+          }))
+      : [];
+
+    if (operation === 'delete') {
+      // ToolCallMatcher returns the file's last-known content as a single
+      // diff entry for delete. Render it as red-only by clearing newText.
+      const first = replacements[0] ?? { oldText: '', newText: '' };
+      out.push({
+        filePath,
+        type: 'delete',
+        operation: 'delete',
+        old_string: first.oldText,
+        new_string: '',
+      });
+      continue;
+    }
+
+    out.push({
+      filePath,
+      type: 'update',
+      operation: 'edit',
+      replacements: replacements.length > 0 ? replacements : undefined,
+    });
   }
   return out;
 };
@@ -855,12 +1093,26 @@ export const extractEditsFromToolMessage = (message: TranscriptViewMessage): any
 export const RichTranscriptView = React.forwardRef<
   { scrollToMessage: (index: number) => void; scrollToTop: () => void },
   RichTranscriptViewProps
->(({ sessionId, sessionStatus, isProcessing, hasPendingInteractivePrompt, messages, provider, settings: propsSettings, onSettingsChange, showSettings, documentContext, workspacePath, renderEmptyExtra, readFile, onOpenFile, onOpenSession, onCompact, promptAdditions, currentTeammates, waitingForNoun, appStartTime, getToolCallDiffs }, ref) => {
+>(({ sessionId, sessionStatus, isProcessing, hasPendingInteractivePrompt, messages, provider, settings: propsSettings, onSettingsChange, showSettings, documentContext, workspacePath, renderEmptyExtra, hideEmptyHelp, readFile, onOpenFile, onOpenSession, onCompact, promptAdditions, currentTeammates, waitingForNoun, appStartTime, renderEmbeddedFile, canEmbedFile, onSearchBarVisibilityChange, persistScrollState = true }, ref) => {
   const [collapsedMessages, setCollapsedMessages] = useState<Set<number>>(new Set());
   const [expandedTools, setExpandedTools] = useState<Set<string>>(new Set());
   const scrollButtonRef = useRef<HTMLDivElement>(null);
   const [copiedMessageIndex, setCopiedMessageIndex] = useState<number | null>(null);
   const [showSearchBar, setShowSearchBar] = useState(false);
+
+  // Subscribe to the transcript tool-widget registry so extension
+  // enable/disable cycles cause this view to re-render and pick up
+  // newly contributed widgets without a session reload.
+  useTranscriptToolWidgetRegistryVersion();
+
+  // Notify the parent when the find-in-page search bar visibility changes
+  // so it can shift `FloatingTranscriptActions` (sibling, absolutely positioned
+  // at top-right of the same container) down and avoid the pill-over-buttons
+  // overlap reported in #309.
+  useEffect(() => {
+    onSearchBarVisibilityChange?.(showSearchBar);
+  }, [showSearchBar, onSearchBarVisibilityChange]);
+
   const pendingPermissionsVisibleRef = useRef(true);
   const [showPermissionBanner, setShowPermissionBanner] = useState(false);
   const [isScrollReady, setIsScrollReady] = useState(false);
@@ -869,8 +1121,44 @@ export const RichTranscriptView = React.forwardRef<
   const viewRootRef = useRef<HTMLDivElement>(null);
   const vlistRef = useRef<VListHandle>(null);
   const messageRefs = useRef<Map<number, HTMLDivElement>>(new Map());
+  const isAtBottomRef = useRef(
+    persistScrollState ? getSessionIsAtBottom(sessionId) : true
+  );
+
+  // Desktop gets a wider buffer to reduce row churn near selection;
+  // iOS WKWebView uses a smaller buffer for memory pressure.
+  const isMobileWebKit = useMemo(() => isAppleMobileWebKit(), []);
+  const vlistBufferSize = isMobileWebKit ? MOBILE_TRANSCRIPT_BUFFER_PX : DESKTOP_TRANSCRIPT_BUFFER_PX;
 
   const settings = propsSettings || defaultSettings;
+  const previousRenderRef = useRef<{
+    messagesRef: TranscriptViewMessage[];
+    messageCount: number;
+    sessionStatus: string | undefined;
+    isProcessing: boolean | undefined;
+    hasPendingInteractivePrompt: boolean | undefined;
+    currentTeammatesRef: unknown;
+    currentTeammatesSummary: string;
+    isContainerVisible: boolean;
+    isScrollReady: boolean;
+    showPermissionBanner: boolean;
+    showSearchBar: boolean;
+  } | null>(null);
+
+  useEffect(() => {
+    isAtBottomRef.current = persistScrollState ? getSessionIsAtBottom(sessionId) : true;
+  }, [persistScrollState, sessionId]);
+
+  const setAtBottomState = useCallback((isAtBottom: boolean) => {
+    isAtBottomRef.current = isAtBottom;
+    if (persistScrollState) {
+      setSessionIsAtBottom(sessionId, isAtBottom);
+    }
+  }, [persistScrollState, sessionId]);
+
+  const getAtBottomState = useCallback(() => {
+    return isAtBottomRef.current;
+  }, []);
 
   // Save VList cache when switching sessions or unmounting.
   // This lets returning to a session skip expensive re-measurement of all item sizes.
@@ -898,6 +1186,64 @@ export const RichTranscriptView = React.forwardRef<
     return () => io.disconnect();
   }, []);
 
+  useEffect(() => {
+    if (!import.meta.env.DEV) return;
+
+    const nextState = {
+      messagesRef: messages,
+      messageCount: messages.length,
+      sessionStatus,
+      isProcessing,
+      hasPendingInteractivePrompt,
+      currentTeammatesRef: currentTeammates,
+      currentTeammatesSummary: summarizeRenderTeammates(currentTeammates),
+      isContainerVisible,
+      isScrollReady,
+      showPermissionBanner,
+      showSearchBar,
+    };
+    const previous = previousRenderRef.current;
+    if (!previous) {
+      emitRichTranscriptRenderTrace('initial', {
+        sessionId,
+        messageCount: nextState.messageCount,
+        sessionStatus,
+        isProcessing,
+        hasPendingInteractivePrompt,
+        currentTeammates: nextState.currentTeammatesSummary,
+        isContainerVisible,
+        isScrollReady,
+        showPermissionBanner,
+        showSearchBar,
+      });
+    } else {
+      const reasons: string[] = [];
+      if (previous.messagesRef !== nextState.messagesRef) reasons.push(`messages-ref ${previous.messageCount}->${nextState.messageCount}`);
+      if (previous.sessionStatus !== nextState.sessionStatus) reasons.push(`sessionStatus ${String(previous.sessionStatus)}->${String(nextState.sessionStatus)}`);
+      if (previous.isProcessing !== nextState.isProcessing) reasons.push(`isProcessing ${String(previous.isProcessing)}->${String(nextState.isProcessing)}`);
+      if (previous.hasPendingInteractivePrompt !== nextState.hasPendingInteractivePrompt) reasons.push(`pendingPrompt ${String(previous.hasPendingInteractivePrompt)}->${String(nextState.hasPendingInteractivePrompt)}`);
+      if (previous.currentTeammatesRef !== nextState.currentTeammatesRef) reasons.push(`currentTeammates ${previous.currentTeammatesSummary}->${nextState.currentTeammatesSummary}`);
+      if (previous.isContainerVisible !== nextState.isContainerVisible) reasons.push(`isContainerVisible ${String(previous.isContainerVisible)}->${String(nextState.isContainerVisible)}`);
+      if (previous.isScrollReady !== nextState.isScrollReady) reasons.push(`isScrollReady ${String(previous.isScrollReady)}->${String(nextState.isScrollReady)}`);
+      if (previous.showPermissionBanner !== nextState.showPermissionBanner) reasons.push(`showPermissionBanner ${String(previous.showPermissionBanner)}->${String(nextState.showPermissionBanner)}`);
+      if (previous.showSearchBar !== nextState.showSearchBar) reasons.push(`showSearchBar ${String(previous.showSearchBar)}->${String(nextState.showSearchBar)}`);
+      emitRichTranscriptRenderTrace('render', {
+        sessionId,
+        reasons,
+        messageCount: nextState.messageCount,
+        sessionStatus,
+        isProcessing,
+        hasPendingInteractivePrompt,
+        currentTeammates: nextState.currentTeammatesSummary,
+        isContainerVisible,
+        isScrollReady,
+        showPermissionBanner,
+        showSearchBar,
+      });
+    }
+    previousRenderRef.current = nextState;
+  });
+
   const runningTeammates = useMemo(
     () => currentTeammates?.filter(t => t.status === 'running') ?? [],
     [currentTeammates]
@@ -908,8 +1254,15 @@ export const RichTranscriptView = React.forwardRef<
     // Session is waiting for the USER to answer — not thinking, don't show the indicator.
     // Check the prop (live IPC state) AND scan messages directly (survives session reloads).
     if (hasPendingInteractivePrompt) return false;
+    // Match BOTH the bare tool name and the MCP-prefixed form
+    // (`mcp__nimbalyst-mcp__AskUserQuestion`); strict equality on just the
+    // bare name left the "Thinking…" indicator rendered on top of the
+    // already-rendered AskUserQuestion widget.
     const hasPendingQuestion = messages.some(
-      msg => isToolLikeMessage(msg) && msg.toolCall?.toolName === 'AskUserQuestion' && !msg.toolCall.result
+      msg => isToolLikeMessage(msg)
+        && !!msg.toolCall
+        && stripMcpPrefix(msg.toolCall.toolName ?? '') === 'AskUserQuestion'
+        && !msg.toolCall.result
     );
     if (hasPendingQuestion) return false;
     // Check isProcessing prop first (most reliable for queued prompts from mobile)
@@ -934,7 +1287,6 @@ export const RichTranscriptView = React.forwardRef<
     }
     return 'Thinking...';
   }, [isProcessing, isWaitingForResponse, runningTeammates, sessionStatus, waitingForNoun]);
-
 
   // Compute effective target index for prompt additions display
   // Use the stored messageIndex if valid, otherwise find the last user message
@@ -1042,17 +1394,17 @@ export const RichTranscriptView = React.forwardRef<
       requestAnimationFrame(() => {
         requestAnimationFrame(() => {
           requestAnimationFrame(() => {
-            if (vlistRef.current && pendingPermissionIndices.length > 0) {
-              const offset = vlistRef.current.scrollOffset;
-              const viewportSize = vlistRef.current.viewportSize;
-              const firstVisibleIdx = vlistRef.current.findItemIndex(offset);
-              const lastVisibleIdx = vlistRef.current.findItemIndex(offset + viewportSize);
-              const anyVisible = pendingPermissionIndices.some(
-                idx => idx >= firstVisibleIdx && idx <= lastVisibleIdx
-              );
-              pendingPermissionsVisibleRef.current = anyVisible;
-              setShowPermissionBanner(!anyVisible);
-            }
+            if (pendingPermissionIndices.length === 0) return;
+            if (!vlistRef.current) return;
+            const offset = vlistRef.current.scrollOffset;
+            const viewportSize = vlistRef.current.viewportSize;
+            const firstVisibleIdx = vlistRef.current.findItemIndex(offset);
+            const lastVisibleIdx = vlistRef.current.findItemIndex(offset + viewportSize);
+            const anyVisible = pendingPermissionIndices.some(
+              idx => idx >= firstVisibleIdx && idx <= lastVisibleIdx
+            );
+            pendingPermissionsVisibleRef.current = anyVisible;
+            setShowPermissionBanner(!anyVisible);
           });
         });
       });
@@ -1062,24 +1414,21 @@ export const RichTranscriptView = React.forwardRef<
   // Expose scroll method via ref
   React.useImperativeHandle(ref, () => ({
     scrollToMessage: (index: number) => {
-      if (vlistRef.current) {
-        vlistRef.current.scrollToIndex(index, { align: 'center' });
-        // Add highlight after scroll
-        setTimeout(() => {
-          const messageDiv = messageRefs.current.get(index);
-          if (messageDiv) {
-            messageDiv.classList.add('highlight-message');
-            setTimeout(() => {
-              messageDiv.classList.remove('highlight-message');
-            }, 2000);
-          }
-        }, 100);
-      }
+      if (!vlistRef.current) return;
+      vlistRef.current.scrollToIndex(index, { align: 'center' });
+      // Highlight after scroll settles
+      setTimeout(() => {
+        const messageDiv = messageRefs.current.get(index);
+        if (messageDiv) {
+          messageDiv.classList.add('highlight-message');
+          setTimeout(() => {
+            messageDiv.classList.remove('highlight-message');
+          }, 2000);
+        }
+      }, 100);
     },
     scrollToTop: () => {
-      if (vlistRef.current) {
-        vlistRef.current.scrollToIndex(0, { align: 'start' });
-      }
+      vlistRef.current?.scrollToIndex(0, { align: 'start' });
     }
   }), []);
 
@@ -1101,10 +1450,7 @@ export const RichTranscriptView = React.forwardRef<
     // Single RAF: wrapper is opacity:0 until scroll-ready, so intermediate state is invisible.
     // With itemSize hint + cache, VList can estimate scroll position accurately on first try.
     requestAnimationFrame(() => {
-      if (vlistRef.current) {
-        vlistRef.current.scrollToIndex(messages.length - 1, { align: 'end' });
-      }
-      // Let VList settle, then reveal
+      vlistRef.current?.scrollToIndex(messages.length - 1, { align: 'end' });
       requestAnimationFrame(() => {
         setIsScrollReady(true);
       });
@@ -1113,31 +1459,23 @@ export const RichTranscriptView = React.forwardRef<
 
   // Auto-scroll to bottom when messages change (if user was at bottom)
   useEffect(() => {
-    // Read scroll state from atom - this is stable across renders
-    const wasAtBottom = getSessionIsAtBottom(sessionId);
+    const wasAtBottom = getAtBottomState();
 
     requestAnimationFrame(() => {
-      if (vlistRef.current) {
-        const scrollSize = vlistRef.current.scrollSize;
-        const viewportSize = vlistRef.current.viewportSize;
-        const scrollOffset = vlistRef.current.scrollOffset;
-        const distanceFromBottom = scrollSize - scrollOffset - viewportSize;
-        const isCurrentlyAtBottom = distanceFromBottom < 100;
+      if (!vlistRef.current) return;
+      const scrollSize = vlistRef.current.scrollSize;
+      const viewportSize = vlistRef.current.viewportSize;
+      const scrollOffset = vlistRef.current.scrollOffset;
+      const distanceFromBottom = scrollSize - scrollOffset - viewportSize;
 
-        // Auto-scroll if user was at bottom (from atom state) or is currently at bottom
-        const shouldAutoScroll = wasAtBottom || isCurrentlyAtBottom;
-
-        if (shouldAutoScroll) {
-          // Account for the "Thinking..." indicator which is an extra item after messages
-          const lastIndex = isWaitingForResponse ? messages.length : messages.length - 1;
-          vlistRef.current.scrollToIndex(lastIndex, { align: 'end' });
-          // Update atom to reflect we're now at bottom
-          setSessionIsAtBottom(sessionId, true);
-        }
+      if (shouldAutoScrollTranscript(wasAtBottom, distanceFromBottom)) {
+        // Account for the "Thinking..." indicator which is an extra item after messages
+        const lastIndex = isWaitingForResponse ? messages.length : messages.length - 1;
+        vlistRef.current.scrollToIndex(lastIndex, { align: 'end' });
+        setAtBottomState(true);
       }
     });
-  }, [messages, isWaitingForResponse, sessionId]);
-
+  }, [getAtBottomState, messages, isWaitingForResponse, setAtBottomState]);
 
   // Listen for routed search events from AgentWorkstreamPanel
   // Only respond if this session is the active one
@@ -1175,11 +1513,10 @@ export const RichTranscriptView = React.forwardRef<
   }, [sessionId, showSearchBar]);
 
   const scrollToBottom = useCallback(() => {
-    if (vlistRef.current) {
-      // Account for the "Thinking..." indicator which is an extra item after messages
-      const lastIndex = isWaitingForResponse ? messages.length : messages.length - 1;
-      vlistRef.current.scrollToIndex(lastIndex, { align: 'end' });
-    }
+    if (!vlistRef.current) return;
+    // Account for the "Thinking..." indicator which is an extra item after messages
+    const lastIndex = isWaitingForResponse ? messages.length : messages.length - 1;
+    vlistRef.current.scrollToIndex(lastIndex, { align: 'end' });
   }, [messages.length, isWaitingForResponse]);
 
   const toggleMessageCollapse = (index: number) => {
@@ -1243,6 +1580,12 @@ export const RichTranscriptView = React.forwardRef<
       return true;
     }
 
+    // Codex app-server pre-flight auth required -- treat the same so the
+    // last-message-only widget gating in shouldShowLoginWidgetForIndex applies.
+    if (message.isCodexAuthRequired === true) {
+      return true;
+    }
+
     // Fallback to string matching for backwards compatibility
     // IMPORTANT: Only match specific authentication error patterns, NOT generic words
     const content = message.text || '';
@@ -1286,6 +1629,8 @@ export const RichTranscriptView = React.forwardRef<
         return 'Claude';
       case 'claude-code':
         return 'Claude Agent';
+      case 'claude-code-cli':
+        return 'Claude Code CLI';
       case 'openai':
       case 'openai-codex':
         return 'OpenAI';
@@ -1333,16 +1678,18 @@ export const RichTranscriptView = React.forwardRef<
 
     const tool = toolMsg.toolCall;
     const toolId = tool.providerToolCallId || tool.toolName || `tool-${toolIndex}`;
+    const toolRenderKey = getTranscriptToolKey(toolMsg, toolIndex, depth);
     const isExpanded = expandedTools.has(toolId);
     const isSubAgent = toolMsg.type === 'subagent';
     const isTeammate = isSubAgent && !!(toolMsg.subagent?.teammateName || toolMsg.subagent?.teamName);
     const hasChildren = isSubAgent && toolMsg.subagent?.childEvents && toolMsg.subagent.childEvents.length > 0;
+
     // Check for custom widget first
     const CustomWidget = tool.toolName ? getCustomToolWidget(tool.toolName) : undefined;
     if (CustomWidget) {
       return (
         <div
-          key={`tool-${toolIndex}-${depth}`}
+          key={toolRenderKey}
           className={`rich-transcript-tool-container mb-2 ${depth > 0 ? 'nested ml-0' : ''}`}
           style={{ marginLeft: depth > 0 ? '1rem' : '0' }}
         >
@@ -1354,9 +1701,30 @@ export const RichTranscriptView = React.forwardRef<
               workspacePath={workspacePath}
               sessionId={sessionId}
               readFile={readFile}
-              getToolCallDiffs={getToolCallDiffs}
             />
           </ToolWidgetErrorBoundary>
+        </div>
+      );
+    }
+
+    // Codex SDK `file_change` rows are enriched with resolved diffs in main
+    // before the transcript reaches the renderer. Render them through the same
+    // EditToolResultCard path as Claude's Edit tool.
+    if (tool.toolName === 'file_change' && tool.fileDiffs && tool.fileDiffs.length > 0) {
+      return (
+        <div
+          key={toolRenderKey}
+          className={`rich-transcript-tool-container mb-2 ${depth > 0 ? 'nested ml-0' : ''}`}
+          style={{ marginLeft: depth > 0 ? '1rem' : '0' }}
+        >
+          <EditToolResultCard
+            toolMessage={toolMsg}
+            edits={toolCallDiffsToEdits(tool.fileDiffs)}
+            workspacePath={workspacePath}
+            onOpenFile={onOpenFile}
+            renderEmbeddedFile={renderEmbeddedFile}
+            canEmbedFile={canEmbedFile}
+          />
         </div>
       );
     }
@@ -1368,7 +1736,7 @@ export const RichTranscriptView = React.forwardRef<
     if (editTool && editEntries.length > 0) {
       return (
         <div
-          key={`tool-${toolIndex}-${depth}`}
+          key={toolRenderKey}
           className={`rich-transcript-tool-container mb-2 ${depth > 0 ? 'nested ml-0' : ''}`}
           style={{ marginLeft: depth > 0 ? '1rem' : '0' }}
         >
@@ -1377,6 +1745,8 @@ export const RichTranscriptView = React.forwardRef<
             edits={editEntries}
             workspacePath={workspacePath}
             onOpenFile={onOpenFile}
+            renderEmbeddedFile={renderEmbeddedFile}
+            canEmbedFile={canEmbedFile}
           />
         </div>
       );
@@ -1400,7 +1770,7 @@ export const RichTranscriptView = React.forwardRef<
           : 'rich-transcript-tool-card rounded border border-[var(--nim-border)] overflow-hidden bg-[var(--nim-bg-secondary)]';
 
     return (
-      <div key={`tool-${toolIndex}-${depth}`} className={`rich-transcript-tool-container mb-2 ${depth > 0 ? 'nested ml-0' : ''}`} style={{ marginLeft: depth > 0 ? '1rem' : '0' }}>
+      <div key={toolRenderKey} className={`rich-transcript-tool-container mb-2 ${depth > 0 ? 'nested ml-0' : ''}`} style={{ marginLeft: depth > 0 ? '1rem' : '0' }}>
         <div className={cardClass}>
           <button onClick={() => toggleToolExpand(toolId)} className="rich-transcript-tool-button w-full py-1 px-2 flex items-center gap-1.5 text-left border-none cursor-pointer text-sm bg-transparent">
             {isTeammate ? (
@@ -1598,14 +1968,14 @@ export const RichTranscriptView = React.forwardRef<
               )}
 
               {/* File changes caused by this tool call */}
-              {!isSubAgent && getToolCallDiffs && tool.providerToolCallId && tool.result !== undefined && tool.result !== null && (
+              {!isSubAgent && tool.fileDiffs && tool.fileDiffs.length > 0 && (
                 <ToolCallChanges
-                  toolCallItemId={tool.providerToolCallId}
-                  toolCallTimestamp={toolMsg.createdAt?.getTime() ?? 0}
-                  getToolCallDiffs={getToolCallDiffs}
+                  diffs={tool.fileDiffs}
                   isExpanded={isExpanded}
                   workspacePath={workspacePath}
                   onOpenFile={onOpenFile}
+                  renderEmbeddedFile={renderEmbeddedFile}
+                  canEmbedFile={canEmbedFile}
                 />
               )}
             </div>
@@ -1614,6 +1984,354 @@ export const RichTranscriptView = React.forwardRef<
       </div>
     );
   };
+
+  // Rendered message rows. Each row's outer div carries `data-message-index`
+  // and registers its DOM node in `messageRefs` so imperative scroll and
+  // selection helpers can find them.
+  const renderedMessages = messages.map((message, index) => {
+    const messageKey = getTranscriptMessageKey(sessionId, message, index);
+    // Skip tool calls superseded by a later event with the same providerToolCallId
+    if (supersededToolIndices.has(index)) {
+      return <div key={messageKey} style={{ display: 'none' }} />;
+    }
+
+    const isUser = message.type === 'user_message';
+    const isTool = isToolLikeMessage(message);
+    const isCollapsed = collapsedMessages.has(index);
+
+    // Hide assistant/tool messages that sit between agent notifications.
+    // These are the agent's internal processing turns after receiving a teammate/sub-agent
+    // message - they appear as dark bars with scrollbars and add visual noise.
+    // NEVER hide interactive tool widgets (ToolPermission, ExitPlanMode, etc.) that require user action.
+    // Also never hide assistant messages that would carry interactive widgets in toolMessagesBefore.
+    if (message.type === 'assistant_message' || isToolLikeMessage(message)) {
+      const isInteractiveWidget = isToolLikeMessage(message)
+        && isInteractiveWidgetTool(message.toolCall?.toolName);
+      // For assistant messages, check if preceding tool messages contain interactive widgets
+      let hasInteractiveToolsBefore = false;
+      if (message.type === 'assistant_message') {
+        let checkPrev = index - 1;
+        while (checkPrev >= 0 && isToolLikeMessage(messages[checkPrev])) {
+          if (isInteractiveWidgetTool(messages[checkPrev].toolCall?.toolName)) {
+            hasInteractiveToolsBefore = true;
+            break;
+          }
+          checkPrev--;
+        }
+      }
+      if (!isInteractiveWidget && !hasInteractiveToolsBefore) {
+        // Walk back to find the nearest user message (skipping tool and assistant messages)
+        let prevIdx = index - 1;
+        while (prevIdx >= 0 && messages[prevIdx].type !== 'user_message') prevIdx--;
+        if (prevIdx >= 0 && messages[prevIdx].metadata?.isTeammateMessage) {
+          // The most recent user message before this is a teammate notification.
+          // Only hide empty processing turns (no substantive content).
+          const hasNoContent = !message.text?.trim();
+          if (hasNoContent) {
+            return <div key={messageKey} style={{ display: 'none' }} />;
+          }
+        }
+      }
+    }
+
+    // Find tool messages that should be grouped with this message
+    const toolMessagesBefore: { message: TranscriptViewMessage, index: number }[] = [];
+    if (message.type === 'assistant_message') {
+      let checkIdx = index - 1;
+      while (checkIdx >= 0 && isToolLikeMessage(messages[checkIdx])) {
+        toolMessagesBefore.unshift({ message: messages[checkIdx], index: checkIdx });
+        checkIdx--;
+      }
+    }
+
+    // Skip rendering tool messages - they'll be rendered with their assistant message
+    if (isTool) {
+      let nextIndex = index + 1;
+      while (nextIndex < messages.length && isToolLikeMessage(messages[nextIndex])) {
+        nextIndex++;
+      }
+      if (nextIndex < messages.length && messages[nextIndex].type === 'assistant_message') {
+        // Return empty div for virtualization (can't return null)
+        return <div key={messageKey} style={{ display: 'none' }} />;
+      }
+    }
+
+    // Check if this is the start of a new message group
+    let effectivePrevMessage = null;
+    let checkIdx = index - 1;
+    while (checkIdx >= 0 && isToolLikeMessage(messages[checkIdx])) {
+      checkIdx--;
+    }
+    if (checkIdx >= 0) {
+      effectivePrevMessage = messages[checkIdx];
+    }
+    const isNewGroup = !effectivePrevMessage || effectivePrevMessage.type !== message.type;
+
+    // Render orphaned tool calls.
+    // When settings.showToolCalls is false, hide non-interactive tool
+    // rows from the chat view but always render interactive widgets
+    // (ToolPermission / ExitPlanMode / AskUserQuestion /
+    // PromptForUserInput / RequestUserInput / GitCommitProposal)
+    // so the user can still act on prompts.
+    if (isTool && message.toolCall) {
+      const isInteractiveWidget = isInteractiveWidgetTool(message.toolCall.toolName);
+      if (!settings.showToolCalls && !isInteractiveWidget) {
+        return null;
+      }
+      return (
+        <div key={messageKey} className="rich-transcript-tool-container orphan ml-6 mb-2">
+          {renderToolCard(message, index, 0)}
+        </div>
+      );
+    }
+
+    // Render teammate/sub-agent messages as compact inline notifications
+    if (isUser && message.metadata?.isTeammateMessage) {
+      const teammateName = (message.metadata?.teammateName as string) || 'agent';
+      const label = `Received message from agent ${teammateName}`;
+      const content = message.text?.trim();
+      // Show first line as preview (truncated)
+      const firstLine = content?.split('\n')[0] || '';
+      const preview = firstLine.length > 100 ? firstLine.slice(0, 100) + '...' : firstLine;
+      const hasMoreContent = content && (content.includes('\n') || content.length > 100);
+      return (
+        <div
+          key={messageKey}
+          data-message-index={index}
+          ref={(el) => {
+            if (el) {
+              messageRefs.current.set(index, el);
+            } else {
+              messageRefs.current.delete(index);
+            }
+          }}
+          className="rich-transcript-message rich-transcript-teammate-notification rounded-md relative max-w-full overflow-x-hidden break-words mb-1"
+        >
+          {hasMoreContent ? (
+            <details>
+              <summary className="flex items-center gap-1.5 py-0.5 text-xs text-[var(--nim-text-faint)] hover:text-[var(--nim-text-muted)]">
+                <MaterialSymbol icon="chevron_right" size={14} className="teammate-chevron transition-transform shrink-0 w-3.5" />
+                <span className="flex-1 truncate">{label}: {preview}</span>
+                <span className="text-[10px] shrink-0">{formatMessageTime(message.createdAt?.getTime() ?? 0)}</span>
+              </summary>
+              <div className="teammate-content ml-5 mt-1 mb-0.5">
+                <MarkdownRenderer content={content} isUser={false} onOpenFile={onOpenFile} onOpenSession={onOpenSession} />
+              </div>
+            </details>
+          ) : (
+            <div className="flex items-center gap-1.5 py-0.5 text-xs text-[var(--nim-text-faint)]">
+              <MaterialSymbol icon="chevron_right" size={14} className="shrink-0 w-3.5 invisible" />
+              <span className="flex-1 truncate">{label}: {content}</span>
+              <span className="text-[10px] shrink-0">{formatMessageTime(message.createdAt?.getTime() ?? 0)}</span>
+            </div>
+          )}
+        </div>
+      );
+    }
+
+    if (message.type === 'system_message' && message.systemMessage?.systemType === 'permission_denied') {
+      // Auto-mode classifier denials are paired with a re-prompt from the
+      // PermissionDenied SDK hook (see AgentToolHooks.createPermissionDeniedHook).
+      // The user sees the regular ToolPermission widget with the classifier
+      // reason in its warnings, so rendering the red "Tool denied" card on top
+      // of that would be redundant and confusing -- skip it.
+      //
+      // Other deny sources (`rule`, `mode`, `asyncAgent`, headless auto-deny)
+      // stay visible because no re-prompt happens for those paths.
+      if (message.systemMessage.deniedReasonType === 'classifier') {
+        return null;
+      }
+      return (
+        <div
+          key={messageKey}
+          data-message-index={index}
+          ref={(el) => {
+            if (el) messageRefs.current.set(index, el);
+          }}
+        >
+          <PermissionDeniedCard message={message} />
+        </div>
+      );
+    }
+
+    if ((message.type === 'system_message' && message.systemMessage?.systemType !== 'error') || (message.metadata?.promptType as string) === 'system_reminder') {
+      return (
+        <div
+          key={messageKey}
+          data-message-index={index}
+          ref={(el) => {
+            if (el) {
+              messageRefs.current.set(index, el);
+            } else {
+              messageRefs.current.delete(index);
+            }
+          }}
+        >
+          <SystemReminderCard message={message} />
+        </div>
+      );
+    }
+
+    return (
+      <div
+        key={messageKey}
+        data-message-index={index}
+        ref={(el) => {
+          if (el) {
+            messageRefs.current.set(index, el);
+          } else {
+            messageRefs.current.delete(index);
+          }
+        }}
+        className={`rich-transcript-message rounded-md relative max-w-full overflow-x-hidden break-words mb-2 ${isUser ? 'user bg-[var(--nim-bg-secondary)]' : 'assistant bg-[var(--nim-bg)]'} ${settings.compactMode ? 'compact p-2' : 'normal p-3'} ${!isNewGroup ? 'continuation -mt-1' : ''}`}
+      >
+        {/* Restart indicator line (dev mode only) - rendered before the first message after restart */}
+        {restartAfterIndex >= 0 && index === restartAfterIndex && (
+          <div className="flex items-center gap-3 mb-3">
+            <div className="flex-1 h-px bg-[var(--nim-error)]" />
+            <span className="text-[11px] font-medium text-[var(--nim-error)] whitespace-nowrap">
+              Nimbalyst restarted {formatMessageTime(appStartTime!)}
+            </span>
+            <div className="flex-1 h-px bg-[var(--nim-error)]" />
+          </div>
+        )}
+        {isNewGroup && (
+          <div className="rich-transcript-message-header flex items-center gap-2 mb-1.5">
+            <div className={`rich-transcript-message-avatar w-7 h-7 rounded-full shrink-0 flex items-center justify-center ${isUser ? 'user' : 'assistant'}`}>
+              {isUser ? (
+                <MaterialSymbol icon="person" size={18} />
+              ) : (
+                <ProviderIcon provider={provider || 'claude-code'} size={18} />
+              )}
+            </div>
+            <div className="rich-transcript-message-meta flex-1 flex items-baseline gap-2">
+              <span className="rich-transcript-message-sender font-medium text-[var(--nim-text)] text-sm">
+                {isUser ? 'You' : getProviderDisplayName(provider)}
+              </span>
+              {isUser && message.mode === 'planning' && (
+                <span
+                  className="text-[10px] rounded-full font-medium"
+                  style={{ backgroundColor: '#3b82f6', color: 'white', padding: '2px 6px' }}
+                >
+                  Plan
+                </span>
+              )}
+              <span className="rich-transcript-message-time text-xs text-[var(--nim-text-faint)]">
+                {formatMessageTime(message.createdAt?.getTime() ?? 0)}
+              </span>
+            </div>
+            <div className="rich-transcript-message-actions flex items-center gap-1">
+              {(message.text ?? '').length > 200 && (
+                <button
+                  onClick={() => toggleMessageCollapse(index)}
+                  className="rich-transcript-collapse-button p-1 rounded-md bg-transparent border-none text-[var(--nim-text-faint)] cursor-pointer transition-colors hover:bg-[var(--nim-bg-secondary)] hover:text-[var(--nim-text-muted)]"
+                  title={isCollapsed ? "Show full message" : "Collapse message"}
+                >
+                  {isCollapsed ? (
+                    <MaterialSymbol icon="visibility" size={16} />
+                  ) : (
+                    <MaterialSymbol icon="visibility_off" size={16} />
+                  )}
+                </button>
+              )}
+            </div>
+          </div>
+        )}
+
+        {toolMessagesBefore.length > 0 && (() => {
+          // Filter out non-interactive tool messages when settings.showToolCalls
+          // is off; always keep interactive widgets so the user can act on prompts.
+          const visibleToolMessages = settings.showToolCalls
+            ? toolMessagesBefore
+            : toolMessagesBefore.filter(
+                ({ message: toolMsg }) => isInteractiveWidgetTool(toolMsg.toolCall?.toolName)
+              );
+          if (visibleToolMessages.length === 0) return null;
+          return (
+            <div className={`rich-transcript-tool-messages flex flex-col gap-2 mb-1.5 ${isNewGroup ? 'indented ml-6' : ''}`}>
+              {visibleToolMessages.map(({ message: toolMsg, index: toolIndex }) =>
+                renderToolCard(toolMsg, toolIndex, 0)
+              )}
+            </div>
+          );
+        })()}
+
+        <div className={`rich-transcript-message-content relative ${isNewGroup ? 'ml-6' : 'no-indent ml-0'}`}>
+          {/* Copy button - shows on hover */}
+          <div className="rich-transcript-message-copy-action absolute -top-1 right-0 z-[1]">
+            <button
+              onClick={() => copyTranscriptViewMessageContent(message, index)}
+              className={`rich-transcript-copy-button p-1.5 rounded-md bg-[var(--nim-bg-secondary)] border border-[var(--nim-border)] cursor-pointer transition-all flex items-center justify-center hover:bg-[var(--nim-bg-hover)] ${copiedMessageIndex === index ? 'copied' : ''}`}
+              title="Copy as Markdown"
+            >
+              {copiedMessageIndex === index ? (
+                <MaterialSymbol icon="check" size={16} className="text-[var(--nim-success)]" />
+              ) : (
+                <MaterialSymbol icon="content_copy" size={16} className="text-[var(--nim-text-faint)]" />
+              )}
+            </button>
+          </div>
+          <MessageSegment
+            message={message}
+            isUser={isUser}
+            isCollapsed={isCollapsed}
+            showToolCalls={false}
+            showThinking={settings.showThinking}
+            expandedTools={expandedTools}
+            onToggleToolExpand={toggleToolExpand}
+            documentContext={documentContext}
+            shouldShowLoginWidget={shouldShowLoginWidgetForIndex(index)}
+            sessionId={sessionId}
+            isLastMessage={index === messages.length - 1}
+            onOpenFile={onOpenFile}
+            onOpenSession={onOpenSession}
+            onCompact={onCompact}
+            provider={provider}
+          />
+        </div>
+
+        {/* Show elapsed time at the end of a completed assistant turn */}
+        {!isUser && (() => {
+          // Check if this is the last message in the assistant group
+          let nextNonToolIdx = index + 1;
+          while (nextNonToolIdx < messages.length && isToolLikeMessage(messages[nextNonToolIdx])) {
+            nextNonToolIdx++;
+          }
+          const isEndOfGroup = nextNonToolIdx >= messages.length || messages[nextNonToolIdx].type !== 'assistant_message';
+          if (!isEndOfGroup) return null;
+          // Don't show for the last assistant group if still streaming
+          if (isWaitingForResponse && nextNonToolIdx >= messages.length) return null;
+          // Find the preceding user-input message that triggered this turn
+          // Only consider genuine user input (isUserInput), not system-generated user-role messages
+          let startIdx = index - 1;
+          while (startIdx >= 0 && !(messages[startIdx].type === 'user_message')) {
+            startIdx--;
+          }
+          if (startIdx < 0) return null; // No preceding user input message
+          const startTimestamp = messages[startIdx].createdAt?.getTime() ?? 0;
+          const endTimestamp = message.createdAt?.getTime() ?? 0;
+          const duration = formatDuration(startTimestamp, endTimestamp);
+          if (!duration || duration === '0ms') return null;
+          const finishedAt = formatTurnFinishedAt(endTimestamp);
+          const fileStats = computeTurnFileStats(messages, startIdx, index);
+          return (
+            <div className="rich-transcript-turn-elapsed text-xs text-[var(--nim-text-faint)] mt-2 ml-6">
+              Finished in {duration}
+              {finishedAt && <span> {finishedAt}</span>}
+              {fileStats && (
+                <span>
+                  {' · '}{fileStats.filesModified} file{fileStats.filesModified !== 1 ? 's' : ''}
+                  {fileStats.linesAdded > 0 && <span className="text-[var(--nim-success)] opacity-60"> +{fileStats.linesAdded}</span>}
+                  {fileStats.linesRemoved > 0 && <span className="text-[var(--nim-error)] opacity-60"> -{fileStats.linesRemoved}</span>}
+                </span>
+              )}
+            </div>
+          );
+        })()}
+
+      </div>
+    );
+  });
 
   return (
     <div ref={viewRootRef} className="rich-transcript-view h-full flex flex-col bg-[var(--nim-bg)] relative overflow-x-hidden select-text">
@@ -1624,9 +2342,7 @@ export const RichTranscriptView = React.forwardRef<
         containerRef={scrollContainerRef}
         onClose={() => setShowSearchBar(false)}
         onScrollToMessage={(index) => {
-          if (vlistRef.current) {
-            vlistRef.current.scrollToIndex(index, { align: 'center' });
-          }
+          vlistRef.current?.scrollToIndex(index, { align: 'center' });
         }}
       />
 
@@ -1666,24 +2382,21 @@ export const RichTranscriptView = React.forwardRef<
       )}
 
       {/* Messages */}
-      <div ref={scrollContainerRef} className="rich-transcript-scroll-container flex-1 overflow-hidden relative">
+      <div
+        ref={scrollContainerRef}
+        className="rich-transcript-scroll-container flex-1 relative overflow-hidden"
+      >
         <div className={`rich-transcript-content mx-auto py-1 h-full ${settings.compactMode ? 'compact' : 'normal'}`}>
           {messages.length === 0 && !isWaitingForResponse ? (
             <div className="rich-transcript-empty flex flex-col items-center p-8 px-4 h-full max-w-4xl mx-auto">
-              <div className="rich-transcript-empty-content flex-1 flex flex-col justify-center max-w-[400px] text-left">
-                <div className="rich-transcript-empty-title text-[var(--nim-text-faint)] text-sm mb-2 leading-relaxed">
-                  {getProviderDisplayName(provider)} is ready to assist with:
+
+              {hideEmptyHelp ? (
+                <div className="rich-transcript-empty-extras-wrap flex-1 flex flex-col items-center justify-center w-full">
+                  {renderEmptyExtra?.()}
                 </div>
-                <ul className="rich-transcript-empty-capabilities list-none p-0 m-0 ml-6">
-                  <li className="text-[var(--nim-text-faint)] text-sm py-1 pl-3 relative leading-relaxed before:content-['•'] before:absolute before:left-0 before:text-[var(--nim-text-faint)]">Web research</li>
-                  <li className="text-[var(--nim-text-faint)] text-sm py-1 pl-3 relative leading-relaxed before:content-['•'] before:absolute before:left-0 before:text-[var(--nim-text-faint)]">Code analysis</li>
-                  <li className="text-[var(--nim-text-faint)] text-sm py-1 pl-3 relative leading-relaxed before:content-['•'] before:absolute before:left-0 before:text-[var(--nim-text-faint)]">File editing</li>
-                </ul>
-                <div className="rich-transcript-empty-footer text-[var(--nim-text-faint)] text-sm mt-3 leading-relaxed">
-                  Enter a task below to get started
-                </div>
-              </div>
-              {renderEmptyExtra?.()}
+              ) : (
+                renderEmptyExtra?.()
+              )}
             </div>
           ) : !isContainerVisible ? (
             /* Skip VList rendering when container is hidden (display:none parent).
@@ -1691,12 +2404,12 @@ export const RichTranscriptView = React.forwardRef<
                causing massive DOM bloat and style recalculation. */
             null
           ) : (
-            <div className={`rich-transcript-messages rich-transcript-vlist-wrapper flex flex-col max-w-full overflow-x-hidden h-full ${isScrollReady ? 'scroll-ready' : ''}`}>
+            <div className={`rich-transcript-messages rich-transcript-messages-wrapper flex flex-col max-w-full overflow-x-hidden h-full ${isScrollReady ? 'scroll-ready' : ''}`}>
               <VList
                   ref={vlistRef}
                   className="rich-transcript-vlist !h-full !w-full"
                   style={{ height: '100%' }}
-                  bufferSize={800}
+                  bufferSize={vlistBufferSize}
                   itemSize={90}
                   cache={vlistCacheMap.get(sessionId)}
                   onScroll={(offset) => {
@@ -1705,9 +2418,9 @@ export const RichTranscriptView = React.forwardRef<
                       const scrollSize = vlistRef.current.scrollSize;
                       const viewportSize = vlistRef.current.viewportSize;
                       const distanceFromBottom = scrollSize - offset - viewportSize;
-                      const isAtBottom = distanceFromBottom < 50;
+                      const isAtBottom = isTranscriptAtBottom(distanceFromBottom);
                       // Update the per-session atom - this persists across component remounts
-                      setSessionIsAtBottom(sessionId, isAtBottom);
+                      setAtBottomState(isAtBottom);
                       if (scrollButtonRef.current) {
                         const show = distanceFromBottom > viewportSize;
                         scrollButtonRef.current.style.opacity = show ? '1' : '0';
@@ -1727,295 +2440,10 @@ export const RichTranscriptView = React.forwardRef<
                       } else if (showPermissionBanner) {
                         setShowPermissionBanner(false);
                       }
-                    }
+                  }
                   }}
                 >
-                  {messages.map((message, index) => {
-                    // Skip tool calls superseded by a later event with the same providerToolCallId
-                    if (supersededToolIndices.has(index)) {
-                      return <div key={`${sessionId}-${index}`} style={{ display: 'none' }} />;
-                    }
-
-                    const isUser = message.type === 'user_message';
-                    const isTool = isToolLikeMessage(message);
-                    const isCollapsed = collapsedMessages.has(index);
-
-                    // Hide assistant/tool messages that sit between agent notifications.
-                    // These are the agent's internal processing turns after receiving a teammate/sub-agent
-                    // message - they appear as dark bars with scrollbars and add visual noise.
-                    // NEVER hide interactive tool widgets (ToolPermission, ExitPlanMode, etc.) that require user action.
-                    // Also never hide assistant messages that would carry interactive widgets in toolMessagesBefore.
-                    if (message.type === 'assistant_message' || isToolLikeMessage(message)) {
-                      const INTERACTIVE_WIDGETS = ['ToolPermission', 'ExitPlanMode', 'AskUserQuestion', 'GitCommitProposal'];
-                      const isInteractiveWidget = isToolLikeMessage(message) && message.toolCall?.toolName &&
-                        INTERACTIVE_WIDGETS.includes(message.toolCall.toolName);
-                      // For assistant messages, check if preceding tool messages contain interactive widgets
-                      let hasInteractiveToolsBefore = false;
-                      if (message.type === 'assistant_message') {
-                        let checkPrev = index - 1;
-                        while (checkPrev >= 0 && isToolLikeMessage(messages[checkPrev])) {
-                          if (messages[checkPrev].toolCall?.toolName && INTERACTIVE_WIDGETS.includes(messages[checkPrev].toolCall!.toolName)) {
-                            hasInteractiveToolsBefore = true;
-                            break;
-                          }
-                          checkPrev--;
-                        }
-                      }
-                      if (!isInteractiveWidget && !hasInteractiveToolsBefore) {
-                        // Walk back to find the nearest user message (skipping tool and assistant messages)
-                        let prevIdx = index - 1;
-                        while (prevIdx >= 0 && messages[prevIdx].type !== 'user_message') prevIdx--;
-                        if (prevIdx >= 0 && messages[prevIdx].metadata?.isTeammateMessage) {
-                          // The most recent user message before this is a teammate notification.
-                          // Only hide empty processing turns (no substantive content).
-                          const hasNoContent = !message.text?.trim();
-                          if (hasNoContent) {
-                            return <div key={`${sessionId}-${index}`} style={{ display: 'none' }} />;
-                          }
-                        }
-                      }
-                    }
-
-                    // Find tool messages that should be grouped with this message
-                    const toolMessagesBefore: { message: TranscriptViewMessage, index: number }[] = [];
-                    if (message.type === 'assistant_message') {
-                      let checkIdx = index - 1;
-                      while (checkIdx >= 0 && isToolLikeMessage(messages[checkIdx])) {
-                        toolMessagesBefore.unshift({ message: messages[checkIdx], index: checkIdx });
-                        checkIdx--;
-                      }
-                    }
-
-                    // Skip rendering tool messages - they'll be rendered with their assistant message
-                    if (isTool) {
-                      let nextIndex = index + 1;
-                      while (nextIndex < messages.length && isToolLikeMessage(messages[nextIndex])) {
-                        nextIndex++;
-                      }
-                      if (nextIndex < messages.length && messages[nextIndex].type === 'assistant_message') {
-                        // Return empty div for virtualization (can't return null)
-                        return <div key={`${sessionId}-${index}`} style={{ display: 'none' }} />;
-                      }
-                    }
-
-                    // Check if this is the start of a new message group
-                    let effectivePrevMessage = null;
-                    let checkIdx = index - 1;
-                    while (checkIdx >= 0 && isToolLikeMessage(messages[checkIdx])) {
-                      checkIdx--;
-                    }
-                    if (checkIdx >= 0) {
-                      effectivePrevMessage = messages[checkIdx];
-                    }
-                    const isNewGroup = !effectivePrevMessage || effectivePrevMessage.type !== message.type;
-
-                    // Render orphaned tool calls
-                    if (isTool && message.toolCall) {
-                      return (
-                        <div key={`${sessionId}-${index}`} className="rich-transcript-tool-container orphan ml-6 mb-2">
-                          {renderToolCard(message, index, 0)}
-                        </div>
-                      );
-                    }
-
-                    // Render teammate/sub-agent messages as compact inline notifications
-                    if (isUser && message.metadata?.isTeammateMessage) {
-                      const teammateName = (message.metadata?.teammateName as string) || 'agent';
-                      const label = `Received message from agent ${teammateName}`;
-                      const content = message.text?.trim();
-                      // Show first line as preview (truncated)
-                      const firstLine = content?.split('\n')[0] || '';
-                      const preview = firstLine.length > 100 ? firstLine.slice(0, 100) + '...' : firstLine;
-                      const hasMoreContent = content && (content.includes('\n') || content.length > 100);
-                      return (
-                        <div
-                          key={`${sessionId}-${index}`}
-                          data-message-index={index}
-                          ref={(el) => {
-                            if (el) messageRefs.current.set(index, el);
-                          }}
-                          className="rich-transcript-message rich-transcript-teammate-notification rounded-md relative max-w-full overflow-x-hidden break-words mb-1"
-                        >
-                          {hasMoreContent ? (
-                            <details>
-                              <summary className="flex items-center gap-1.5 py-0.5 text-xs text-[var(--nim-text-faint)] hover:text-[var(--nim-text-muted)]">
-                                <MaterialSymbol icon="chevron_right" size={14} className="teammate-chevron transition-transform shrink-0 w-3.5" />
-                                <span className="flex-1 truncate">{label}: {preview}</span>
-                                <span className="text-[10px] shrink-0">{formatMessageTime(message.createdAt?.getTime() ?? 0)}</span>
-                              </summary>
-                              <div className="teammate-content ml-5 mt-1 mb-0.5">
-                                <MarkdownRenderer content={content} isUser={false} onOpenFile={onOpenFile} onOpenSession={onOpenSession} />
-                              </div>
-                            </details>
-                          ) : (
-                            <div className="flex items-center gap-1.5 py-0.5 text-xs text-[var(--nim-text-faint)]">
-                              <MaterialSymbol icon="chevron_right" size={14} className="shrink-0 w-3.5 invisible" />
-                              <span className="flex-1 truncate">{label}: {content}</span>
-                              <span className="text-[10px] shrink-0">{formatMessageTime(message.createdAt?.getTime() ?? 0)}</span>
-                            </div>
-                          )}
-                        </div>
-                      );
-                    }
-
-                    if ((message.type === 'system_message' && message.systemMessage?.systemType !== 'error') || (message.metadata?.promptType as string) === 'system_reminder') {
-                      return (
-                        <div
-                          key={`${sessionId}-${index}`}
-                          data-message-index={index}
-                          ref={(el) => {
-                            if (el) messageRefs.current.set(index, el);
-                          }}
-                        >
-                          <SystemReminderCard message={message} />
-                        </div>
-                      );
-                    }
-
-                    return (
-                      <div
-                        key={`${sessionId}-${index}`}
-                        data-message-index={index}
-                        ref={(el) => {
-                          if (el) messageRefs.current.set(index, el);
-                        }}
-                        className={`rich-transcript-message rounded-md relative max-w-full overflow-x-hidden break-words mb-2 ${isUser ? 'user bg-[var(--nim-bg-secondary)]' : 'assistant bg-[var(--nim-bg)]'} ${settings.compactMode ? 'compact p-2' : 'normal p-3'} ${!isNewGroup ? 'continuation -mt-1' : ''}`}
-                      >
-                        {/* Restart indicator line (dev mode only) - rendered before the first message after restart */}
-                        {restartAfterIndex >= 0 && index === restartAfterIndex && (
-                          <div className="flex items-center gap-3 mb-3">
-                            <div className="flex-1 h-px bg-[var(--nim-error)]" />
-                            <span className="text-[11px] font-medium text-[var(--nim-error)] whitespace-nowrap">
-                              Nimbalyst restarted {formatMessageTime(appStartTime!)}
-                            </span>
-                            <div className="flex-1 h-px bg-[var(--nim-error)]" />
-                          </div>
-                        )}
-                        {isNewGroup && (
-                          <div className="rich-transcript-message-header flex items-center gap-2 mb-1.5">
-                            <div className={`rich-transcript-message-avatar w-7 h-7 rounded-full shrink-0 flex items-center justify-center ${isUser ? 'user' : 'assistant'}`}>
-                              {isUser ? (
-                                <MaterialSymbol icon="person" size={18} />
-                              ) : (
-                                <ProviderIcon provider={provider || 'claude-code'} size={18} />
-                              )}
-                            </div>
-                            <div className="rich-transcript-message-meta flex-1 flex items-baseline gap-2">
-                              <span className="rich-transcript-message-sender font-medium text-[var(--nim-text)] text-sm">
-                                {isUser ? 'You' : getProviderDisplayName(provider)}
-                              </span>
-                              {isUser && message.mode === 'planning' && (
-                                <span
-                                  className="text-[10px] rounded-full font-medium"
-                                  style={{ backgroundColor: '#3b82f6', color: 'white', padding: '2px 6px' }}
-                                >
-                                  Plan
-                                </span>
-                              )}
-                              <span className="rich-transcript-message-time text-xs text-[var(--nim-text-faint)]">
-                                {formatMessageTime(message.createdAt?.getTime() ?? 0)}
-                              </span>
-                            </div>
-                            <div className="rich-transcript-message-actions flex items-center gap-1">
-                              {(message.text ?? '').length > 200 && (
-                                <button
-                                  onClick={() => toggleMessageCollapse(index)}
-                                  className="rich-transcript-collapse-button p-1 rounded-md bg-transparent border-none text-[var(--nim-text-faint)] cursor-pointer transition-colors hover:bg-[var(--nim-bg-secondary)] hover:text-[var(--nim-text-muted)]"
-                                  title={isCollapsed ? "Show full message" : "Collapse message"}
-                                >
-                                  {isCollapsed ? (
-                                    <MaterialSymbol icon="visibility" size={16} />
-                                  ) : (
-                                    <MaterialSymbol icon="visibility_off" size={16} />
-                                  )}
-                                </button>
-                              )}
-                            </div>
-                          </div>
-                        )}
-
-                        {toolMessagesBefore.length > 0 && (
-                          <div className={`rich-transcript-tool-messages flex flex-col gap-2 mb-1.5 ${isNewGroup ? 'indented ml-6' : ''}`}>
-                            {toolMessagesBefore.map(({ message: toolMsg, index: toolIndex }) =>
-                              renderToolCard(toolMsg, toolIndex, 0)
-                            )}
-                          </div>
-                        )}
-
-                        <div className={`rich-transcript-message-content relative ${isNewGroup ? 'ml-6' : 'no-indent ml-0'}`}>
-                          {/* Copy button - shows on hover */}
-                          <div className="rich-transcript-message-copy-action absolute -top-1 right-0 z-[1]">
-                            <button
-                              onClick={() => copyTranscriptViewMessageContent(message, index)}
-                              className={`rich-transcript-copy-button p-1.5 rounded-md bg-[var(--nim-bg-secondary)] border border-[var(--nim-border)] cursor-pointer transition-all flex items-center justify-center hover:bg-[var(--nim-bg-hover)] ${copiedMessageIndex === index ? 'copied' : ''}`}
-                              title="Copy as Markdown"
-                            >
-                              {copiedMessageIndex === index ? (
-                                <MaterialSymbol icon="check" size={16} className="text-[var(--nim-success)]" />
-                              ) : (
-                                <MaterialSymbol icon="content_copy" size={16} className="text-[var(--nim-text-faint)]" />
-                              )}
-                            </button>
-                          </div>
-                          <MessageSegment
-                            message={message}
-                            isUser={isUser}
-                            isCollapsed={isCollapsed}
-                            showToolCalls={false}
-                            showThinking={settings.showThinking}
-                            expandedTools={expandedTools}
-                            onToggleToolExpand={toggleToolExpand}
-                            documentContext={documentContext}
-                            shouldShowLoginWidget={shouldShowLoginWidgetForIndex(index)}
-                            sessionId={sessionId}
-                            isLastMessage={index === messages.length - 1}
-                            onOpenFile={onOpenFile}
-                            onOpenSession={onOpenSession}
-                            onCompact={onCompact}
-                            provider={provider}
-                          />
-                        </div>
-
-                        {/* Show elapsed time at the end of a completed assistant turn */}
-                        {!isUser && (() => {
-                          // Check if this is the last message in the assistant group
-                          let nextNonToolIdx = index + 1;
-                          while (nextNonToolIdx < messages.length && isToolLikeMessage(messages[nextNonToolIdx])) {
-                            nextNonToolIdx++;
-                          }
-                          const isEndOfGroup = nextNonToolIdx >= messages.length || messages[nextNonToolIdx].type !== 'assistant_message';
-                          if (!isEndOfGroup) return null;
-                          // Don't show for the last assistant group if still streaming
-                          if (isWaitingForResponse && nextNonToolIdx >= messages.length) return null;
-                          // Find the preceding user-input message that triggered this turn
-                          // Only consider genuine user input (isUserInput), not system-generated user-role messages
-                          let startIdx = index - 1;
-                          while (startIdx >= 0 && !(messages[startIdx].type === 'user_message')) {
-                            startIdx--;
-                          }
-                          if (startIdx < 0) return null; // No preceding user input message
-                          const startTimestamp = messages[startIdx].createdAt?.getTime() ?? 0;
-                          const endTimestamp = message.createdAt?.getTime() ?? 0;
-                          const duration = formatDuration(startTimestamp, endTimestamp);
-                          if (!duration || duration === '0ms') return null;
-                          const fileStats = computeTurnFileStats(messages, startIdx, index);
-                          return (
-                            <div className="rich-transcript-turn-elapsed text-xs text-[var(--nim-text-faint)] mt-2 ml-6">
-                              Finished in {duration}
-                              {fileStats && (
-                                <span>
-                                  {' · '}{fileStats.filesModified} file{fileStats.filesModified !== 1 ? 's' : ''}
-                                  {fileStats.linesAdded > 0 && <span className="text-[var(--nim-success)] opacity-60"> +{fileStats.linesAdded}</span>}
-                                  {fileStats.linesRemoved > 0 && <span className="text-[var(--nim-error)] opacity-60"> -{fileStats.linesRemoved}</span>}
-                                </span>
-                              )}
-                            </div>
-                          );
-                        })()}
-
-                      </div>
-                    );
-                  })}
+                  {renderedMessages}
                   {/* Restart indicator at bottom when all messages precede the restart (dev mode only) */}
                   {restartAtBottom && (
                     <div key="restart-bottom" className="flex items-center gap-3 my-2 px-3">
@@ -2046,7 +2474,8 @@ export const RichTranscriptView = React.forwardRef<
           <div className="sticky bottom-12 flex justify-center z-10 pointer-events-none">
             <button
               onClick={() => {
-                vlistRef.current?.scrollToIndex(pendingPermissionIndices[0], { align: 'center' });
+                const targetIdx = pendingPermissionIndices[0];
+                vlistRef.current?.scrollToIndex(targetIdx, { align: 'center' });
               }}
               className="pointer-events-auto flex items-center gap-2 px-4 py-2 bg-[var(--nim-primary)] text-white rounded-full shadow-lg text-sm font-medium cursor-pointer border-none transition-all hover:brightness-110"
             >

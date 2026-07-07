@@ -22,14 +22,33 @@ export class InMemoryTranscriptEventStore implements ITranscriptEventStore {
   private events: TranscriptEvent[] = [];
   private nextId = 1;
   private sequenceBySession = new Map<string, number>();
+  // Optional external id allocator. When RoutingStore (TranscriptRuntime)
+  // holds per-session stores, multiple stores would otherwise mint id=1, 2,
+  // ... in parallel, so cross-store lookups by id (getEventById, mergeEventPayload)
+  // can return the wrong session's event. Sharing a single allocator across
+  // every per-session store makes ids globally unique within the runtime.
+  private idAllocator: (() => number) | null;
+
+  constructor(idAllocator?: () => number) {
+    this.idAllocator = idAllocator ?? null;
+  }
 
   async insertEvent(event: Omit<TranscriptEvent, 'id'>): Promise<TranscriptEvent> {
-    const inserted: TranscriptEvent = { ...event, id: this.nextId++ };
+    const id = this.idAllocator ? this.idAllocator() : this.nextId++;
+    const inserted: TranscriptEvent = { ...event, id };
     this.events.push(inserted);
     const current = this.sequenceBySession.get(event.sessionId) ?? 0;
     if (event.sequence >= current) {
       this.sequenceBySession.set(event.sessionId, event.sequence + 1);
     }
+    return inserted;
+  }
+
+  async insertEvents(
+    events: Array<Omit<TranscriptEvent, 'id'>>,
+  ): Promise<TranscriptEvent[]> {
+    const inserted: TranscriptEvent[] = [];
+    for (const event of events) inserted.push(await this.insertEvent(event));
     return inserted;
   }
 
@@ -86,6 +105,26 @@ export class InMemoryTranscriptEventStore implements ITranscriptEventStore {
         event.providerToolCallId === providerToolCallId &&
         event.sessionId === sessionId
       ) {
+        return event;
+      }
+    }
+    return null;
+  }
+
+  async findActiveToolCallByRawProviderId(
+    rawProviderToolCallId: string,
+    sessionId: string,
+  ): Promise<TranscriptEvent | null> {
+    const synthPrefix = `nimtc|${encodeURIComponent(rawProviderToolCallId)}|`;
+    for (let i = this.events.length - 1; i >= 0; i--) {
+      const event = this.events[i];
+      if (event.sessionId !== sessionId) continue;
+      if (event.eventType !== 'tool_call') continue;
+      const ptcid = event.providerToolCallId ?? '';
+      const matches = ptcid === rawProviderToolCallId || ptcid.startsWith(synthPrefix);
+      if (!matches) continue;
+      const status = (event.payload as Record<string, unknown> | undefined)?.status;
+      if (status === 'running' || status === 'pending' || status == null) {
         return event;
       }
     }

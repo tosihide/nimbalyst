@@ -1,4 +1,5 @@
 import React, { useState, useEffect } from 'react';
+import { useAtomValue } from 'jotai';
 import { KeyboardShortcuts, getShortcutDisplay } from '../../../shared/KeyboardShortcuts';
 import {
   getRegisteredKeybindings,
@@ -6,6 +7,7 @@ import {
   type RegisteredKeybinding,
 } from '../../extensions/commands/ExtensionCommandRegistry';
 import { getExtensionLoader } from '@nimbalyst/runtime';
+import { developerModeAtom } from '../../store/atoms/appSettings';
 
 interface KeyboardShortcutsDialogProps {
   isOpen: boolean;
@@ -82,6 +84,7 @@ function buildExtensionShortcutGroups(keybindings: RegisteredKeybinding[]): Shor
 export function KeyboardShortcutsDialog({ isOpen, onClose }: KeyboardShortcutsDialogProps) {
   const [activeTab, setActiveTab] = useState<TabId>('general');
   const [extensionGroups, setExtensionGroups] = useState<ShortcutGroup[]>([]);
+  const developerMode = useAtomValue(developerModeAtom);
 
   // Handle Escape key to close dialog
   useEffect(() => {
@@ -117,8 +120,8 @@ export function KeyboardShortcutsDialog({ isOpen, onClose }: KeyboardShortcutsDi
       shortcuts: [
         { label: 'New File / New Session', shortcut: KeyboardShortcuts.file.newFile }, // shared/KeyboardShortcuts.ts:9 - Cmd+N
         { label: 'New Session (any mode)', shortcut: KeyboardShortcuts.file.newSessionGlobal }, // shared/KeyboardShortcuts.ts:11 - Cmd+Shift+N
-        { label: 'Open File', shortcut: KeyboardShortcuts.file.open }, // shared/KeyboardShortcuts.ts:12 - Cmd+O
-        { label: 'Open Folder', shortcut: KeyboardShortcuts.file.openFolder }, // shared/KeyboardShortcuts.ts:13 - Cmd+Shift+O
+        { label: 'New Browser Tab', shortcut: KeyboardShortcuts.file.newBrowserTab }, // shared/KeyboardShortcuts.ts:12 - Cmd+Shift+B
+        { label: 'Open File', shortcut: KeyboardShortcuts.file.open }, // shared/KeyboardShortcuts.ts:13 - Cmd+O
         { label: 'Save', shortcut: KeyboardShortcuts.file.save }, // shared/KeyboardShortcuts.ts:14 - Cmd+S
         { label: 'Close Tab', shortcut: KeyboardShortcuts.file.closeTab }, // shared/KeyboardShortcuts.ts:15 - Cmd+W
         { label: 'Reopen Closed Tab', shortcut: KeyboardShortcuts.file.reopenClosedTab }, // shared/KeyboardShortcuts.ts:16 - Cmd+Shift+T
@@ -134,6 +137,7 @@ export function KeyboardShortcutsDialog({ isOpen, onClose }: KeyboardShortcutsDi
         { label: 'Cut', shortcut: KeyboardShortcuts.edit.cut }, // shared/KeyboardShortcuts.ts:25 - Cmd+X
         { label: 'Copy', shortcut: KeyboardShortcuts.edit.copy }, // shared/KeyboardShortcuts.ts:26 - Cmd+C
         { label: 'Paste', shortcut: KeyboardShortcuts.edit.paste }, // shared/KeyboardShortcuts.ts:28 - Cmd+V
+        { label: 'Paste as Text', shortcut: KeyboardShortcuts.edit.pasteAsText }, // shared/KeyboardShortcuts.ts:29 - Cmd+Shift+V
         { label: 'Select All', shortcut: KeyboardShortcuts.edit.selectAll }, // shared/KeyboardShortcuts.ts:29 - Cmd+A
         { label: 'Find', shortcut: KeyboardShortcuts.edit.find }, // shared/KeyboardShortcuts.ts:30 - Cmd+F
         { label: 'Find Next', shortcut: KeyboardShortcuts.edit.findNext }, // shared/KeyboardShortcuts.ts:31 - Cmd+G
@@ -153,6 +157,7 @@ export function KeyboardShortcutsDialog({ isOpen, onClose }: KeyboardShortcutsDi
         { label: 'Toggle AI Chat Panel', shortcut: KeyboardShortcuts.view.toggleAIChat }, // shared/KeyboardShortcuts.ts:46 - Cmd+Shift+A
         { label: 'Toggle Bottom Panel', shortcut: KeyboardShortcuts.view.toggleBottomPanel }, // shared/KeyboardShortcuts.ts:47 - Cmd+J
         { label: 'Toggle Terminal Panel', shortcut: KeyboardShortcuts.view.toggleTerminalPanel }, // shared/KeyboardShortcuts.ts:48 - Ctrl+`
+        { label: 'Toggle Claude CLI Terminal Drawer', shortcut: KeyboardShortcuts.view.toggleCliTerminalDrawer }, // Ctrl+Shift+` — active claude-code-cli session only
         { label: 'Tracker Mode', shortcut: KeyboardShortcuts.view.trackerMode }, // shared/KeyboardShortcuts.ts:49 - Cmd+T
         { label: 'Shared Documents', shortcut: KeyboardShortcuts.view.collabMode }, // shared/KeyboardShortcuts.ts:50 - Cmd+D
         { label: 'Toggle Sidebar', shortcut: KeyboardShortcuts.view.toggleSidebar }, // shared/KeyboardShortcuts.ts:51 - Cmd+B
@@ -174,6 +179,7 @@ export function KeyboardShortcutsDialog({ isOpen, onClose }: KeyboardShortcutsDi
         { label: 'Session Quick Open', shortcut: KeyboardShortcuts.window.sessionQuickOpen }, // shared/KeyboardShortcuts.ts:77 - Cmd+L
         { label: 'Prompt Quick Open', shortcut: KeyboardShortcuts.window.promptQuickOpen }, // shared/KeyboardShortcuts.ts:78 - Cmd+Shift+L
         { label: 'Content Search', shortcut: KeyboardShortcuts.window.contentSearch }, // shared/KeyboardShortcuts.ts:79 - Cmd+Shift+F
+        { label: 'Global Search (semantic)', shortcut: KeyboardShortcuts.window.globalSearch }, // shared/KeyboardShortcuts.ts - Cmd+Shift+O
         { label: 'New Worktree', shortcut: KeyboardShortcuts.window.newWorktree }, // shared/KeyboardShortcuts.ts:81 - Cmd+Alt+W
         { label: 'Settings', shortcut: KeyboardShortcuts.window.aiModels }, // shared/KeyboardShortcuts.ts:82 - Cmd+,
         { label: 'Minimize', shortcut: KeyboardShortcuts.window.minimize }, // shared/KeyboardShortcuts.ts:83 - Cmd+M
@@ -232,6 +238,14 @@ export function KeyboardShortcutsDialog({ isOpen, onClose }: KeyboardShortcutsDi
       ],
     },
   ];
+
+  if (developerMode) {
+    const viewGroup = generalShortcuts.find((group) => group.title === 'View');
+    viewGroup?.shortcuts.splice(8, 0, {
+      label: 'Pull Requests',
+      shortcut: KeyboardShortcuts.view.prReviewMode,
+    });
+  }
 
   const shortcutGroups = activeTab === 'general'
     ? generalShortcuts

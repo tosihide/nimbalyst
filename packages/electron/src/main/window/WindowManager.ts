@@ -13,13 +13,20 @@ import { ElectronDocumentService, setupDocumentServiceHandlers } from '../servic
 import { ElectronFileSystemService } from '../services/ElectronFileSystemService';
 import { isWorktreePath, resolveProjectPath } from '../utils/workspaceDetection';
 import { getPreloadPath } from '../utils/appPaths';
-import { setFileSystemService, clearFileSystemService } from '@nimbalyst/runtime';
+import {
+  setFileSystemService,
+  clearFileSystemService,
+  setFileSystemServiceFor,
+} from '@nimbalyst/runtime';
 import { navigationHistoryService } from '../services/NavigationHistoryService';
+import { signalFirstWindowLoaded } from '../services/startupMaintenanceGate';
 import { AnalyticsService } from '../services/analytics/AnalyticsService';
 import { FeatureTrackingService } from '../services/analytics/FeatureTrackingService';
 import { ExtensionLogService } from '../services/ExtensionLogService';
-import { getMcpConfigService } from '../index';
-import { windows, windowStates } from './windowState';
+import { getMcpConfigService } from '../mcpConfigServiceRef';
+import { addNimAssetRoot } from '../protocols/nimAssetProtocol';
+import { addNimPreviewWorkspaceRoot } from '../protocols/nimPreviewProtocol';
+import { windows, windowStates, anyWindowReferencesWorkspace, resolveDocumentServicePath } from './windowState';
 
 // Window management
 export { windows, windowStates };
@@ -87,8 +94,9 @@ export const recentlyDeletedFiles = {
 
 // Store document services for each workspace
 export const documentServices = new Map<string, ElectronDocumentService>();
-// Store file system services for each workspace
-const fileSystemServices = new Map<string, ElectronFileSystemService>();
+// File-system services live in a separate module so the multi-project rail
+// handlers can register/free them without importing this whole module.
+import { fileSystemServices } from './serviceRegistry';
 
 function resolveDocumentServiceForEvent(event: IpcMainEvent | IpcMainInvokeEvent): ElectronDocumentService | null {
     const browserWindow = BrowserWindow.fromWebContents(event.sender);
@@ -102,22 +110,15 @@ function resolveDocumentServiceForEvent(event: IpcMainEvent | IpcMainInvokeEvent
         return null;
     }
     const state = windowStates.get(windowId);
-    // Support both 'workspace' and 'agentic-coding' modes
-    if (!state || !state.workspacePath) {
-        // console.log('[DocumentService] Window has no workspace path:', {
-        //     hasState: !!state,
-        //     mode: state?.mode,
-        //     hasPath: !!state?.workspacePath
-        // });
+    // Honor the project rail's active selection (issue #591). Reading the raw
+    // primary `workspacePath` here leaked another project's tracker items when
+    // the visible project differed from the window's startup project.
+    const path = resolveDocumentServicePath(state);
+    if (!path) {
         return null;
     }
-    // Both workspace and agentic-coding windows should have document service access
-    if (state.mode !== 'workspace' && state.mode !== 'agentic-coding') {
-        // console.log('[DocumentService] Window not in supported mode:', state.mode);
-        return null;
-    }
-    const service = documentServices.get(state.workspacePath);
-    // console.log('[DocumentService] Resolved service for path:', state.workspacePath, '-> found:', !!service);
+    const service = documentServices.get(path);
+    // console.log('[DocumentService] Resolved service for path:', path, '-> found:', !!service);
     return service ?? null;
 }
 
@@ -240,7 +241,14 @@ export function createWindow(
                 nodeIntegration: false,
                 contextIsolation: true,
                 preload: preloadPath,
-                webSecurity: false,
+                // Issue #146: webSecurity enforces same-origin policy. We
+                // previously disabled it so the renderer could load workspace
+                // images via `<img src="file://...">`. Those four call sites
+                // (ImageViewer, ImageDiffViewer, HistoryDialog,
+                // AttachmentPreview) now go through the registered
+                // `nim-asset://` scheme (see protocols/nimAssetProtocol.ts),
+                // which is treated as same-origin by the renderer. Leaving
+                // webSecurity at its default (true).
                 webviewTag: false
             },
             show: false,
@@ -265,6 +273,15 @@ export function createWindow(
             workspacePath: isWorkspaceMode ? workspacePath : null,
             documentEdited: false
         });
+
+        // Issue #146: register the workspace path with the nim-asset protocol
+        // so the renderer can render workspace images via `nim-asset://`. This
+        // happens before the renderer mounts, so the allowlist is ready when
+        // image components first render.
+        if (isWorkspaceMode && workspacePath) {
+            addNimAssetRoot(workspacePath);
+            addNimPreviewWorkspaceRoot(workspacePath);
+        }
         if (isWorkspaceMode && workspacePath) {
             if (!documentServices.has(workspacePath)) {
                 const docService = new ElectronDocumentService(workspacePath);
@@ -277,6 +294,11 @@ export function createWindow(
                 fileSystemServices.set(workspacePath, fileSystemService);
                 // Set the file system service globally for the runtime
                 setFileSystemService(fileSystemService);
+                // Also register it in the per-path runtime registry so AI
+                // tool dispatch in inactive rail projects can resolve the
+                // correct workspace's service without falling back to the
+                // global (see fileTools.resolveFileSystemServiceForCall).
+                setFileSystemServiceFor(workspacePath, fileSystemService);
                 // console.log('[MAIN] Created FileSystemService for workspace:', workspacePath);
             }
 
@@ -414,37 +436,39 @@ export function createWindow(
             // Clean up navigation history for this window
             navigationHistoryService.removeWindow(windowId);
 
-            // Clean up document service if this was the last window for the workspace
-            if (state?.mode === 'workspace' && state.workspacePath) {
-                // Check if any other windows are using this workspace
-                const otherWorkspaceWindows = Array.from(windowStates.values())
-                    .filter(s => s.mode === 'workspace' && s.workspacePath === state.workspacePath);
+            // Clean up document/file-system services for any workspace this
+            // window referenced (its primary path AND any rail-warm
+            // additional paths). A path is freed only when no other window
+            // still references it — covers both window-per-project overlap
+            // and the multi-project rail.
+            if (state?.mode === 'workspace') {
+                const referencedPaths = new Set<string>();
+                if (state.workspacePath) referencedPaths.add(state.workspacePath);
+                state.additionalWorkspacePaths?.forEach((p) => referencedPaths.add(p));
 
-                if (otherWorkspaceWindows.length === 0) {
-                    // Clean up document service if no other windows are using it
-                    const docService = documentServices.get(state.workspacePath);
+                for (const path of referencedPaths) {
+                    if (anyWindowReferencesWorkspace(path)) continue;
+
+                    const docService = documentServices.get(path);
                     if (docService) {
                         docService.destroy();
-                        documentServices.delete(state.workspacePath);
-                        console.log('[MAIN] Destroyed DocumentService for workspace:', state.workspacePath);
+                        documentServices.delete(path);
+                        console.log('[MAIN] Destroyed DocumentService for workspace:', path);
                     }
-                    // Clean up file system service
-                    const fileSystemService = fileSystemServices.get(state.workspacePath);
+                    const fileSystemService = fileSystemServices.get(path);
                     if (fileSystemService) {
                         fileSystemService.destroy();
-                        fileSystemServices.delete(state.workspacePath);
+                        fileSystemServices.delete(path);
                         clearFileSystemService();
-                        console.log('[MAIN] Destroyed FileSystemService for workspace:', state.workspacePath);
+                        console.log('[MAIN] Destroyed FileSystemService for workspace:', path);
                     }
-                    // Stop watching MCP config for this workspace
                     try {
                         const mcpService = getMcpConfigService();
                         if (mcpService) {
-                            mcpService.stopWatchingWorkspaceConfig(state.workspacePath);
-                            console.log('[MAIN] Stopped watching MCP config for workspace:', state.workspacePath);
+                            mcpService.stopWatchingWorkspaceConfig(path);
+                            console.log('[MAIN] Stopped watching MCP config for workspace:', path);
                         }
                     } catch (error) {
-                        // Log error but don't throw - window cleanup must continue
                         console.error('[MAIN] Error stopping MCP config watcher:', error);
                     }
                 }
@@ -642,6 +666,11 @@ export function createWindow(
         window.webContents.once('did-finish-load', () => {
             // console.log('[MAIN] did-finish-load at', new Date().toISOString(), 'elapsed:', Date.now() - startTime, 'ms');
 
+            // Mark "first usable" so deferred startup maintenance (transcript
+            // backfill, etc.) is released only after the first window has
+            // painted, never competing with the queries that load it. NIM-899.
+            signalFirstWindowLoaded();
+
             // DO NOT send theme-change here - the window already got the theme via getThemeSync()
             // Sending it again causes a flash as React re-applies the same theme
             // Only send theme-change when user actually changes theme from menu
@@ -702,20 +731,43 @@ export function findWindowByFilePath(filePath: string): BrowserWindow | null {
  * @returns The BrowserWindow for that workspace, or null if not found
  */
 export function findWindowByWorkspace(workspacePath: string): BrowserWindow | null {
-    // First try exact match
+    // First try exact match — primary or any rail-warm additional path.
+    // Prefer windows where the path is currently active so MCP routes to
+    // the visible project when several windows host the same workspace.
+    let bestActiveMatch: BrowserWindow | null = null;
+    let bestAnyMatch: BrowserWindow | null = null;
+
     for (const [windowId, window] of windows) {
         const state = windowStates.get(windowId);
-        if (state?.workspacePath === workspacePath) {
-            return window;
+        if (!state) continue;
+
+        const isActive = (state.activeWorkspacePath ?? state.workspacePath) === workspacePath;
+        const isReferenced =
+            state.workspacePath === workspacePath ||
+            state.additionalWorkspacePaths?.includes(workspacePath) === true;
+
+        if (isActive) {
+            bestActiveMatch = window;
+            break;
+        }
+        if (isReferenced && !bestAnyMatch) {
+            bestAnyMatch = window;
         }
     }
+
+    if (bestActiveMatch) return bestActiveMatch;
+    if (bestAnyMatch) return bestAnyMatch;
 
     // If the given path is a worktree, try to find window by parent project path
     if (isWorktreePath(workspacePath)) {
         const projectPath = resolveProjectPath(workspacePath);
         for (const [windowId, window] of windows) {
             const state = windowStates.get(windowId);
-            if (state?.workspacePath === projectPath) {
+            if (!state) continue;
+            if (
+                state.workspacePath === projectPath ||
+                state.additionalWorkspacePaths?.includes(projectPath)
+            ) {
                 return window;
             }
         }
@@ -724,9 +776,13 @@ export function findWindowByWorkspace(workspacePath: string): BrowserWindow | nu
     // If the given path is a project path, check if any window is a worktree of that project
     for (const [windowId, window] of windows) {
         const state = windowStates.get(windowId);
-        if (state?.workspacePath && isWorktreePath(state.workspacePath)) {
-            const windowProjectPath = resolveProjectPath(state.workspacePath);
-            if (windowProjectPath === workspacePath) {
+        if (!state) continue;
+        const candidatePaths: string[] = [];
+        if (state.workspacePath) candidatePaths.push(state.workspacePath);
+        if (state.additionalWorkspacePaths) candidatePaths.push(...state.additionalWorkspacePaths);
+
+        for (const candidate of candidatePaths) {
+            if (isWorktreePath(candidate) && resolveProjectPath(candidate) === workspacePath) {
                 return window;
             }
         }

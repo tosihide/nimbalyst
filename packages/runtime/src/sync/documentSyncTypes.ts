@@ -1,10 +1,34 @@
 /**
  * Types for DocumentSync -- client-side Yjs + encryption layer.
  *
- * These are the client-side equivalents of the DocClientMessage/DocServerMessage
- * types defined in collabv3/src/types.ts. Duplicated here to avoid a dependency
- * on the collabv3 package (which is a Cloudflare Worker, not a library).
+ * Wire-protocol message shapes come from `@nimbalyst/collab-protocol` and
+ * are shared with the sync server. This file adds the client-side config
+ * surface, review-gate state, and awareness types the renderer consumes.
  */
+
+import type { KeyEnvelopeMessage as ProtocolKeyEnvelopeMessage } from '@nimbalyst/collab-protocol';
+
+export type {
+  DocClientMessage,
+  DocServerMessage,
+  DocSyncRequestMessage,
+  DocUpdateMessage,
+  DocCompactMessage,
+  DocAwarenessMessage,
+  AddKeyEnvelopeMessage,
+  RequestKeyEnvelopeMessage,
+  DocSetMetadataMessage,
+  DocSyncResponseMessage,
+  DocUpdateBroadcastMessage,
+  DocUpdateAckMessage,
+  DocAwarenessBroadcastMessage,
+  DocErrorMessage,
+  EncryptedDocUpdate,
+  EncryptedDocSnapshot,
+} from '@nimbalyst/collab-protocol';
+
+/** Wire key-envelope delivery message (`type: 'keyEnvelope'`). */
+export type DocKeyEnvelopeMessage = ProtocolKeyEnvelopeMessage;
 
 // ============================================================================
 // Configuration
@@ -14,14 +38,53 @@ export interface DocumentSyncConfig {
   /** WebSocket server URL (e.g., wss://sync.nimbalyst.com) */
   serverUrl: string;
 
-  /** Function to get fresh JWT for WebSocket auth */
-  getJwt: () => Promise<string>;
+  /**
+   * Function to get a fresh JWT for WebSocket auth.
+   * `forceRefresh` (NIM-949) bypasses any cached org-scoped token so a reconnect
+   * after an auth-style rejection (HTTP 400 wrong-org/expired) re-exchanges.
+   */
+  getJwt: (opts?: { forceRefresh?: boolean }) => Promise<string>;
 
   /** B2B organization ID */
   orgId: string;
 
-  /** AES-256-GCM key for encrypting/decrypting Yjs updates */
-  documentKey: CryptoKey;
+  /**
+   * Epic H2 key custody. `legacy-e2e` (default): the client encrypts/decrypts
+   * Yjs updates with `documentKey` (zero-knowledge). `server-managed`: the
+   * server holds the per-team DEK and encrypts at rest, so the client sends and
+   * receives PLAINTEXT (base64 raw bytes, no iv) and `documentKey` is unused.
+   */
+  keyCustody?: 'legacy-e2e' | 'server-managed';
+
+  /**
+   * AES-256-GCM key for encrypting/decrypting Yjs updates. Required in
+   * `legacy-e2e` mode; unused (and optional) in `server-managed` mode.
+   */
+  documentKey?: CryptoKey;
+
+  /**
+   * Legacy org key for reading PRE-MIGRATION rows in `server-managed` mode.
+   *
+   * When a team migrates legacy-e2e -> server-managed, rows written before the
+   * flip are still AES-ciphertext (the server passes them through with their
+   * original iv; only DEK-fingerprinted rows are server-decrypted to plaintext
+   * with an empty-iv sentinel). To read those old rows the client must AES-
+   * decrypt them with the original org key. This holds that key so server-
+   * managed docs can still surface their legacy history. Optional: absent when
+   * the legacy envelope is unavailable (those rows then skip, never crash).
+   */
+  legacyDocumentKey?: CryptoKey;
+
+  /**
+   * NIM-959: every candidate legacy org-key epoch for reading PRE-MIGRATION
+   * rows in `server-managed` mode. A team that rotated its org key while still
+   * legacy-e2e can have content rows spanning multiple epochs; the doc-content
+   * read path must try each (the doc INDEX path already does this for titles,
+   * NIM-906/910). `decryptFromWire` tries these in order until one succeeds, so
+   * a snapshot written under a now-archived epoch still decrypts instead of
+   * blanking the document body. Superset of `legacyDocumentKey` when present.
+   */
+  legacyDocumentKeys?: CryptoKey[];
 
   /** Current user's ID */
   userId: string;
@@ -85,6 +148,13 @@ export interface DocumentSyncConfig {
     senderPublicKey: string;
     senderUserId: string;
   }) => void;
+
+  /**
+   * Epic H3 P1: called when the server reports this document room was relocated
+   * to another org by the move engine. The doc id is unchanged; the host should
+   * re-resolve which org owns the document and reconnect.
+   */
+  onRoomMoved?: (dest: { destOrgId: string }) => void;
 
   /**
    * Enable the review gate for remote changes.
@@ -157,98 +227,27 @@ export type DocumentSyncStatus =
  */
 export type SerializedRelativePosition = string; // base64 encoded
 
-export interface AwarenessState {
-  /**
-   * Cursor/selection as Yjs relative positions.
-   * Anchor = start of selection, head = end of selection (may be equal for a collapsed cursor).
-   * Encoded as base64 Yjs relative positions for wire transmission.
-   */
+/**
+ * Awareness state carried over the encrypted broadcast.
+ *
+ * Two shapes coexist on this wire:
+ * - Markdown (Lexical) sends `{ cursor?: { anchor, head }, user: { name, color } }`.
+ * - Extension editors send the y-protocols Awareness state, which always
+ *   includes a `user: { id, name, color }` standard block plus arbitrary
+ *   editor-specific keys (e.g. `selectedElementIds`, `tool`, `editingNodeId`).
+ *
+ * Server-side validation: none. The DocumentRoom relays the encrypted blob
+ * verbatim. This is a private protocol consumed only by Nimbalyst clients,
+ * so widening the type here is safe.
+ */
+export type AwarenessState = Record<string, unknown> & {
+  /** Required user block. `id` is optional in the markdown path; required in
+   *  the extension path so the SDK hook can dedupe remote collaborators by
+   *  stable user id rather than y-protocols clientID. */
+  user: { name: string; color: string; id?: string; [k: string]: unknown };
+  /** Lexical-style cursor block (markdown path only). */
   cursor?: {
     anchor: SerializedRelativePosition;
     head: SerializedRelativePosition;
   };
-  /** User info for rendering remote cursors */
-  user: { name: string; color: string };
-}
-
-// ============================================================================
-// Wire Protocol (client-side copies of collabv3 types)
-// ============================================================================
-
-/** Client -> Server messages */
-export type DocClientMessage =
-  | { type: 'docSyncRequest'; sinceSeq: number }
-  | { type: 'docUpdate'; encryptedUpdate: string; iv: string; clientUpdateId?: string; orgKeyFingerprint?: string }
-  | { type: 'docCompact'; encryptedState: string; iv: string; replacesUpTo: number; orgKeyFingerprint?: string }
-  | { type: 'docAwareness'; encryptedState: string; iv: string }
-  | { type: 'addKeyEnvelope'; targetUserId: string; wrappedKey: string; iv: string; senderPublicKey: string }
-  | { type: 'requestKeyEnvelope' }
-  | { type: 'docSetMetadata'; entries: Record<string, string> };
-
-/** Server -> Client messages */
-export type DocServerMessage =
-  | DocSyncResponseMessage
-  | DocUpdateBroadcastMessage
-  | DocUpdateAckMessage
-  | DocAwarenessBroadcastMessage
-  | DocKeyEnvelopeMessage
-  | DocErrorMessage;
-
-export interface DocSyncResponseMessage {
-  type: 'docSyncResponse';
-  updates: EncryptedDocUpdate[];
-  snapshot?: EncryptedDocSnapshot;
-  hasMore: boolean;
-  cursor: number;
-}
-
-export interface DocUpdateBroadcastMessage {
-  type: 'docUpdateBroadcast';
-  encryptedUpdate: string;
-  iv: string;
-  senderId: string;
-  sequence: number;
-}
-
-export interface DocUpdateAckMessage {
-  type: 'docUpdateAck';
-  clientUpdateId: string;
-  sequence: number;
-}
-
-export interface DocAwarenessBroadcastMessage {
-  type: 'docAwarenessBroadcast';
-  encryptedState: string;
-  iv: string;
-  fromUserId: string;
-}
-
-export interface DocKeyEnvelopeMessage {
-  type: 'keyEnvelope';
-  wrappedKey: string;
-  iv: string;
-  senderPublicKey: string;
-  /** User ID of the sender who created this envelope */
-  senderUserId: string;
-}
-
-export interface DocErrorMessage {
-  type: 'error';
-  code: string;
-  message: string;
-}
-
-export interface EncryptedDocUpdate {
-  sequence: number;
-  encryptedUpdate: string;
-  iv: string;
-  senderId: string;
-  createdAt: number;
-}
-
-export interface EncryptedDocSnapshot {
-  encryptedState: string;
-  iv: string;
-  replacesUpTo: number;
-  createdAt: number;
-}
+};

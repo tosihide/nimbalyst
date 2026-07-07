@@ -7,12 +7,8 @@ import {
   syncConfigAtom,
   setSyncConfigAtom,
   releaseChannelAtom,
-  advancedSettingsAtom,
-  setAdvancedSettingsAtom,
   type SyncConfig,
 } from '../../../store/atoms/appSettings';
-import { AlphaBadge } from '../../common/AlphaBadge';
-import { SettingsToggle } from '../SettingsToggle';
 
 /** Format a timestamp as relative time (e.g., "5 minutes ago") */
 function formatRelativeTime(timestamp: number): string {
@@ -123,11 +119,6 @@ export function SyncPanel() {
   const [, updateConfig] = useAtom(setSyncConfigAtom);
   const releaseChannel = useAtomValue(releaseChannelAtom);
   const isAlpha = releaseChannel === 'alpha';
-
-  // Collaboration alpha feature -- enables the Team and Trackers settings panels.
-  const [advancedSettings] = useAtom(advancedSettingsAtom);
-  const [, updateAdvancedSettings] = useAtom(setAdvancedSettingsAtom);
-  const collaborationEnabled = advancedSettings.alphaFeatures.collaboration ?? false;
 
   // Compute effective server URL early so it can be used throughout
   // Only honor config.environment in dev builds - production always uses production sync
@@ -341,6 +332,49 @@ export function SyncPanel() {
     }
   };
 
+  // Per-project doc sync UI feedback (Docs checkbox): pending while the toggle
+  // is applied, then live status (connected + file count) or an error.
+  interface DocSyncUiStatus {
+    pending: boolean;
+    error: string | null;
+    subscribed?: boolean;
+    connected?: boolean;
+    fileCount?: number;
+  }
+  const [docSyncStatus, setDocSyncStatus] = useState<Record<string, DocSyncUiStatus>>({});
+
+  const updateDocSyncStatus = (projectPath: string, updates: Partial<DocSyncUiStatus>) => {
+    setDocSyncStatus(prev => {
+      const existing: DocSyncUiStatus = prev[projectPath] ?? { pending: false, error: null };
+      return { ...prev, [projectPath]: { ...existing, ...updates } };
+    });
+  };
+
+  const fetchDocSyncStatus = async (projectPath: string): Promise<boolean> => {
+    try {
+      const result = await window.electronAPI.invoke('sync:get-doc-sync-status', projectPath);
+      if (result?.success) {
+        updateDocSyncStatus(projectPath, {
+          subscribed: result.subscribed,
+          connected: result.connected,
+          fileCount: result.fileCount,
+        });
+        return !!result.connected;
+      }
+    } catch {
+      // Non-fatal; leave prior status in place
+    }
+    return false;
+  };
+
+  // Load status for projects that already have doc sync enabled
+  useEffect(() => {
+    for (const projectPath of config.docSyncEnabledProjects ?? []) {
+      fetchDocSyncStatus(projectPath);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   const handleDocSyncToggle = async (projectPath: string, enabled: boolean) => {
     const current = config.docSyncEnabledProjects ?? [];
     const updated = enabled
@@ -349,12 +383,43 @@ export function SyncPanel() {
 
     const newConfig = { ...config, docSyncEnabledProjects: updated };
     setConfig(newConfig);
+    updateDocSyncStatus(projectPath, { pending: true, error: null });
 
     try {
       await window.electronAPI.invoke('sync:set-config', newConfig);
     } catch (error) {
       console.error('[SyncPanel] Failed to toggle doc sync:', error);
+      // Revert the checkbox so the UI reflects what is actually persisted
+      setConfig({ ...config, docSyncEnabledProjects: current });
+      updateDocSyncStatus(projectPath, {
+        pending: false,
+        error: `Failed to ${enabled ? 'enable' : 'disable'} document sync: ${error instanceof Error ? error.message : String(error)}`,
+      });
+      return;
     }
+
+    if (!enabled) {
+      setDocSyncStatus(prev => {
+        const next = { ...prev };
+        delete next[projectPath];
+        return next;
+      });
+      return;
+    }
+
+    // The initial sweep + room connection are async; poll until connected so
+    // the user sees the toggle actually take effect (or an error if it never does).
+    for (const delayMs of [700, 1500, 3000, 5000]) {
+      await new Promise(resolve => setTimeout(resolve, delayMs));
+      if (await fetchDocSyncStatus(projectPath)) {
+        updateDocSyncStatus(projectPath, { pending: false, error: null });
+        return;
+      }
+    }
+    updateDocSyncStatus(projectPath, {
+      pending: false,
+      error: 'Document sync did not connect. Check your connection, then toggle again or restart the app.',
+    });
   };
 
   const handleFieldChange = (field: keyof SyncConfig, value: string | boolean | number) => {
@@ -513,33 +578,6 @@ export function SyncPanel() {
         </p>
       </div>
 
-      {/* Team Collaboration (alpha) */}
-      <div className="provider-panel-section py-4 mb-4 border-b border-[var(--nim-border)]">
-        <div className="flex items-center gap-2 mb-2">
-          <h4 className="provider-panel-section-title text-base font-semibold text-[var(--nim-text)] m-0">Team Collaboration</h4>
-          <AlphaBadge size="sm" />
-        </div>
-        <SettingsToggle
-          variant="enable"
-          name="Enable team collaboration"
-          description="Adds shared trackers and team management. Reveals Team and Trackers settings panels."
-          checked={collaborationEnabled}
-          onChange={(checked) => {
-            updateAdvancedSettings({
-              alphaFeatures: {
-                ...advancedSettings.alphaFeatures,
-                collaboration: checked,
-              },
-            });
-            posthog?.capture('alpha_feature_toggled', {
-              feature_tag: 'collaboration',
-              enabled: checked,
-              source: 'sync_panel',
-            });
-          }}
-        />
-      </div>
-
       {/* Environment Toggle - Dev Only */}
       {/*{isDevelopment && (*/}
       {false && (
@@ -550,7 +588,7 @@ export function SyncPanel() {
               onClick={() => handleEnvironmentSwitch('development')}
               className={`flex-1 px-3 py-2 text-xs border border-nim rounded-md cursor-pointer ${
                 currentEnvironment === 'development'
-                  ? 'bg-nim-primary text-white font-semibold'
+                  ? 'bg-nim-primary text-nim-on-primary font-semibold'
                   : 'bg-nim-secondary text-nim-muted font-normal'
               }`}
             >
@@ -560,7 +598,7 @@ export function SyncPanel() {
               onClick={() => handleEnvironmentSwitch('production')}
               className={`flex-1 px-3 py-2 text-xs border border-nim rounded-md cursor-pointer ${
                 currentEnvironment === 'production'
-                  ? 'bg-nim-primary text-white font-semibold'
+                  ? 'bg-nim-primary text-nim-on-primary font-semibold'
                   : 'bg-nim-secondary text-nim-muted font-normal'
               }`}
             >
@@ -626,7 +664,7 @@ export function SyncPanel() {
               })
             ) : (
               <div className="flex items-center gap-3 p-2.5 bg-nim-secondary rounded-lg">
-                <div className="w-9 h-9 rounded-full bg-nim-primary flex items-center justify-center text-white font-semibold text-sm">
+                <div className="w-9 h-9 rounded-full bg-nim-primary flex items-center justify-center text-nim-on-primary font-semibold text-sm">
                   {(stytchAuth.user.name?.first_name?.[0] || stytchAuth.user.emails[0]?.email[0] || '?').toUpperCase()}
                 </div>
                 <div className="flex-1">
@@ -725,7 +763,7 @@ export function SyncPanel() {
                   <button
                     type="submit"
                     disabled={authLoading || !isStytchAvailable || !email}
-                    className={`w-full px-4 py-2.5 bg-nim-primary border-none rounded-md text-white font-medium text-[13px] ${
+                    className={`w-full px-4 py-2.5 bg-nim-primary border-none rounded-md text-nim-on-primary font-medium text-[13px] ${
                       authLoading ? 'cursor-wait' : 'cursor-pointer'
                     } ${(authLoading || !email) ? 'opacity-70' : 'opacity-100'}`}
                   >
@@ -760,7 +798,7 @@ export function SyncPanel() {
             <button
               onClick={() => setShowAuthForm(true)}
               disabled={!isStytchAvailable}
-              className={`px-5 py-2 bg-nim-primary border-none rounded-md text-white font-medium text-[13px] ${
+              className={`px-5 py-2 bg-nim-primary border-none rounded-md text-nim-on-primary font-medium text-[13px] ${
                 isStytchAvailable ? 'cursor-pointer opacity-100' : 'cursor-not-allowed opacity-50'
               }`}
             >
@@ -813,7 +851,7 @@ export function SyncPanel() {
               </div>
               {/* Pair Device button - right side of card */}
               <button
-                  className="self-center flex flex-col items-center gap-1.5 px-4 py-2.5 bg-nim-primary border-none rounded-lg text-white text-[14px] font-medium cursor-pointer hover:bg-nim-primary-hover disabled:opacity-50 disabled:cursor-not-allowed shrink-0"
+                  className="self-center flex flex-col items-center gap-1.5 px-4 py-2.5 bg-nim-primary border-none rounded-lg text-nim-on-primary text-[14px] font-medium cursor-pointer hover:bg-nim-primary-hover disabled:opacity-50 disabled:cursor-not-allowed shrink-0"
                   onClick={() => {
                     if (enabledProjectCount === 0) {
                       setPairError('Enable at least one project to sync before pairing your device.');
@@ -912,27 +950,60 @@ export function SyncPanel() {
           <div className="bg-nim-secondary rounded-lg overflow-hidden">
             {syncedProjects.map((project) => {
               const docSyncEnabled = (config.docSyncEnabledProjects ?? []).includes(project.path);
+              const status = docSyncStatus[project.path];
               return (
-                <div key={project.path} className="flex items-center gap-2 px-2.5 py-1.5 border-b border-[var(--nim-border)] last:border-b-0 group">
-                  <span className="text-[13px] text-nim truncate flex-1">{project.name}</span>
-                  {isAlpha && (
-                    <label className="flex items-center gap-1 cursor-pointer shrink-0" title="Sync .md files to mobile">
-                      <input
-                        type="checkbox"
-                        checked={docSyncEnabled}
-                        onChange={(e) => handleDocSyncToggle(project.path, e.target.checked)}
-                        className="w-3 h-3 cursor-pointer accent-[var(--nim-primary)]"
-                      />
-                      <span className="text-[10px] text-nim-faint">Docs</span>
-                    </label>
+                <div key={project.path} className="border-b border-[var(--nim-border)] last:border-b-0 group">
+                  <div className="flex items-center gap-2 px-2.5 py-1.5">
+                    <span className="text-[13px] text-nim truncate flex-1">{project.name}</span>
+                    {isAlpha && docSyncEnabled && status && (
+                      status.pending ? (
+                        <span className="flex items-center gap-1 text-[10px] text-nim-faint shrink-0" title="Starting document sync">
+                          <MaterialSymbol icon="progress_activity" size={12} className="animate-spin" />
+                          Syncing...
+                        </span>
+                      ) : status.error ? (
+                        <span className="flex items-center gap-1 text-[10px] text-nim-error shrink-0" title={status.error}>
+                          <MaterialSymbol icon="error" size={12} />
+                          Error
+                        </span>
+                      ) : status.connected ? (
+                        <span
+                          className="flex items-center gap-1 text-[10px] text-nim-faint shrink-0"
+                          title={`Document sync connected (${status.fileCount ?? 0} files)`}
+                        >
+                          <span className="w-1.5 h-1.5 rounded-full bg-nim-success" />
+                          {status.fileCount ?? 0} docs
+                        </span>
+                      ) : (
+                        <span className="flex items-center gap-1 text-[10px] text-nim-warning shrink-0" title="Document sync is enabled but not connected">
+                          <span className="w-1.5 h-1.5 rounded-full bg-nim-warning" />
+                          Not connected
+                        </span>
+                      )
+                    )}
+                    {isAlpha && (
+                      <label className="flex items-center gap-1 cursor-pointer shrink-0" title="Sync .md files to mobile">
+                        <input
+                          type="checkbox"
+                          checked={docSyncEnabled}
+                          disabled={status?.pending}
+                          onChange={(e) => handleDocSyncToggle(project.path, e.target.checked)}
+                          className="w-3 h-3 cursor-pointer accent-[var(--nim-primary)]"
+                        />
+                        <span className="text-[10px] text-nim-faint">Docs</span>
+                      </label>
+                    )}
+                    <button
+                      onClick={() => handleRemoveProject(project.path)}
+                      className="opacity-0 group-hover:opacity-100 p-0.5 bg-transparent border-none text-nim-faint cursor-pointer hover:text-nim-muted shrink-0"
+                      title="Remove from sync"
+                    >
+                      <MaterialSymbol icon="close" size={14} />
+                    </button>
+                  </div>
+                  {isAlpha && status?.error && (
+                    <p className="m-0 px-2.5 pb-1.5 text-[10px] text-nim-error">{status.error}</p>
                   )}
-                  <button
-                    onClick={() => handleRemoveProject(project.path)}
-                    className="opacity-0 group-hover:opacity-100 p-0.5 bg-transparent border-none text-nim-faint cursor-pointer hover:text-nim-muted shrink-0"
-                    title="Remove from sync"
-                  >
-                    <MaterialSymbol icon="close" size={14} />
-                  </button>
                 </div>
               );
             })}

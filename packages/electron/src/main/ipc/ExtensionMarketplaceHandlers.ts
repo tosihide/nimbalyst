@@ -15,7 +15,7 @@ import * as path from 'path';
 import * as os from 'os';
 import * as crypto from 'crypto';
 import { spawn } from 'child_process';
-import extractZip from 'extract-zip';
+import AdmZip from 'adm-zip';
 import { BrowserWindow, net } from 'electron';
 import { logger } from '../utils/logger';
 import { safeHandle } from '../utils/ipcRegistry';
@@ -28,12 +28,21 @@ import {
   updateMarketplaceInstall,
   type MarketplaceInstallRecord,
 } from '../utils/store';
+import {
+  selectReleaseAsset,
+  type GitHubReleaseAsset,
+} from './extensionReleaseAsset';
+import { getAgentProviderRegistry } from '../extensions/AgentProviderRegistry';
 
 // Import mock registry data (used as fallback when live registry is unreachable)
 import mockRegistry from '../data/extensionRegistry.json';
 
 // Live registry URL -- served by the marketplace Cloudflare Worker
 const REGISTRY_URL = 'https://extensions.nimbalyst.com/registry';
+
+const RENAMED_EXTENSION_IDS: Record<string, string> = {
+  'com.developer.nimbalyst-mindmap': 'com.nimbalyst.mindmap',
+};
 
 // Registry cache
 let registryCache: RegistryData | null = null;
@@ -170,6 +179,87 @@ async function copyDirectory(src: string, dest: string): Promise<void> {
   }
 }
 
+interface ParsedManifest {
+  id?: string;
+  name?: string;
+  version?: string;
+  main?: string;
+  contributions?: Record<string, unknown>;
+}
+
+// Mirrors onlyThemes / onlyClaudePlugin validation in ExtensionLoader.ts: these
+// extension shapes have no JS to run, so a dist/ directory is not required.
+export function isManifestOnlyExtension(manifest: ParsedManifest): boolean {
+  const c = manifest.contributions;
+  if (!c) return false;
+
+  const onlyClaudePlugin = c.claudePlugin &&
+    !c.customEditors && !c.documentHeaders && !c.aiTools && !c.slashCommands &&
+    !c.nodes && !c.transformers && !c.hostComponents && !c.panels &&
+    !c.settingsPanel && !c.newFileMenu && !c.configuration && !c.themes;
+
+  const onlyThemes = c.themes &&
+    !c.claudePlugin && !c.customEditors && !c.documentHeaders && !c.aiTools &&
+    !c.slashCommands && !c.nodes && !c.transformers && !c.hostComponents &&
+    !c.panels && !c.settingsPanel && !c.newFileMenu && !c.configuration;
+
+  const noMain = typeof manifest.main !== 'string' || !manifest.main;
+
+  return Boolean((onlyClaudePlugin || onlyThemes) && noMain);
+}
+
+// ---------------------------------------------------------------------------
+// GitHub release lookup
+// ---------------------------------------------------------------------------
+
+interface GitHubRelease {
+  tag_name: string;
+  assets: GitHubReleaseAsset[];
+}
+
+/**
+ * Fetch the "latest" release for a repo. Returns null on 404 (no release).
+ * Throws on other network/protocol errors so the caller can decide whether
+ * to surface them or quietly fall through.
+ *
+ * Uses `/releases/latest`, which excludes prereleases by GitHub's definition.
+ * Unauthenticated -- rate-limited to 60 req/hour per IP, which is fine for
+ * a click-to-install UX.
+ */
+async function fetchLatestRelease(owner: string, repo: string): Promise<GitHubRelease | null> {
+  const url = `https://api.github.com/repos/${owner}/${repo}/releases/latest`;
+  const response = await net.fetch(url, {
+    headers: { 'Accept': 'application/vnd.github+json' },
+  });
+  if (response.status === 404) {
+    return null;
+  }
+  if (!response.ok) {
+    throw new Error(`GitHub API returned ${response.status}`);
+  }
+  return await response.json() as GitHubRelease;
+}
+
+// ---------------------------------------------------------------------------
+// Install progress reporting
+// ---------------------------------------------------------------------------
+
+export type InstallProgressStage =
+  | 'checking-release'
+  | 'downloading-release'
+  | 'cloning'
+  | 'installing'
+  | 'done';
+
+export interface InstallProgressEvent {
+  stage: InstallProgressStage;
+  message: string;
+}
+
+type ProgressReporter = (event: InstallProgressEvent) => void;
+
+const noopProgress: ProgressReporter = () => {};
+
 /**
  * Download a file using Electron's net module.
  * Returns the path to the downloaded temp file.
@@ -200,16 +290,141 @@ async function verifyChecksum(filePath: string, expectedChecksum: string): Promi
 /**
  * Extract a .nimext (zip) file to a directory.
  *
- * Uses the pure-JS `extract-zip` package so this works on Windows (where there
- * is no system `unzip` binary) in addition to macOS and Linux.
+ * Uses the pure-JS `adm-zip` package so this works on Windows (where there is
+ * no system `unzip` binary) in addition to macOS and Linux. `extract-zip` is
+ * unusable here: its yauzl/fd-slicer stream stack deadlocks after the first
+ * entry on Node 24+ (Electron >= 41), leaving the install invoke pending
+ * forever ("reply was never sent") -- see GitHub issue #755 / NIM-1513.
  */
 async function extractNimext(nimextPath: string, destPath: string): Promise<void> {
   await fs.mkdir(destPath, { recursive: true });
-  await extractZip(nimextPath, { dir: destPath });
+  const zip = new AdmZip(nimextPath);
+  // Zip-slip guard: reject any entry that would resolve outside destPath.
+  const destRoot = path.resolve(destPath);
+  for (const entry of zip.getEntries()) {
+    const target = path.resolve(destRoot, entry.entryName);
+    if (target !== destRoot && !target.startsWith(destRoot + path.sep)) {
+      throw new Error(`Archive entry escapes destination directory: ${entry.entryName}`);
+    }
+  }
+  zip.extractAllTo(destPath, true);
+}
+
+interface InstallFromPackageUrlOptions {
+  /** URL to download the .nimext/.zip package from. */
+  downloadUrl: string;
+  /** Optional SHA-256 checksum for integrity verification. */
+  expectedChecksum?: string;
+  /**
+   * Optional expected extension id. When set, the package's manifest.id must
+   * match exactly. Used by the curated marketplace where the id is known
+   * upfront from the registry entry.
+   */
+  expectedExtensionId?: string;
+  /** Constructs the MarketplaceInstallRecord from the parsed manifest. */
+  buildRecord: (manifest: ParsedManifest) => MarketplaceInstallRecord;
+  /** Short tag for logging (e.g. "marketplace", "github-release"). */
+  logTag: string;
+  progress?: ProgressReporter;
 }
 
 /**
- * Install an extension from a download URL (.nimext zip file).
+ * Shared download-extract-validate-register flow for any pre-built extension
+ * package (a `.nimext` or `.zip` containing a top-level `manifest.json`).
+ *
+ * Extracts to a staging directory first so a broken package does not wipe
+ * out an existing installation.
+ */
+async function installFromPackageUrl(opts: InstallFromPackageUrlOptions): Promise<InstallResult> {
+  const progress = opts.progress ?? noopProgress;
+  const extensionsDir = await getUserExtensionsDirectory();
+  let tempFile: string | null = null;
+  let stagingPath: string | null = null;
+
+  try {
+    if (!opts.downloadUrl) {
+      return { success: false, error: 'No download URL available' };
+    }
+
+    // 1. Download
+    logger.main.info(`[ExtMarketplace] [${opts.logTag}] downloading: ${opts.downloadUrl}`);
+    tempFile = await downloadFile(opts.downloadUrl);
+
+    // 2. Verify checksum (if provided)
+    if (opts.expectedChecksum) {
+      const valid = await verifyChecksum(tempFile, opts.expectedChecksum);
+      if (!valid) {
+        return { success: false, error: 'Checksum verification failed. The download may be corrupted or tampered with.' };
+      }
+      logger.main.info(`[ExtMarketplace] [${opts.logTag}] checksum verified`);
+    }
+
+    // 3. Extract to a staging directory
+    stagingPath = path.join(extensionsDir, `.staging-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+    try {
+      await extractNimext(tempFile, stagingPath);
+    } catch (err) {
+      const errMsg = err instanceof Error ? err.message : String(err);
+      return { success: false, error: `Package is not a valid Nimbalyst extension archive: ${errMsg}` };
+    }
+
+    // 4. Read + validate manifest
+    const manifestPath = path.join(stagingPath, 'manifest.json');
+    let manifestContent: string;
+    try {
+      manifestContent = await fs.readFile(manifestPath, 'utf-8');
+    } catch {
+      return { success: false, error: 'Package is missing manifest.json at the top level.' };
+    }
+    let manifest: ParsedManifest;
+    try {
+      manifest = JSON.parse(manifestContent);
+    } catch {
+      return { success: false, error: 'Package has an invalid manifest.json (could not parse JSON).' };
+    }
+    if (!manifest.id) {
+      return { success: false, error: 'Package manifest.json missing required "id" field.' };
+    }
+    if (opts.expectedExtensionId && manifest.id !== opts.expectedExtensionId) {
+      return {
+        success: false,
+        error: `Package manifest id "${manifest.id}" does not match expected "${opts.expectedExtensionId}".`,
+      };
+    }
+
+    const extensionId = manifest.id;
+    const finalInstallPath = path.join(extensionsDir, extensionId);
+
+    // 5. Replace any existing installation by moving staging to final
+    progress({ stage: 'installing', message: `Installing ${extensionId}...` });
+    await fs.rm(finalInstallPath, { recursive: true, force: true });
+    await fs.rename(stagingPath, finalInstallPath);
+    stagingPath = null; // Moved successfully; do not clean up in finally
+
+    // 6. Track + notify
+    addMarketplaceInstall(opts.buildRecord(manifest));
+    await initializeExtensionFileTypes();
+    notifyExtensionsChanged(extensionId, finalInstallPath);
+
+    logger.main.info(`[ExtMarketplace] [${opts.logTag}] installed ${extensionId} v${manifest.version ?? '0.0.0'}`);
+    return { success: true, extensionId };
+
+  } catch (err) {
+    const errorMsg = err instanceof Error ? err.message : String(err);
+    logger.main.error(`[ExtMarketplace] [${opts.logTag}] install failed:`, err);
+    return { success: false, error: errorMsg };
+  } finally {
+    if (stagingPath) {
+      try { await fs.rm(stagingPath, { recursive: true, force: true }); } catch { /* ignore */ }
+    }
+    if (tempFile) {
+      try { await fs.unlink(tempFile); } catch { /* ignore */ }
+    }
+  }
+}
+
+/**
+ * Install an extension from a curated-marketplace download URL.
  */
 async function installFromUrl(
   extensionId: string,
@@ -217,51 +432,12 @@ async function installFromUrl(
   expectedChecksum: string,
   version: string,
 ): Promise<InstallResult> {
-  const extensionsDir = await getUserExtensionsDirectory();
-  const installPath = path.join(extensionsDir, extensionId);
-  let tempFile: string | null = null;
-
-  try {
-    logger.main.info(`[ExtMarketplace] Installing extension: ${extensionId} v${version}`);
-
-    if (!downloadUrl) {
-      return { success: false, error: 'No download URL available' };
-    }
-
-    // 1. Download .nimext file
-    logger.main.info(`[ExtMarketplace] Downloading: ${downloadUrl}`);
-    tempFile = await downloadFile(downloadUrl);
-
-    // 2. Verify checksum
-    if (expectedChecksum) {
-      const valid = await verifyChecksum(tempFile, expectedChecksum);
-      if (!valid) {
-        return { success: false, error: 'Checksum verification failed. The download may be corrupted or tampered with.' };
-      }
-      logger.main.info(`[ExtMarketplace] Checksum verified for ${extensionId}`);
-    }
-
-    // 3. Remove existing installation if present
-    try {
-      await fs.rm(installPath, { recursive: true, force: true });
-    } catch {
-      // Not installed yet
-    }
-
-    // 4. Extract to install path
-    await extractNimext(tempFile, installPath);
-
-    // 5. Verify manifest.json exists
-    const manifestPath = path.join(installPath, 'manifest.json');
-    try {
-      await fs.access(manifestPath);
-    } catch {
-      await fs.rm(installPath, { recursive: true, force: true });
-      return { success: false, error: 'Invalid .nimext package: missing manifest.json' };
-    }
-
-    // 6. Track the install
-    addMarketplaceInstall({
+  logger.main.info(`[ExtMarketplace] Installing extension: ${extensionId} v${version}`);
+  return installFromPackageUrl({
+    downloadUrl,
+    expectedChecksum: expectedChecksum || undefined,
+    expectedExtensionId: extensionId,
+    buildRecord: () => ({
       extensionId,
       version,
       installedAt: new Date().toISOString(),
@@ -269,61 +445,113 @@ async function installFromUrl(
       downloadUrl,
       checksum: expectedChecksum,
       source: 'marketplace',
-    });
-
-    // 7. Re-register file types and notify renderer (with hot-reload)
-    await initializeExtensionFileTypes();
-    notifyExtensionsChanged(extensionId, installPath);
-
-    logger.main.info(`[ExtMarketplace] Successfully installed ${extensionId} v${version}`);
-    return { success: true, extensionId };
-
-  } catch (err) {
-    const errorMsg = err instanceof Error ? err.message : String(err);
-    logger.main.error(`[ExtMarketplace] Failed to install ${extensionId}:`, err);
-
-    // Clean up partial installation
-    try {
-      await fs.rm(installPath, { recursive: true, force: true });
-    } catch {
-      // Ignore cleanup errors
-    }
-
-    return { success: false, error: errorMsg };
-  } finally {
-    // Clean up temp file
-    if (tempFile) {
-      try {
-        await fs.unlink(tempFile);
-      } catch {
-        // Ignore
-      }
-    }
-  }
+    }),
+    logTag: 'marketplace',
+  });
 }
 
 /**
  * Install an extension from a GitHub repository URL.
+ *
+ * Strategy:
+ *  1. Try to fetch the repo's "latest" GitHub Release and install a pre-built
+ *     `.nimext` / `.zip` asset if one is found (Obsidian/BRAT-style).
+ *  2. If no release exists or no usable asset is attached, fall back to
+ *     cloning HEAD and looking for a committed `dist/` directory (or a
+ *     manifest-only extension).
+ *
+ * A present-but-broken release asset is a hard fail and does NOT fall
+ * through to clone-source: doing so would silently install a different
+ * (older, source-based) version of the extension under the same id.
  */
-async function installFromGitHub(githubUrl: string): Promise<InstallResult> {
-  const extensionsDir = await getUserExtensionsDirectory();
-
+async function installFromGitHub(
+  githubUrl: string,
+  progress: ProgressReporter = noopProgress,
+): Promise<InstallResult> {
   // Parse GitHub URL
   const match = githubUrl.match(/github\.com\/([^/]+\/[^/]+?)(?:\.git)?(?:\/tree\/[^/]+\/(.+))?(?:\/?$)/);
   if (!match) {
     return { success: false, error: `Invalid GitHub URL: ${githubUrl}` };
   }
-
   const [, repo, subdir] = match;
-  const repoName = repo.split('/')[1];
+  const [owner, repoName] = repo.split('/');
+
+  logger.main.info(`[ExtMarketplace] GitHub install: ${githubUrl} -- trying release asset`);
+  progress({ stage: 'checking-release', message: 'Checking for release artifact...' });
+
+  // ---- Path 1: release asset ----------------------------------------------
+  let release: GitHubRelease | null = null;
+  try {
+    release = await fetchLatestRelease(owner, repoName);
+  } catch (err) {
+    // Network/protocol error: log and fall through to clone-source. We do
+    // not surface this to the user because offline-flaky-network users
+    // should still be able to clone-install.
+    logger.main.warn(`[ExtMarketplace] GitHub install: ${githubUrl} -- release lookup failed, falling through to clone-source:`, err);
+  }
+
+  if (release) {
+    const asset = selectReleaseAsset(release.assets, { repoName, subdir });
+    if (asset) {
+      logger.main.info(`[ExtMarketplace] GitHub install: ${githubUrl} -- using release asset ${asset.name} (tag ${release.tag_name})`);
+      progress({ stage: 'downloading-release', message: `Downloading ${asset.name} (${release.tag_name})...` });
+
+      const releaseTag = release.tag_name;
+      const releaseResult = await installFromPackageUrl({
+        downloadUrl: asset.browser_download_url,
+        buildRecord: (manifest) => ({
+          extensionId: manifest.id!,
+          version: manifest.version ?? '0.0.0',
+          installedAt: new Date().toISOString(),
+          updatedAt: new Date().toISOString(),
+          downloadUrl: asset.browser_download_url,
+          checksum: '',
+          source: 'github-url',
+          githubUrl,
+          githubReleaseTag: releaseTag,
+          githubReleaseAssetName: asset.name,
+          githubInstallMethod: 'release-asset',
+        }),
+        logTag: 'github-release',
+        progress,
+      });
+
+      if (releaseResult.success) {
+        progress({
+          stage: 'done',
+          message: `Installed ${releaseResult.extensionId} from release ${releaseTag}`,
+        });
+      }
+      // Hard fail: do not fall through if the release asset was present but broken.
+      return releaseResult;
+    }
+    logger.main.info(`[ExtMarketplace] GitHub install: ${githubUrl} -- no matching asset on release ${release.tag_name}, falling back to clone-source`);
+  } else {
+    logger.main.info(`[ExtMarketplace] GitHub install: ${githubUrl} -- no release, falling back to clone-source`);
+  }
+
+  // ---- Path 2: clone-source fallback -------------------------------------
+  progress({ stage: 'cloning', message: 'No release artifact found, cloning source...' });
+  return installFromGitHubCloneSource(githubUrl, repo, subdir, progress);
+}
+
+/**
+ * Clone-source install path: shallow-clone HEAD, optionally sparse-checkout
+ * a subdir, validate the manifest, and require either a committed `dist/`
+ * or a manifest-only extension shape.
+ */
+async function installFromGitHubCloneSource(
+  githubUrl: string,
+  repo: string,
+  subdir: string | undefined,
+  progress: ProgressReporter,
+): Promise<InstallResult> {
+  const extensionsDir = await getUserExtensionsDirectory();
   const tempDir = path.join(extensionsDir, `.tmp-${Date.now()}`);
 
   try {
-    logger.main.info(`[ExtMarketplace] Installing from GitHub: ${githubUrl}`);
-
     // Clone the repository
     if (subdir) {
-      // Sparse checkout for subdirectory
       await execGit(['clone', '--depth', '1', '--filter=blob:none', '--sparse', `https://github.com/${repo}.git`, tempDir]);
       await execGit(['sparse-checkout', 'set', subdir], { cwd: tempDir });
     } else {
@@ -341,7 +569,7 @@ async function installFromGitHub(githubUrl: string): Promise<InstallResult> {
       return { success: false, error: 'No manifest.json found in repository. Is this a Nimbalyst extension?' };
     }
 
-    let manifest: { id?: string; name?: string; version?: string };
+    let manifest: ParsedManifest;
     try {
       manifest = JSON.parse(manifestContent);
     } catch {
@@ -355,34 +583,39 @@ async function installFromGitHub(githubUrl: string): Promise<InstallResult> {
     const extensionId = manifest.id;
     const installPath = path.join(extensionsDir, extensionId);
 
-    // Check if already installed
-    try {
-      await fs.access(installPath);
-      // Remove existing installation
-      await fs.rm(installPath, { recursive: true, force: true });
-    } catch {
-      // Not installed yet, that's fine
-    }
-
-    // Copy to extensions directory (excluding .git and node_modules)
-    await copyDirectory(sourceDir, installPath);
-
-    // Check if there's a dist/ directory; if not, check if there's a package.json and build
-    const distPath = path.join(installPath, 'dist');
-    try {
-      await fs.access(distPath);
-    } catch {
-      // No dist directory - check if there's a package.json to build
-      const pkgJsonPath = path.join(installPath, 'package.json');
+    // Validate dist/ on the clone (sourceDir) BEFORE touching any existing
+    // installation, so a failed install doesn't brick a working extension.
+    // Theme-only / claudePlugin-only extensions have no JS to run, so dist/
+    // is not required. Mirrors onlyThemes / onlyClaudePlugin in ExtensionLoader.ts.
+    if (!isManifestOnlyExtension(manifest)) {
+      // Auto-building is intentionally deferred (slow, error-prone, runs
+      // arbitrary npm scripts), so we ask the user to publish a release
+      // or build locally first.
+      const distPath = path.join(sourceDir, 'dist');
       try {
-        await fs.access(pkgJsonPath);
-        logger.main.info(`[ExtMarketplace] Extension needs building - run 'npm install && npm run build' in ${installPath}`);
-        // We don't auto-build here because it could be slow and error-prone.
-        // The user can use the extension dev tools to build it.
+        await fs.access(distPath);
       } catch {
-        // No package.json either - extension might be pre-built or not need building
+        const pkgJsonPath = path.join(sourceDir, 'package.json');
+        let hasPkgJson = false;
+        try {
+          await fs.access(pkgJsonPath);
+          hasPkgJson = true;
+        } catch {
+          // No package.json either - extension might be pre-built or malformed
+        }
+
+        const message = hasPkgJson
+          ? `Extension repository does not include a built dist/ directory. Either publish a GitHub Release with a .nimext asset, or commit dist/ to the repo, or clone locally and run "npm install && npm run build" before installing from the local folder.`
+          : `Extension repository does not include a dist/ directory or a package.json. The repo may be malformed or built artifacts may not be committed.`;
+        logger.main.info(`[ExtMarketplace] Aborting install of ${extensionId} from GitHub: ${message}`);
+        return { success: false, error: message };
       }
     }
+
+    // Validation passed -- safe to replace any existing installation.
+    progress({ stage: 'installing', message: `Installing ${extensionId}...` });
+    await fs.rm(installPath, { recursive: true, force: true });
+    await copyDirectory(sourceDir, installPath);
 
     // Track the install
     addMarketplaceInstall({
@@ -394,18 +627,20 @@ async function installFromGitHub(githubUrl: string): Promise<InstallResult> {
       checksum: '',
       source: 'github-url',
       githubUrl,
+      githubInstallMethod: 'clone-source',
     });
 
     // Re-register file types and notify renderer (with hot-reload)
     await initializeExtensionFileTypes();
     notifyExtensionsChanged(extensionId, installPath);
 
-    logger.main.info(`[ExtMarketplace] Successfully installed ${extensionId} from GitHub`);
+    logger.main.info(`[ExtMarketplace] [github-clone] installed ${extensionId} v${manifest.version ?? '0.0.0'}`);
+    progress({ stage: 'done', message: `Installed ${extensionId} from source` });
     return { success: true, extensionId };
 
   } catch (err) {
     const errorMsg = err instanceof Error ? err.message : String(err);
-    logger.main.error(`[ExtMarketplace] Failed to install from GitHub:`, err);
+    logger.main.error(`[ExtMarketplace] [github-clone] install failed:`, err);
     return { success: false, error: errorMsg };
   } finally {
     // Clean up temp directory
@@ -413,6 +648,38 @@ async function installFromGitHub(githubUrl: string): Promise<InstallResult> {
       await fs.rm(tempDir, { recursive: true, force: true });
     } catch {
       // Ignore cleanup errors
+    }
+  }
+}
+
+/**
+ * Remove the given aiProvider ids from the ai-settings store. Used when an
+ * extension is uninstalled so its contributed provider entries (enabled,
+ * models, testStatus...) don't linger and re-populate the Settings UI on
+ * the next boot. Broadcasts `ai-settings:changed` so open renderer windows
+ * refresh their atoms.
+ */
+async function pruneAiSettingsProviders(providerIds: string[]): Promise<void> {
+  if (providerIds.length === 0) return;
+  const { default: Store } = await import('electron-store');
+  const aiStore = new Store<Record<string, unknown>>({ name: 'ai-settings' });
+  const providerSettings = (aiStore.get('providerSettings', {}) as Record<string, unknown>) ?? {};
+  const removed: string[] = [];
+  for (const id of providerIds) {
+    if (id in providerSettings) {
+      delete providerSettings[id];
+      removed.push(id);
+    }
+  }
+  if (removed.length > 0) {
+    aiStore.set('providerSettings', providerSettings);
+    for (const win of BrowserWindow.getAllWindows()) {
+      if (!win.isDestroyed() && !win.webContents.isDestroyed()) {
+        win.webContents.send('ai-settings:changed', {
+          providerIds: removed,
+          apiKeyNames: [],
+        });
+      }
     }
   }
 }
@@ -433,6 +700,45 @@ async function uninstallExtension(extensionId: string): Promise<InstallResult> {
       return { success: false, error: `Extension ${extensionId} was not installed via marketplace` };
     }
 
+    // BEFORE removing the directory, read the manifest to learn which AI
+    // providers the extension contributed. We need this list to garbage-
+    // collect the matching keys from ai-settings.providerSettings -- without
+    // this step, the user's stored enabled/models choices persist on disk
+    // forever and the renderer SettingsSidebar keeps rendering ghost provider
+    // rows on the next boot even though no extension is registered.
+    //
+    // Read both `aiProviders` and `aiAgentProviders`. The agent-provider
+    // contribution shape proposed in the Agent-Providers-as-Extensions design
+    // doc uses `aiAgentProviders`, while a future chat-only contribution may
+    // reuse the older `aiProviders` name. Reading both keeps the GC working
+    // across the rename without a follow-up patch when either lands. An
+    // extension that declares both (e.g., for a transitional period) is
+    // handled idempotently downstream because the prune loop skips ids that
+    // are not in providerSettings.
+    let contributedAiProviderIds: string[] = [];
+    try {
+      const manifestPath = path.join(installPath, 'manifest.json');
+      const manifestRaw = await fs.readFile(manifestPath, 'utf8');
+      const manifest = JSON.parse(manifestRaw) as {
+        contributions?: {
+          aiProviders?: Array<{ id?: string }>;
+          aiAgentProviders?: Array<{ id?: string }>;
+        };
+      };
+      const collected = [
+        ...(manifest.contributions?.aiProviders ?? []),
+        ...(manifest.contributions?.aiAgentProviders ?? []),
+      ];
+      contributedAiProviderIds = collected
+        .map((p) => p?.id)
+        .filter((id): id is string => typeof id === 'string' && id.length > 0);
+    } catch (err) {
+      logger.main.warn(
+        `[ExtMarketplace] Could not read manifest for ${extensionId} ` +
+        `before uninstall; skipping ai-settings cleanup: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+
     // Remove the extension directory
     try {
       await fs.rm(installPath, { recursive: true, force: true });
@@ -443,9 +749,32 @@ async function uninstallExtension(extensionId: string): Promise<InstallResult> {
     // Remove from tracking
     removeMarketplaceInstall(extensionId);
 
+    // Evict any aiAgentProviders the extension contributed. The
+    // PrivilegedExtensionHost handles its own teardown via
+    // handleExtensionUninstalled; this just clears the dropdown catalog.
+    getAgentProviderRegistry().clearAll(extensionId);
+
     // Re-register file types and notify renderer (with unload)
     await initializeExtensionFileTypes();
     notifyExtensionUnloaded(extensionId);
+
+    // Garbage-collect provider entries the uninstalled extension contributed
+    // to ai-settings. Done AFTER notifyExtensionUnloaded so the renderer's
+    // ProviderRegistry.unregister fires before the broadcast that follows.
+    if (contributedAiProviderIds.length > 0) {
+      try {
+        await pruneAiSettingsProviders(contributedAiProviderIds);
+        logger.main.info(
+          `[ExtMarketplace] Pruned ${contributedAiProviderIds.length} aiProvider entry(ies) ` +
+          `from ai-settings for ${extensionId}: ${contributedAiProviderIds.join(', ')}`,
+        );
+      } catch (err) {
+        logger.main.warn(
+          `[ExtMarketplace] Failed to prune ai-settings for ${extensionId}: ` +
+          `${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+    }
 
     logger.main.info(`[ExtMarketplace] Successfully uninstalled ${extensionId}`);
     return { success: true, extensionId };
@@ -478,6 +807,71 @@ async function checkForUpdates(): Promise<Array<{ extensionId: string; currentVe
   }
 
   return updates;
+}
+
+async function migrateRenamedExtensions(registry: RegistryData): Promise<void> {
+  const installs = getMarketplaceInstalls();
+  const extensionsDir = await getUserExtensionsDirectory();
+
+  for (const [legacyId, replacementId] of Object.entries(RENAMED_EXTENSION_IDS)) {
+    const legacyInstallPath = path.join(extensionsDir, legacyId);
+    const replacementInstallPath = path.join(extensionsDir, replacementId);
+    const legacyRecord = installs[legacyId];
+
+    let legacyInstalledOnDisk = false;
+    try {
+      await fs.access(legacyInstallPath);
+      legacyInstalledOnDisk = true;
+    } catch {
+      legacyInstalledOnDisk = false;
+    }
+
+    if (!legacyInstalledOnDisk && !legacyRecord) {
+      continue;
+    }
+
+    let replacementInstalledOnDisk = false;
+    try {
+      await fs.access(replacementInstallPath);
+      replacementInstalledOnDisk = true;
+    } catch {
+      replacementInstalledOnDisk = false;
+    }
+
+    const replacementRecord = installs[replacementId];
+    if (!replacementInstalledOnDisk && !replacementRecord) {
+      const replacementEntry = registry.extensions.find((entry) => entry.id === replacementId);
+      if (!replacementEntry?.downloadUrl) {
+        logger.main.warn(
+          `[ExtMarketplace] Cannot migrate legacy extension ${legacyId} -> ${replacementId}: replacement missing from registry`
+        );
+        continue;
+      }
+
+      const result = await installFromUrl(
+        replacementId,
+        replacementEntry.downloadUrl,
+        replacementEntry.checksum,
+        replacementEntry.version,
+      );
+      if (!result.success) {
+        logger.main.warn(
+          `[ExtMarketplace] Failed to migrate legacy extension ${legacyId} -> ${replacementId}: ${result.error ?? 'unknown error'}`
+        );
+        continue;
+      }
+    }
+
+    try {
+      await fs.rm(legacyInstallPath, { recursive: true, force: true });
+    } catch (err) {
+      logger.main.warn(`[ExtMarketplace] Failed to remove legacy extension directory ${legacyId}:`, err);
+    }
+    removeMarketplaceInstall(legacyId);
+    await initializeExtensionFileTypes();
+    notifyExtensionUnloaded(legacyId);
+    logger.main.info(`[ExtMarketplace] Migrated legacy extension ${legacyId} -> ${replacementId}`);
+  }
 }
 
 /**
@@ -528,10 +922,12 @@ export function queueMarketplaceInstallRequest(extensionId: string): void {
  */
 export async function runExtensionAutoUpdate(): Promise<void> {
   try {
+    const registry = await fetchRegistry();
+    await migrateRenamedExtensions(registry);
+
     const updates = await checkForUpdates();
     if (updates.length === 0) return;
 
-    const registry = await fetchRegistry();
     for (const update of updates) {
       const entry = registry.extensions.find(e => e.id === update.extensionId);
       if (!entry?.downloadUrl) continue;
@@ -588,11 +984,17 @@ export function registerExtensionMarketplaceHandlers(): void {
   });
 
   // Install from GitHub URL
-  safeHandle('extension-marketplace:install-from-github', async (_event, githubUrl: string) => {
+  safeHandle('extension-marketplace:install-from-github', async (event, githubUrl: string) => {
     if (!githubUrl) {
       return { success: false, error: 'GitHub URL is required' };
     }
-    return await installFromGitHub(githubUrl);
+    const progress: ProgressReporter = (e) => {
+      const sender = event.sender;
+      if (sender && !sender.isDestroyed()) {
+        sender.send('extension-marketplace:install-progress', e);
+      }
+    };
+    return await installFromGitHub(githubUrl, progress);
   });
 
   // Uninstall extension

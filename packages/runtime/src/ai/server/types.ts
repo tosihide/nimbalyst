@@ -6,7 +6,11 @@ import type { ToolDefinition } from '../tools';
 import type { EffortLevel } from './effortLevels';
 import type { ToolResult } from './protocols/ProtocolInterface';
 import { ModelIdentifier } from './ModelIdentifier';
-import { CLAUDE_CODE_PINNED_SDK_MODELS } from '../modelConstants';
+import {
+  CLAUDE_CODE_ACCEPTED_VARIANT_INPUTS,
+  CLAUDE_CODE_PINNED_SDK_MODELS,
+  normalizeClaudeCodeVariant,
+} from '../modelConstants';
 import type { TranscriptViewMessage } from './transcript/TranscriptProjector';
 export type { ToolDefinition } from '../tools';
 export { ModelIdentifier } from './ModelIdentifier';
@@ -32,8 +36,8 @@ export interface DocumentContext {
   textSelection?: string;  // Just the selected text (filePath is already on document context)
   textSelectionTimestamp?: number | null;  // For staleness detection
 
-  // AI mode at time of message submission (planning vs agent)
-  mode?: 'planning' | 'agent';
+  // AI mode at time of message submission (planning vs agent vs auto)
+  mode?: 'planning' | 'agent' | 'auto';
 
   // Worktree context (for isolated AI coding sessions)
   worktreeId?: string;  // ID of the associated worktree
@@ -56,6 +60,9 @@ export interface DocumentContext {
   // Pre-built prompts from DocumentContextService (for user message additions)
   documentContextPrompt?: string;  // File path, cursor, selection, content/diff, transitions
   editingInstructions?: string;    // One-time editing instructions (only first message with doc)
+
+  /** Identifies the origin of this message when it comes from an automated source (e.g. 'wakeup_resume'). */
+  promptOrigin?: string;
 }
 
 export interface ChatAttachment {
@@ -93,11 +100,27 @@ export interface ToolCall {
   };
 }
 
+/**
+ * OpenAI function-calling shaped tool definition threaded to extension-agent
+ * providers so their tool loops (e.g. gemini-antigravity) can present the host's
+ * meta-agent tools as JSON in the model prompt. Built-in providers ignore this
+ * — they discover the same tools over an SSE MCP server instead. Optional and
+ * additive everywhere it appears so no built-in provider path is affected.
+ */
+export interface AgentToolDefinition {
+  type: 'function';
+  function: {
+    name: string;
+    description?: string;
+    parameters?: Record<string, unknown>;
+  };
+}
+
 export interface Message {
   role: 'user' | 'assistant' | 'tool' | 'system';
   content: string;
   timestamp: number;
-  mode?: 'planning' | 'agent';  // AI mode when message was sent (user messages only)
+  mode?: 'planning' | 'agent' | 'auto';  // AI mode when message was sent (user messages only)
   // Additional fields for rich message types
   edits?: unknown[];
   toolCall?: ToolCall;
@@ -128,7 +151,7 @@ export interface Message {
  * Add new providers here -- the type, runtime array, and exhaustiveness
  * checks all derive from this one definition.
  */
-export const AI_PROVIDER_TYPES = ['claude', 'claude-code', 'openai', 'openai-codex', 'openai-codex-acp', 'lmstudio', 'opencode', 'copilot-cli'] as const;
+export const AI_PROVIDER_TYPES = ['claude', 'claude-code', 'claude-code-cli', 'openai', 'openai-codex', 'openai-codex-acp', 'lmstudio', 'opencode', 'copilot-cli'] as const;
 
 export type AIProviderType = typeof AI_PROVIDER_TYPES[number];
 
@@ -147,8 +170,26 @@ export function assertExhaustiveProvider(provider: never): never {
   throw new Error(`Unhandled provider: ${provider}`);
 }
 
-export function isAgentProvider(provider: string | null | undefined): provider is 'claude-code' | 'openai-codex' | 'openai-codex-acp' | 'opencode' | 'copilot-cli' {
-  return provider === 'claude-code' || provider === 'openai-codex' || provider === 'openai-codex-acp' || provider === 'opencode' || provider === 'copilot-cli';
+export function isAgentProvider(provider: string | null | undefined): provider is 'claude-code' | 'claude-code-cli' | 'openai-codex' | 'openai-codex-acp' | 'opencode' | 'copilot-cli' {
+  return provider === 'claude-code' || provider === 'claude-code-cli' || provider === 'openai-codex' || provider === 'openai-codex-acp' || provider === 'opencode' || provider === 'copilot-cli';
+}
+
+/**
+ * The Claude Code provider family — both Claude-Code variants that drive the
+ * genuine `claude` agent and share the Claude model variant namespace
+ * (opus/sonnet/haiku) and the `ClaudeCodeRawParser` transcript shape:
+ *
+ * - `claude-code`      — Agent SDK in-process, billed to the user's API key.
+ * - `claude-code-cli`  — genuine `claude` CLI on the user's Pro/Max
+ *                        subscription (no API metering). See NIM-805.
+ *
+ * The two are distinct provider IDs so billing is locked per session by
+ * `shouldBlockStartedSessionProviderSwitch()`. Use this guard anywhere a code
+ * path must treat both the same (model validation, variant resolution, parser
+ * routing) rather than hard-coding `=== 'claude-code'`.
+ */
+export function isClaudeCodeFamily(provider: string | null | undefined): provider is 'claude-code' | 'claude-code-cli' {
+  return provider === 'claude-code' || provider === 'claude-code-cli';
 }
 
 /**
@@ -171,11 +212,20 @@ export function shouldBlockStartedSessionProviderSwitch(
  * Claude Code uses simplified variant names (opus, sonnet, haiku) instead of full model IDs.
  * These are ONLY valid for the claude-code provider.
  *
- * `opus-4-6` is a pinned-version variant retained after bumping the canonical
- * `opus` alias to 4.7, so users can still choose the previous generation.
- * See CLAUDE_CODE_PINNED_SDK_MODELS in modelConstants.ts.
+ * `opus-4-7`, `opus-4-6`, and `sonnet-4-6` are pinned-version variants retained
+ * after bumping the canonical `opus`/`sonnet` aliases (to 4.8 / 5), so users can
+ * still choose previous generations. See CLAUDE_CODE_PINNED_SDK_MODELS in
+ * modelConstants.ts.
+ *
+ * `fable` is the Fable 5 tier above Opus — the CLI accepts it as a first-class
+ * alias (`--model fable`, `/model fable`). The CLI gates the 1M window behind
+ * the `fable[1m]` form just like opus/sonnet (plain `fable` is windowed at
+ * 200k client-side; verified on CLI 2.1.175), so `fable` IS in
+ * CLAUDE_CODE_VARIANTS_WITH_1M and gets a `fable-1m` picker row. Note it
+ * requires usage credits on subscription plans (the CLI surfaces that itself
+ * when unavailable).
  */
-export const CLAUDE_CODE_VARIANTS = ['opus', 'opus-4-6', 'sonnet', 'haiku'] as const;
+export const CLAUDE_CODE_VARIANTS = ['fable', 'opus', 'opus-4-7', 'opus-4-6', 'sonnet', 'sonnet-4-6', 'haiku'] as const;
 
 /**
  * Resolves a configured model string to the SDK model value.
@@ -191,14 +241,13 @@ export const CLAUDE_CODE_VARIANTS = ['opus', 'opus-4-6', 'sonnet', 'haiku'] as c
  */
 export function resolveClaudeCodeModelVariant(configuredModel: string | undefined, defaultModel: string): string {
   type ClaudeCodeVariant = typeof CLAUDE_CODE_VARIANTS[number];
-  const fallback: ClaudeCodeVariant = 'sonnet';
   const configured = configuredModel || defaultModel;
 
   const toSdkBase = (variant: string): string => CLAUDE_CODE_PINNED_SDK_MODELS[variant as ClaudeCodeVariant] ?? variant;
 
   // Try parsing with ModelIdentifier
   const parsed = ModelIdentifier.tryParse(configured);
-  if (parsed && parsed.provider === 'claude-code') {
+  if (parsed && isClaudeCodeFamily(parsed.provider)) {
     // baseVariant strips suffixes like -1m
     const variant = parsed.baseVariant as ClaudeCodeVariant;
     if ((CLAUDE_CODE_VARIANTS as readonly string[]).includes(variant)) {
@@ -214,12 +263,20 @@ export function resolveClaudeCodeModelVariant(configuredModel: string | undefine
   const isExtended = normalized?.endsWith('-1m');
   const withoutContext = normalized?.replace(/-1m$/, '');
 
-  if (withoutContext && (CLAUDE_CODE_VARIANTS as readonly string[]).includes(withoutContext)) {
-    const sdkBase = toSdkBase(withoutContext);
+  const normalizedVariant = withoutContext ? normalizeClaudeCodeVariant(withoutContext) : null;
+  if (normalizedVariant) {
+    const sdkBase = toSdkBase(normalizedVariant);
     return isExtended ? `${sdkBase}[1m]` : sdkBase;
   }
 
-  return fallback;
+  const supported = CLAUDE_CODE_ACCEPTED_VARIANT_INPUTS.join(', ');
+  if (parsed && !isClaudeCodeFamily(parsed.provider)) {
+    throw new Error(`Claude Agent requires a claude-code:* model identifier. Received: ${configured}`);
+  }
+
+  throw new Error(
+    `Unsupported Claude Agent model "${configured}". Must be one of: ${supported} (optionally with -1m suffix)`
+  );
 }
 
 export interface AIModel {
@@ -233,7 +290,7 @@ export interface AIModel {
 /** Structural type describing what role a session plays in the hierarchy */
 export type SessionType = 'session' | 'workstream' | 'blitz' | 'voice';
 
-export type SessionMode = 'planning' | 'agent';
+export type SessionMode = 'planning' | 'agent' | 'auto';
 
 export type AgentRole = 'standard' | 'meta-agent';
 
@@ -385,7 +442,12 @@ export interface ProviderSettings {
 }
 
 export interface StreamChunk {
-  type: 'text' | 'tool_call' | 'tool_error' | 'error' | 'complete' | 'stream_edit_start' | 'stream_edit_content' | 'stream_edit_end';
+  // 'context_usage' is a lightweight, mid-turn update that carries ONLY
+  // contextFillTokens so the UI's context indicator can refresh per assistant
+  // step during a long agentic turn (instead of once per turn at 'complete').
+  // It must never carry cumulative input/output usage -- those stay on
+  // 'complete' to avoid double-counting. See NIM-868.
+  type: 'text' | 'tool_call' | 'tool_error' | 'error' | 'complete' | 'context_usage' | 'stream_edit_start' | 'stream_edit_content' | 'stream_edit_end' | 'pre_edit_snapshot' | 'post_edit_snapshot';
   content?: string;
   isSystem?: boolean; // For system messages like slash command output
   toolCall?: {
@@ -393,6 +455,14 @@ export interface StreamChunk {
     name: string;
     arguments?: Record<string, any>;
     result?: ToolResult | string;
+    /**
+     * Stable provider-agnostic edit-group ID stamped by the provider so file
+     * trackers and pre-edit history tags can dedupe and attribute file
+     * changes to the exact tool invocation. For Codex this carries the
+     * synthetic `nimtc|<encoded>|<ts>|<idx>` ID minted by
+     * OpenAICodexProvider; for Claude Code this is the SDK's tool_use_id.
+     */
+    toolUseId?: string;
   };
   toolError?: {
     name: string;
@@ -404,6 +474,7 @@ export interface StreamChunk {
   isAuthError?: boolean; // True when error is an authentication failure (SDK first-class detection)
   isBedrockToolError?: boolean; // True when error is a Bedrock tool search error
   isServerError?: boolean; // True when error is a 500/internal server error (Claude may be down)
+  isCodexAuthRequired?: boolean; // True when a Codex app-server session was blocked because the user is not signed in to OpenAI
   isComplete?: boolean;
   config?: unknown; // For stream_edit_start
   usage?: {
@@ -430,6 +501,55 @@ export interface StreamChunk {
   contextWindow?: number;
   // Set to true when context was compacted this turn. Signals AIService to clear stale currentContext.
   contextCompacted?: boolean;
+  /**
+   * Pre-edit snapshot delivered by providers that have a clean
+   * tool-lifecycle signal (currently OpenAICodex `file_change` via
+   * `item.started`). Carries the on-disk content of each affected path,
+   * read BEFORE the agent applies its patch. The host writes a
+   * local-history pre-edit tag with that exact content so the diff
+   * renderer always has a real baseline -- gitignored files,
+   * never-snapshotted files, and post-boot-created files all work.
+   * Replaces the watcher/cache/recoverBaseline fallback chain for
+   * this provider.
+   */
+  preEditSnapshot?: {
+    toolUseId: string;
+    entries: Array<{
+      path: string;
+      content: string | null;
+      kind?: string;
+    }>;
+    /**
+     * When true, `MessageStreamingHandler` must use `entries[].content` as the
+     * pre-edit baseline VERBATIM and skip its `FileSnapshotCache` fallback
+     * lookup. Used by the codex app-server transport, where the pre-edit
+     * content is computed deterministically by reverse-applying the patch
+     * diff text against the post-edit disk state -- a cache lookup at that
+     * point would clobber correct content with whatever chokidar happened to
+     * observe (often the post-edit body for fresh gitignored files).
+     *
+     * The legacy SDK transport leaves this undefined (false), preserving its
+     * cache-prefers behavior for the race-prone item.started disk-read path.
+     */
+    authoritative?: boolean;
+  };
+  /**
+   * Post-edit snapshot delivered by providers that have a clean tool-completion
+   * signal (currently OpenAICodex `file_change` via `item.completed`). Carries
+   * the on-disk content of each affected path AFTER the agent applied its
+   * patch. The host writes a local-history `ai-edit` snapshot with this
+   * content so the session-aware diff can show a stable AI-output baseline
+   * even after the user later modifies the file. Mirrors Claude's
+   * `createTurnEndSnapshots` for the Codex provider.
+   */
+  postEditSnapshot?: {
+    toolUseId: string;
+    entries: Array<{
+      path: string;
+      content: string;
+      kind?: string;
+    }>;
+  };
 }
 
 export interface DiffArgs {
@@ -544,6 +664,19 @@ export interface CreateAgentMessageInput {
   createdAt?: Date | string;  // Optional timestamp for imported messages (defaults to NOW())
   providerMessageId?: string;  // Provider-assigned message ID (e.g., SDK uuid) for deduplication
   searchable?: boolean;  // Whether to include in FTS index (user prompts and assistant text only)
+  /**
+   * User-visible plaintext extracted from `content` at write time. Populated by
+   * `searchableTextExtractor.extractSearchable`. NULL when the row carries no
+   * user-visible content (metadata, tool noise). Indexed by `ai_agent_messages_fts`
+   * after Phase 2 of the canonical-transcript-deprecation plan.
+   */
+  searchableText?: string | null;
+  /**
+   * Stable provider-agnostic classification: `user` | `assistant` | `tool` | `system` | `meta`.
+   * Used by search call sites that need to filter on message kind without
+   * decoding the provider-shaped `content` payload.
+   */
+  messageKind?: 'user' | 'assistant' | 'tool' | 'system' | 'meta';
 }
 
 // ============================================================================

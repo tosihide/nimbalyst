@@ -39,9 +39,11 @@ import { BadGitStateDialog } from './BadGitStateDialog';
 import { HelpTooltip } from '../../help';
 import { refreshWorktreeChangedFiles } from '../../store/listeners/fileStateListeners';
 import { getWorktreeNameFromPath } from '../../utils/pathUtils';
+import { isPathInWorkspace } from '../../../shared/pathUtils';
 import { SuperFilesPanel } from './SuperFilesPanel';
 import { defaultAgentModelAtom } from '../../store/atoms/appSettings';
 import { type AgentModelOption } from './AgentModelPicker';
+import { isClaudeCliTerminalSession } from '../UnifiedAI/claudeCliInputRouting';
 
 // Types for worktree mode (copied from DiffModeView)
 interface WorktreeChangedFile {
@@ -88,14 +90,32 @@ export const GitOperationsPanel: React.FC<GitOperationsPanelProps> = React.memo(
     const isCommitting = useAtomValue(isCommittingAtom);
     const setIsCommitting = useSetAtom(isCommittingAtom);
 
+    const gitWorkspacePath = worktreePath || workspacePath;
+    const isWorkspaceCommittablePath = useCallback((filePath: string) => {
+      if (!filePath) {
+        return false;
+      }
+
+      // Worktree git state uses relative paths internally; keep accepting those.
+      if (!filePath.startsWith('/') && !/^[A-Za-z]:[\\/]/.test(filePath)) {
+        return true;
+      }
+
+      return isPathInWorkspace(filePath, gitWorkspacePath);
+    }, [gitWorkspacePath]);
+
     // Local state for commit workflow mode (manual vs smart)
     const [commitMode, setCommitMode] = useState<'manual' | 'smart'>('smart');
+    const [worktreeCommitMode, setWorktreeCommitMode] = useState<'manual' | 'smart'>('smart');
 
     // Default model for new sessions (user's last selected model)
     const defaultModel = useAtomValue(defaultAgentModelAtom);
     // Per-workstream git state (persisted)
     const stagedFilesArr = useAtomValue(workstreamStagedFilesAtom(workstreamId));
-    const stagedFiles = new Set(stagedFilesArr); // Convert to Set for compatibility
+    const stagedFiles = useMemo(
+      () => new Set(stagedFilesArr.filter((filePath) => isWorkspaceCommittablePath(filePath))),
+      [isWorkspaceCommittablePath, stagedFilesArr]
+    );
     const setStagedFilesAction = useSetAtom(setWorkstreamStagedFilesAtom);
     const commitMessage = useAtomValue(workstreamCommitMessageAtom(workstreamId));
     const setCommitMessageAction = useSetAtom(setWorkstreamCommitMessageAtom);
@@ -103,16 +123,22 @@ export const GitOperationsPanel: React.FC<GitOperationsPanelProps> = React.memo(
 
     // Helper functions to wrap atom actions with workstreamId
     const setStagedFiles = useCallback((files: Set<string>) => {
-      setStagedFilesAction({ workstreamId, files: Array.from(files) });
-    }, [workstreamId, setStagedFilesAction]);
+      setStagedFilesAction({
+        workstreamId,
+        files: Array.from(files).filter((filePath) => isWorkspaceCommittablePath(filePath)),
+      });
+    }, [isWorkspaceCommittablePath, workstreamId, setStagedFilesAction]);
 
     const setCommitMessage = useCallback((message: string) => {
       setCommitMessageAction({ workstreamId, message });
     }, [workstreamId, setCommitMessageAction]);
 
     const stageAll = useCallback((files: string[]) => {
-      setStagedFilesAction({ workstreamId, files });
-    }, [workstreamId, setStagedFilesAction]);
+      setStagedFilesAction({
+        workstreamId,
+        files: files.filter((filePath) => isWorkspaceCommittablePath(filePath)),
+      });
+    }, [isWorkspaceCommittablePath, workstreamId, setStagedFilesAction]);
 
     const clearStaging = useCallback(() => {
       setStagedFilesAction({ workstreamId, files: [] });
@@ -375,36 +401,59 @@ export const GitOperationsPanel: React.FC<GitOperationsPanelProps> = React.memo(
       try {
         const isInWorkstream = childSessionIds && childSessionIds.length > 1;
         const isInWorktree = !!worktreeId;
+        // In a worktree, edited files are rooted at the worktree path. Pass it so the
+        // session-edited-files cross-reference with git status resolves to matching paths.
+        const commitContextPath = worktreePath || workspacePath;
 
-        // Pre-fetch commit context from main process
+        // Pre-fetch commit context from main process. In a worktree, the worktree is
+        // the isolation boundary for this whole workstream, so include ALL uncommitted
+        // changes -- not just the current session's edits.
         const commitContext = await window.electronAPI.invoke(
           'git:get-commit-context',
-          workspacePath,
+          commitContextPath,
           sessionId,
-          isInWorkstream ? childSessionIds : undefined
+          isInWorkstream ? childSessionIds : undefined,
+          isInWorktree
         ) as {
           success: boolean;
           files: Array<{ path: string; status: 'added' | 'modified' | 'deleted' }>;
-          scenario: 'single' | 'workstream';
+          scenario: 'single' | 'workstream' | 'worktree';
           error?: string;
         };
 
         let message = 'Use the developer_git_commit_proposal tool to create a commit.';
 
         if (commitContext.success && commitContext.files.length > 0) {
-          // Inject pre-fetched file list directly into the prompt
-          const scope = commitContext.scenario === 'workstream'
-            ? `across ${childSessionIds!.length} sessions in this workstream`
-            : 'in this session';
           const fileList = commitContext.files
             .map(f => `- ${f.path} (${f.status})`)
             .join('\n');
 
-          message += `\n\nHere are the files edited ${scope} that have uncommitted changes:\n${fileList}`;
-          message += '\n\nCall developer_git_commit_proposal immediately with these files.';
-          message += '\nDo NOT call get_session_edited_files, get_workstream_edited_files, or git diff -- the data is already provided above.';
+          if (commitContext.scenario === 'worktree') {
+            // Worktree: everything uncommitted here belongs to this workstream.
+            message += `\n\nHere are all the uncommitted changes in this worktree:\n${fileList}`;
+            message += '\n\nThis is the complete set of uncommitted changes in this worktree. ' +
+              'A worktree is dedicated to a single line of work, so include all of these files in the commit.';
+            message += '\n\nThen call developer_git_commit_proposal with the file list.';
+            message += '\nDo NOT call get_session_edited_files or get_workstream_edited_files -- the file data is already provided above.';
+          } else {
+            // Shared checkout: scope to this session's/workstream's edits so concurrent
+            // sessions' unrelated work isn't swept in.
+            const scope = commitContext.scenario === 'workstream'
+              ? `across ${childSessionIds!.length} sessions in this workstream`
+              : 'in this session';
+
+            message += `\n\nHere are the files edited ${scope} that have uncommitted changes:\n${fileList}`;
+            message += '\n\nThis list covers files edited directly. If you ALSO ran commands this session that change files as a side effect ' +
+              '(e.g. npm install rewriting package-lock.json, a build/codegen step, license regeneration), include those changed files too -- ' +
+              'check git status for them. If you ran no such commands, the list above is complete; do not go looking. ' +
+              'Either way, do NOT add unrelated uncommitted changes -- other concurrent sessions may have their own work in this repo.';
+            message += '\n\nThen call developer_git_commit_proposal with the file list.';
+            message += '\nDo NOT call get_session_edited_files or get_workstream_edited_files -- the edited-file data is already provided above.';
+          }
         } else if (commitContext.success && commitContext.files.length === 0) {
-          message += '\n\nNo session-edited files have uncommitted changes. Check git status to see if there are any other uncommitted changes to commit.';
+          message += isInWorktree
+            ? '\n\nNo uncommitted changes in this worktree.'
+            : '\n\nNo session-edited files have uncommitted changes. Check git status to see if there are any other uncommitted changes to commit.';
         } else {
           // Fallback: let the agent discover files the old way
           if (isInWorkstream) {
@@ -429,12 +478,33 @@ export const GitOperationsPanel: React.FC<GitOperationsPanelProps> = React.memo(
           fileType: undefined,
           attachments: undefined,
           mode: 'agent',
+          inputType: 'user' as const,
         };
-        await window.electronAPI.invoke('ai:sendMessage', message, docContext, sessionId, workspacePath);
+
+        // claude-code-cli (subscription, NIM-806): the genuine `claude` CLI is
+        // driven by its PTY, not the Agent SDK loop. ai:sendMessage has no
+        // in-process provider for it and throws ("Unknown provider"). Route the
+        // smart-commit prompt through the Nimbalyst queue instead; the
+        // main-process PID-idle flusher drains it to the terminal once the CLI is
+        // idle, whether or not a turn is currently in flight.
+        let provider: string | null = null;
+        try {
+          const sessionResult = await window.electronAPI.invoke('sessions:get', sessionId) as
+            { session?: { provider?: string } } | null;
+          provider = sessionResult?.session?.provider ?? null;
+        } catch {
+          /* fall through to the SDK send path */
+        }
+
+        if (isClaudeCliTerminalSession(provider)) {
+          await window.electronAPI.invoke('ai:createQueuedPrompt', sessionId, message, [], docContext);
+        } else {
+          await window.electronAPI.invoke('ai:sendMessage', message, docContext, sessionId, workspacePath);
+        }
       } catch (error) {
         console.error('[GitOperationsPanel] Failed to send smart commit message:', error);
       }
-    }, [sessionId, workspacePath, childSessionIds, worktreeId]);
+    }, [sessionId, workspacePath, worktreePath, childSessionIds, worktreeId]);
 
     // Toggle file staging
     const toggleFileStaging = useCallback(
@@ -1373,29 +1443,53 @@ Please proceed with this strategy.`;
                 {/* Section header with refresh button */}
                 <div className="flex items-center justify-between">
                   <span className="text-[11px] font-semibold text-[var(--nim-text)]">Commit & Sync</span>
-                  <button
-                    onClick={async () => {
-                      try {
-                        // Refresh worktree data (local state for GitOperationsPanel)
-                        await Promise.all([
-                          loadWorktreeChangedFiles(),
-                          loadWorktreeCommits(),
-                          loadWorktreeStatus(),
-                        ]);
-                        // Also refresh the central atom so FilesEditedSidebar updates
-                        if (worktreeId && worktreePath) {
-                          await refreshWorktreeChangedFiles(worktreeId, worktreePath);
+                  <div className="flex items-center gap-2">
+                    <HelpTooltip testId="git-commit-mode-toggle">
+                      <div className="flex rounded-[3px] overflow-hidden border border-[var(--nim-border)]" data-testid="git-commit-mode-toggle">
+                        <button
+                          className={`px-1.5 py-0.5 border-none bg-transparent text-[var(--nim-text-muted)] text-[10px] font-medium cursor-pointer transition-all duration-150 border-r border-[var(--nim-border)] ${
+                            worktreeCommitMode === 'manual' ? 'bg-[var(--nim-bg-tertiary)] text-[var(--nim-text)]' : 'hover:bg-[var(--nim-bg-tertiary)] hover:opacity-60'
+                          }`}
+                          onClick={() => setWorktreeCommitMode('manual')}
+                          aria-label="Manual commit message"
+                        >
+                          Manual
+                        </button>
+                        <button
+                          className={`px-1.5 py-0.5 border-none bg-transparent text-[var(--nim-text-muted)] text-[10px] font-medium cursor-pointer transition-all duration-150 ${
+                            worktreeCommitMode === 'smart' ? 'bg-[var(--nim-bg-tertiary)] text-[var(--nim-text)]' : 'hover:bg-[var(--nim-bg-tertiary)] hover:opacity-60'
+                          }`}
+                          onClick={() => setWorktreeCommitMode('smart')}
+                          aria-label="AI-assisted commit"
+                        >
+                          Smart
+                        </button>
+                      </div>
+                    </HelpTooltip>
+                    <button
+                      onClick={async () => {
+                        try {
+                          // Refresh worktree data (local state for GitOperationsPanel)
+                          await Promise.all([
+                            loadWorktreeChangedFiles(),
+                            loadWorktreeCommits(),
+                            loadWorktreeStatus(),
+                          ]);
+                          // Also refresh the central atom so FilesEditedSidebar updates
+                          if (worktreeId && worktreePath) {
+                            await refreshWorktreeChangedFiles(worktreeId, worktreePath);
+                          }
+                        } catch (error) {
+                          console.error('[GitOperationsPanel] Failed to refresh worktree data:', error);
                         }
-                      } catch (error) {
-                        console.error('[GitOperationsPanel] Failed to refresh worktree data:', error);
-                      }
-                    }}
-                    className="flex items-center gap-1 px-2 py-1 text-[10px] text-[var(--nim-primary)] hover:bg-[var(--nim-bg-hover)] rounded transition-colors"
-                    title="Refresh worktree status and uncommitted files"
-                  >
-                    <MaterialSymbol icon="refresh" size={14} />
-                    <span>Refresh</span>
-                  </button>
+                      }}
+                      className="flex items-center gap-1 px-2 py-1 text-[10px] text-[var(--nim-primary)] hover:bg-[var(--nim-bg-hover)] rounded transition-colors"
+                      title="Refresh worktree status and uncommitted files"
+                    >
+                      <MaterialSymbol icon="refresh" size={14} />
+                      <span>Refresh</span>
+                    </button>
+                  </div>
                 </div>
 
                 {/* Worktree Status Info */}
@@ -1416,39 +1510,65 @@ Please proceed with this strategy.`;
                   </div>
                 )}
 
-                {/* Commit Message */}
-                <div className="flex flex-col gap-2">
-                  <textarea
-                    className="w-full p-2 border border-[var(--nim-border)] rounded bg-[var(--nim-bg)] text-[var(--nim-text)] text-[11px] font-[var(--nim-font-mono)] resize-y focus:outline-none focus:border-[var(--nim-primary)] disabled:opacity-50 disabled:cursor-not-allowed"
-                    placeholder="Commit message..."
-                    value={worktreeCommitMessage}
-                    onChange={(e) => setWorktreeCommitMessage(e.target.value)}
-                    disabled={worktreeIsCommitting}
-                    rows={3}
-                  />
-                </div>
+                {/* Manual commit workflow */}
+                {worktreeCommitMode === 'manual' && (
+                  <div className="flex flex-col gap-2" data-testid="git-operations-manual-mode">
+                    <textarea
+                      className="w-full p-2 border border-[var(--nim-border)] rounded bg-[var(--nim-bg)] text-[var(--nim-text)] text-[11px] font-[var(--nim-font-mono)] resize-y focus:outline-none focus:border-[var(--nim-primary)] disabled:opacity-50 disabled:cursor-not-allowed"
+                      placeholder="Commit message..."
+                      value={worktreeCommitMessage}
+                      onChange={(e) => setWorktreeCommitMessage(e.target.value)}
+                      disabled={worktreeIsCommitting}
+                      rows={3}
+                    />
+                  </div>
+                )}
+
+                {/* Smart commit workflow - AI proposes commit in transcript */}
+                {worktreeCommitMode === 'smart' && (
+                  <div className="flex flex-col gap-2" data-testid="git-operations-smart-mode">
+                    <p className="text-xs text-[var(--nim-text-muted)] m-0 leading-normal">
+                      Let AI analyze your changes and propose a commit message.
+                    </p>
+                  </div>
+                )}
 
                 {/* Action Buttons */}
                 <div className="flex flex-col gap-2">
-                  <button
-                    type="button"
-                    className="w-full p-2 border-none rounded bg-[var(--nim-primary)] text-white text-xs font-semibold cursor-pointer flex items-center justify-center gap-1.5 hover:opacity-90 disabled:opacity-50 disabled:cursor-not-allowed"
-                    onClick={handleWorktreeCommit}
-                    disabled={!worktreeCanCommit}
-                    title={worktreeStagedCount === 0 ? 'Stage files to commit' : !worktreeCommitMessage.trim() ? 'Enter commit message' : 'Commit staged changes'}
-                  >
-                    {worktreeIsCommitting ? (
-                      <>
-                        <MaterialSymbol icon="progress_activity" size={16} />
-                        <span>Committing...</span>
-                      </>
-                    ) : (
-                      <>
-                        <MaterialSymbol icon="check" size={16} />
-                        <span>Commit ({worktreeStagedCount})</span>
-                      </>
-                    )}
-                  </button>
+                  {worktreeCommitMode === 'manual' ? (
+                    <button
+                      type="button"
+                      className="w-full p-2 border-none rounded bg-[var(--nim-primary)] text-white text-xs font-semibold cursor-pointer flex items-center justify-center gap-1.5 hover:opacity-90 disabled:opacity-50 disabled:cursor-not-allowed"
+                      onClick={handleWorktreeCommit}
+                      disabled={!worktreeCanCommit}
+                      title={worktreeStagedCount === 0 ? 'Stage files to commit' : !worktreeCommitMessage.trim() ? 'Enter commit message' : 'Commit staged changes'}
+                    >
+                      {worktreeIsCommitting ? (
+                        <>
+                          <MaterialSymbol icon="progress_activity" size={16} />
+                          <span>Committing...</span>
+                        </>
+                      ) : (
+                        <>
+                          <MaterialSymbol icon="check" size={16} />
+                          <span>Commit ({worktreeStagedCount})</span>
+                        </>
+                      )}
+                    </button>
+                  ) : (
+                    <HelpTooltip testId="git-operations-commit-with-ai-button">
+                      <button
+                        type="button"
+                        className="w-full p-2 border-none rounded text-white text-xs font-semibold cursor-pointer flex items-center justify-center gap-1.5 hover:opacity-90 disabled:opacity-50 disabled:cursor-not-allowed bg-gradient-to-br from-[var(--nim-primary)] to-[var(--nim-primary-hover)]"
+                        onClick={handleSmartCommit}
+                        disabled={!worktreeHasUncommittedChanges}
+                        data-testid="git-operations-commit-with-ai-button"
+                      >
+                        <MaterialSymbol icon="auto_awesome" size={16} />
+                        Commit with AI
+                      </button>
+                    </HelpTooltip>
+                  )}
                   <button
                     type="button"
                     className={`w-full p-2 border-none rounded text-white text-xs font-semibold cursor-pointer flex items-center justify-center gap-1.5 hover:opacity-90 disabled:opacity-50 disabled:cursor-not-allowed ${

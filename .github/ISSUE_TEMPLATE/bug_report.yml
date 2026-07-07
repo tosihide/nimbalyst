@@ -1,7 +1,8 @@
 name: Bug report
 description: Something isn't working in Nimbalyst
 title: "[Bug]: "
-labels: ["type:bug", "status:needs-triage"]
+type: Bug
+labels: ["status:needs-triage"]
 body:
   - type: markdown
     attributes:
@@ -34,8 +35,6 @@ body:
     attributes:
       label: Nimbalyst version
       placeholder: e.g. 0.58.3
-    validations:
-      required: true
   - type: dropdown
     id: os
     attributes:
@@ -46,5 +45,3 @@ body:
         - Linux
         - iOS
         - Other
-    validations:
-      required: true

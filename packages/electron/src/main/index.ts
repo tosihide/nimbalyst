@@ -202,6 +202,18 @@ if (process.platform === 'win32') {
   app.setAppUserModelId('com.nimbalyst.electron');
 }
 
+// Linux: Electron 41 runs native Wayland by default, where the desktop
+// matches windows to their .desktop file by app_id, not X11 WM_CLASS -- the
+// StartupWMClass in the packaged nimbalyst.desktop no longer applies and
+// GNOME shows a generic gear icon in the dock/taskbar. setDesktopName makes
+// the Wayland app_id resolve to nimbalyst.desktop.
+// Do NOT force ozone-platform=x11 here: ANGLE's GL initialization segfaults
+// in a loop on XWayland with this Electron version (libGLESv2 SIGSEGV, 3x
+// GPU-process crashes then the app dies).
+if (process.platform === 'linux') {
+  app.setDesktopName('nimbalyst.desktop');
+}
+
 // Issue #146: register the `nim-asset://` scheme as standard/secure BEFORE
 // `app.whenReady` resolves. Per Electron docs, schemes must be marked as
 // privileged before the app is ready or the renderer treats them as opaque

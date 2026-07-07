@@ -60,6 +60,7 @@ export function initUpdateListeners(): () => void {
     releaseDate?: string;
     releaseChannel?: string;
     isManualCheck?: boolean;
+    manualOnly?: boolean;
   }) => {
     console.log('[UpdateListeners] Update available:', data);
 
@@ -111,6 +112,7 @@ export function initUpdateListeners(): () => void {
         version: data.newVersion,
         releaseNotes: data.releaseNotes,
         releaseDate: data.releaseDate,
+        manualOnly: data.manualOnly,
       },
     }));
   };

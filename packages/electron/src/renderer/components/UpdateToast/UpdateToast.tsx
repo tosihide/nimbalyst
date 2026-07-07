@@ -22,9 +22,15 @@ export function UpdateToast(): React.ReactElement | null {
       action: 'download_clicked',
       new_version: updateInfo?.version || 'unknown'
     });
+    if (updateInfo?.manualOnly) {
+      // Linux package install: no in-app download; open the releases page.
+      window.electronAPI.send('update-toast:open-download-page');
+      setUpdateState((prev) => ({ ...prev, state: 'idle', updateInfo: null }));
+      return;
+    }
     setUpdateState((prev) => ({ ...prev, state: 'downloading' }));
     window.electronAPI.send('update-toast:download');
-  }, [posthog, updateInfo?.version, setUpdateState]);
+  }, [posthog, updateInfo, setUpdateState]);
 
   const handleViewReleaseNotes = useCallback(() => {
     console.log('[UpdateToast] View release notes clicked');
@@ -63,9 +69,14 @@ export function UpdateToast(): React.ReactElement | null {
 
   const handleUpdateFromNotes = useCallback(() => {
     console.log('[UpdateToast] Update from release notes clicked');
+    if (updateInfo?.manualOnly) {
+      window.electronAPI.send('update-toast:open-download-page');
+      setUpdateState((prev) => ({ ...prev, state: 'idle', updateInfo: null }));
+      return;
+    }
     setUpdateState((prev) => ({ ...prev, state: 'downloading' }));
     window.electronAPI.send('update-toast:download');
-  }, [setUpdateState]);
+  }, [updateInfo?.manualOnly, setUpdateState]);
 
   const handleCancelDownload = useCallback(() => {
     console.log('[UpdateToast] Cancel download clicked');

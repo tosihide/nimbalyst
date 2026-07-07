@@ -6,6 +6,8 @@ export interface UpdateInfo {
   version: string;
   releaseNotes?: string;
   releaseDate?: string;
+  /** In-app download unavailable (Linux package install); Update Now opens the releases page. */
+  manualOnly?: boolean;
 }
 
 export interface DownloadProgress {

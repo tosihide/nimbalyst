@@ -1,5 +1,5 @@
 import { autoUpdater } from 'electron-updater';
-import { app, BrowserWindow, dialog } from 'electron';
+import { app, BrowserWindow, dialog, shell } from 'electron';
 import log from 'electron-log/main';
 import * as fs from 'fs';
 import * as path from 'path';
@@ -33,6 +33,9 @@ const GITHUB_UPDATE_PROVIDER = {
   owner: 'nimbalyst',
   repo: 'nimbalyst'
 };
+// Manual-download destination for installs that can't auto-update (Linux
+// package installs): the toast's Update Now button opens this page.
+const DOWNLOAD_PAGE_URL = `https://github.com/${GITHUB_UPDATE_PROVIDER.owner}/${GITHUB_UPDATE_PROVIDER.repo}/releases/latest`;
 
 // classifyUpdateError, categorizeDownloadDuration, isWindowsRenameLockError
 // moved to ./autoUpdaterUtils so unit tests can import them without pulling
@@ -78,7 +81,7 @@ export class AutoUpdaterService {
 
     if (this.autoUpdateUnsupported) {
       log.info(
-        'Auto-update disabled: Linux package install (no APPIMAGE env); the GitHub Linux feed only ships an AppImage.',
+        'Linux package install (no APPIMAGE env): update checks run notify-only; the GitHub Linux feed only ships an AppImage, so downloads route to the releases page.',
       );
     }
 
@@ -119,6 +122,7 @@ export class AutoUpdaterService {
       log.info('Update available:', info);
       this.isCheckingForUpdate = false;
       this.lastUpdateErrorKey = null;
+      const wasManualCheck = this.isManualCheck;
       this.isManualCheck = false;
 
       let releaseNotes = info.releaseNotes as string | undefined;
@@ -140,6 +144,22 @@ export class AutoUpdaterService {
       // (update-downloaded) is shown. The update-available event is still
       // broadcast so renderer state stays in sync.
       this.sendToAllWindows('update-available', info);
+
+      // Linux package install: autoDownload is off (the feed has no matching
+      // asset), so the background-download flow above never runs. Surface the
+      // notify-only "Update Available" toast instead; manualOnly makes its
+      // Update Now button open the releases page rather than download.
+      if (this.autoUpdateUnsupported) {
+        this.sendToFrontmostWindow('update-toast:show-available', {
+          currentVersion: app.getVersion(),
+          newVersion: info.version,
+          releaseNotes,
+          releaseDate: info.releaseDate,
+          releaseChannel: getReleaseChannel(),
+          isManualCheck: wasManualCheck,
+          manualOnly: true,
+        });
+      }
     });
 
     autoUpdater.on('update-not-available', (info) => {
@@ -453,7 +473,24 @@ export class AutoUpdaterService {
     });
 
     // Toast-based update IPC handlers
+    safeOn('update-toast:open-download-page', async () => {
+      log.info('Update toast: opening releases page for manual download');
+      await shell.openExternal(DOWNLOAD_PAGE_URL);
+    });
+
     safeOn('update-toast:download', async () => {
+      // Defense in depth for Linux package installs: the manualOnly toast
+      // never sends this event, but if it arrives anyway, route to the
+      // releases page instead of the download path that would crash
+      // (DebUpdater finds no matching asset in the AppImage-only feed).
+      if (this.autoUpdateUnsupported) {
+        log.warn('Update toast: download requested on a Linux package install; opening releases page instead');
+        await shell.openExternal(DOWNLOAD_PAGE_URL);
+        this.sendToFrontmostWindow('update-toast:error', {
+          message: 'Automatic updates are not available for this Linux package. The download page was opened in your browser.'
+        });
+        return;
+      }
       try {
         log.info('Update toast: Starting download...');
 
@@ -576,10 +613,8 @@ export class AutoUpdaterService {
   }
 
   public startAutoUpdateCheck(intervalMinutes = 60) {
-    if (this.autoUpdateUnsupported) {
-      log.info('Skipping scheduled auto-update check on this Linux package install');
-      return;
-    }
+    // On Linux package installs the scheduled checks still run, but with
+    // autoDownload forced off they are version checks only (notify-only).
     // Initial check after 30 seconds
     setTimeout(() => {
       this.checkForUpdates();
@@ -603,9 +638,6 @@ export class AutoUpdaterService {
   }
 
   public async checkForUpdates() {
-    if (this.autoUpdateUnsupported) {
-      return;
-    }
     if (this.isCheckingForUpdate) {
       log.info('Already checking for updates, skipping...');
       return;
@@ -622,21 +654,6 @@ export class AutoUpdaterService {
   public async checkForUpdatesWithUI() {
     if (this.isCheckingForUpdate) {
       // Already checking, don't show anything - the checking toast is already visible
-      return;
-    }
-
-    // Linux package install (.deb/.rpm/etc.): the GitHub Linux feed only ships
-    // an AppImage, so electron-updater cannot deliver an in-place update here.
-    // Give the user the manual-download path instead of attempting a check that
-    // would crash in the auto-download step.
-    if (this.autoUpdateUnsupported) {
-      log.info('Manual update check requested on an unsupported Linux package install');
-      this.sendToFrontmostWindow('update-toast:checking');
-      setTimeout(() => {
-        this.sendToFrontmostWindow('update-toast:error', {
-          message: 'Automatic updates are not available for this Linux package. Please download the latest version manually.'
-        });
-      }, 500);
       return;
     }
 
